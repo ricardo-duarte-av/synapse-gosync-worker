@@ -11,7 +11,7 @@ Status is recorded here; what actually happened is in [log.md](log.md).
 | M1 | Skeleton, auth, `/rooms/{roomId}/initialSync` | **done — 9/9 rooms at parity** |
 | M2 | `/initialSync` | **done — at parity** |
 | M3 | Initial `/sync` (no `since`) | **done** — both accounts, all endpoints |
-| M4 | Stream tokens and incremental `/sync` | **nearly done** — 5 of 6 windows across two accounts |
+| M4 | Stream tokens and incremental `/sync` | **done** — 10 windows, two accounts; one deep-history caveat |
 | M5 | Long-polling and Redis replication | not started |
 | M6 | Filters and lazy-loading | not started |
 | M7 | Ephemeral: receipts, typing, presence | not started |
@@ -54,13 +54,21 @@ stream (M5). syncdiff counts it by name rather than treating it as a mismatch.
 
 An incremental `/sync` (`since` present) returns 501; that is M4.
 
-## M4 — nearly done
+## M4 — done
 
-An incremental `/sync` is served and matches for five of six test windows across
-the two accounts (rewinds of 3,000 / 30,000 / 200,000 stream positions). The
-sixth leaves one extra state entry in one room at the deepest rewind.
+An incremental `/sync` matches Synapse across **ten test windows** on both
+accounts (rewinds of 3,000 / 30,000 / 200,000 / 500,000 / 1,000,000 stream
+positions). The `invite`, `knock` and `leave` sections are implemented.
 
-Not yet implemented: the `leave` and `knock` sections, and `to_device`.
+**One caveat, in one room.** At a 1.3M-position rewind — far beyond anything a
+real client sends — a room the account left long ago gets 6 of its 10 state
+entries. The anchor event and the `previous` subtraction are both ruled out (the
+room has no events at all before that `since`), so the state-group walk itself
+is under-returning for that room. Worth chasing when the state resolver is next
+touched.
+
+`to_device` is not implemented; that is M8, and it needs the deletion decision
+first.
 
 ## M5 is not just long-polling
 

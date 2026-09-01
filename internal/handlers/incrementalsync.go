@@ -73,8 +73,15 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 	strippedCfg := cfg
 	strippedCfg.IncludeStrippedRoomState = true
 
+	// Load twice the limit, as Synapse does: visibility filtering happens after
+	// and would otherwise leave the timeline short, and a short timeline shifts
+	// both prev_batch and the state delta that hangs off its first event.
+	loadLimit := defaultTimelineLimit * 2
+	if loadLimit < 10 {
+		loadLimit = 10
+	}
 	timelines, err := d.Store.RoomTimelineSince(ctx, joinedIDs, roomVersions,
-		sincePos, nowPos, defaultTimelineLimit+1)
+		sincePos, nowPos, loadLimit)
 	if err != nil {
 		return nil, http.StatusInternalServerError, internalError(d, "room timelines", err)
 	}
@@ -133,7 +140,7 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 
 		entry, err := incrementalRoomEntry(ctx, d, room, verdict.UserID, since, now,
 			timeNow, cfg, timelines[room.RoomID],
-			accountDataByRoom[room.RoomID], receiptsByRoom[room.RoomID])
+			accountDataByRoom[room.RoomID], receiptsByRoom[room.RoomID], loadLimit)
 		if err != nil {
 			return nil, http.StatusInternalServerError, internalError(d, "room entry", err)
 		}
@@ -175,6 +182,53 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 		}
 		invitedRooms[roomID] = map[string]any{
 			"invite_state": map[string]any{"events": []json.RawMessage{body}},
+		}
+	}
+
+	// Rooms the caller left or was banned from during the window, and rooms
+	// they knocked on.
+	archivedRooms := map[string]any{}
+	knockedRooms := map[string]any{}
+	for roomID, c := range lastChange {
+		switch c.Membership {
+		case "leave", "ban":
+			if _, stillJoined := timelines[roomID]; stillJoined {
+				continue
+			}
+			if isCurrentlyJoined(rooms, roomID) {
+				continue
+			}
+			entry, err := archivedRoomEntry(ctx, d, roomID, verdict.UserID, c,
+				since, now, timeNow, cfg, d.MSC3391Enabled)
+			if err != nil {
+				return nil, http.StatusInternalServerError, internalError(d, "archived room", err)
+			}
+			if entry != nil {
+				archivedRooms[roomID] = entry
+			}
+		case "knock":
+			info, err := d.Store.RoomInfo(ctx, roomID)
+			if err != nil {
+				return nil, http.StatusInternalServerError, internalError(d, "room info", err)
+			}
+			knock, err := d.Store.InviteEvent(ctx, c.EventID, roomID, info.RoomVersion)
+			if err != nil {
+				return nil, http.StatusInternalServerError, internalError(d, "knock event", err)
+			}
+			body, err := clientevent.Serialize(knock.Stored, timeNow, strippedCfg)
+			if err != nil {
+				return nil, http.StatusInternalServerError, internalError(d, "serialise knock", err)
+			}
+			// The stripped state a knock carries lives in the event's unsigned
+			// block; the response lifts it out into knock_state.
+			events := []json.RawMessage{}
+			gjson.GetBytes(body, `unsigned.knock_room_state`).ForEach(func(_, v gjson.Result) bool {
+				events = append(events, json.RawMessage(v.Raw))
+				return true
+			})
+			knockedRooms[roomID] = map[string]any{
+				"knock_state": map[string]any{"events": events},
+			}
 		}
 	}
 
@@ -329,6 +383,12 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 	if len(invitedRooms) > 0 {
 		roomsOut["invite"] = invitedRooms
 	}
+	if len(knockedRooms) > 0 {
+		roomsOut["knock"] = knockedRooms
+	}
+	if len(archivedRooms) > 0 {
+		roomsOut["leave"] = archivedRooms
+	}
 	if len(roomsOut) > 0 {
 		resp["rooms"] = roomsOut
 	}
@@ -345,18 +405,30 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 func incrementalRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID string,
 	since, now streamtoken.Token, timeNow int64, cfg clientevent.Config,
 	raw []store.TimelineEvent, accountData []store.AccountDataEntry,
-	receipts []store.ReceiptRow) (map[string]any, error) {
+	receipts []store.ReceiptRow, loadLimit int) (map[string]any, error) {
 
-	// One more than the limit was fetched, so "was there more" is answerable
-	// without a second query.
-	limited := len(raw) > defaultTimelineLimit
-	if limited {
-		raw = raw[len(raw)-defaultTimelineLimit:]
-	}
+	// More were loaded than will be returned, so hitting the load limit already
+	// means the window held more than fits.
+	limited := len(raw) >= loadLimit
 
-	messages, memberships, err := filterVisible(ctx, d, room.RoomID, userID, raw, false, timeNow)
+	// A state event still in current state is shown regardless of history
+	// visibility: withholding it from a client that can already see the state
+	// it established gains nothing.
+	alwaysInclude, err := stateEventIDsInCurrentState(ctx, d, raw)
 	if err != nil {
 		return nil, err
+	}
+	messages, memberships, err := filterVisibleAlways(ctx, d, room.RoomID, userID, raw,
+		false, timeNow, alwaysInclude)
+	if err != nil {
+		return nil, err
+	}
+
+	// Trim to the limit, keeping the newest.
+	if len(messages) > defaultTimelineLimit {
+		limited = true
+		messages = messages[len(messages)-defaultTimelineLimit:]
+		memberships = memberships[len(memberships)-defaultTimelineLimit:]
 	}
 
 	stateIDs, err := incrementalStateDelta(ctx, d, room, messages, limited, since, now)
@@ -573,12 +645,29 @@ func isLinearTimeline(ctx context.Context, d Deps, roomID string,
 	}
 	for _, ev := range messages {
 		prevEvents := gjson.GetBytes(ev.JSON, "prev_events").Array()
-		if len(prevEvents) != 1 || prevEvents[0].String() != prev {
+		if len(prevEvents) != 1 || prevEventID(prevEvents[0]) != prev {
 			return false, nil
 		}
 		prev = ev.EventID
 	}
 	return true, nil
+}
+
+// prevEventID reads an entry of `prev_events`, which has two shapes.
+//
+// Room versions 1 and 2 store each entry as a `[event_id, hashes]` PAIR;
+// everything since stores a bare event id. Reading the pair as a string yields
+// the whole array, so a v1 room never looks linear and always gets a state
+// block Synapse would have omitted. Nine of the 1,165 rooms on this server are
+// v1 or v2, and one of them is in the test corpus.
+func prevEventID(entry gjson.Result) string {
+	if entry.IsArray() {
+		if pair := entry.Array(); len(pair) > 0 {
+			return pair[0].String()
+		}
+		return ""
+	}
+	return entry.String()
 }
 
 // calculateState is Synapse's _calculate_state.
@@ -722,4 +811,161 @@ func resolveLeftUsers(ctx context.Context, d Deps, candidates map[string]string)
 		out = append(out, user)
 	}
 	return out, nil
+}
+
+func isCurrentlyJoined(rooms []store.RoomForUser, roomID string) bool {
+	for _, r := range rooms {
+		if r.RoomID == roomID && r.Membership == "join" {
+			return true
+		}
+	}
+	return false
+}
+
+// archivedRoomEntry builds the section for a room the caller left during the
+// window.
+//
+// Everything is bounded by the LEAVE, not by `now`: a departed member is not
+// entitled to what happened after they went. Synapse expresses that by setting
+// both upto_token and end_token to the leave position, and the state delta is
+// computed against that rather than the current state.
+//
+// The section itself is smaller than a joined room's: no ephemeral, no unread
+// counts, no summary. Those describe a room you are in.
+func archivedRoomEntry(ctx context.Context, d Deps, roomID, userID string,
+	change store.MembershipChange, since, now streamtoken.Token, timeNow int64,
+	cfg clientevent.Config, msc3391 bool) (map[string]any, error) {
+
+	info, err := d.Store.RoomInfo(ctx, roomID)
+	if err != nil {
+		return nil, err
+	}
+	leaveKey := streamtoken.Live(change.StreamOrdering)
+
+	var raw []store.TimelineEvent
+	if change.OutOfBand {
+		// An out-of-band membership -- a federated invite or its rejection --
+		// arrived without the room's state, so there is nothing to paginate.
+		// The membership event is the whole response.
+		events, err := d.Store.EventsByID(ctx, []string{change.EventID}, info.RoomVersion)
+		if err != nil {
+			return nil, err
+		}
+		if ev, ok := events[change.EventID]; ok {
+			raw = []store.TimelineEvent{{
+				Stored: ev.Stored, Sender: ev.Sender, StateKey: ev.StateKey,
+				IsState: true, StreamOrdering: change.StreamOrdering,
+			}}
+		}
+	} else {
+		loadLimit := defaultTimelineLimit * 2
+		if loadLimit < 10 {
+			loadLimit = 10
+		}
+		byRoom, err := d.Store.RoomTimelineSince(ctx, []string{roomID},
+			map[string]string{roomID: info.RoomVersion},
+			since.Room.MaxStreamPos(), change.StreamOrdering, loadLimit)
+		if err != nil {
+			return nil, err
+		}
+		raw = byRoom[roomID]
+	}
+
+	limited := len(raw) >= defaultTimelineLimit*2
+	messages, memberships, err := filterVisible(ctx, d, roomID, userID, raw, false, timeNow)
+	if err != nil {
+		return nil, err
+	}
+	if len(messages) > defaultTimelineLimit {
+		limited = true
+		messages = messages[len(messages)-defaultTimelineLimit:]
+		memberships = memberships[len(memberships)-defaultTimelineLimit:]
+	}
+
+	room := store.RoomForUser{RoomID: roomID, RoomVersion: info.RoomVersion}
+	endToken := now.WithRoomKey(leaveKey)
+	var stateIDs map[store.StateKey]string
+	if !change.OutOfBand {
+		stateIDs, err = incrementalStateDelta(ctx, d, room, messages, limited, since, endToken)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	accountData, err := d.Store.RoomAccountDataSince(ctx, userID,
+		since.AccountData, now.AccountData, msc3391)
+	if err != nil {
+		return nil, err
+	}
+	adEvents, err := accountDataEvents(accountData[roomID])
+	if err != nil {
+		return nil, err
+	}
+
+	if len(messages) == 0 && len(stateIDs) == 0 && len(adEvents) == 0 {
+		return nil, nil
+	}
+
+	stateEventIDs := make([]string, 0, len(stateIDs))
+	for _, id := range stateIDs {
+		stateEventIDs = append(stateEventIDs, id)
+	}
+	stateEvents, err := d.Store.EventsByID(ctx, stateEventIDs, info.RoomVersion)
+	if err != nil {
+		return nil, err
+	}
+	redactions, err := d.Store.Redactions(ctx, append(timelineEventIDs(messages), stateEventIDs...))
+	if err != nil {
+		return nil, err
+	}
+	prevTargets := make([]*clientevent.Stored, 0, len(messages))
+	for i := range messages {
+		prevTargets = append(prevTargets, &messages[i].Stored)
+	}
+	if err := d.Store.AttachPrevContent(ctx, prevTargets); err != nil {
+		return nil, err
+	}
+
+	timeline := make([]json.RawMessage, 0, len(messages))
+	for i, ev := range messages {
+		stored := ev.Stored
+		stored.Membership = memberships[i]
+		if err := attachRedaction(&stored, redactions, timeNow, cfg); err != nil {
+			return nil, err
+		}
+		body, err := clientevent.Serialize(stored, timeNow, cfg)
+		if err != nil {
+			return nil, err
+		}
+		timeline = append(timeline, body)
+	}
+	stateJSON := make([]json.RawMessage, 0, len(stateEventIDs))
+	for _, id := range stateEventIDs {
+		ev, ok := stateEvents[id]
+		if !ok {
+			continue
+		}
+		stored := ev.Stored
+		if err := attachRedaction(&stored, redactions, timeNow, cfg); err != nil {
+			return nil, err
+		}
+		body, err := clientevent.Serialize(stored, timeNow, cfg)
+		if err != nil {
+			return nil, err
+		}
+		stateJSON = append(stateJSON, body)
+	}
+
+	prevBatch := endToken
+	if len(messages) > 0 {
+		prevBatch = now.WithRoomKey(streamtoken.Live(messages[0].StreamOrdering - 1))
+	}
+
+	return map[string]any{
+		"timeline": map[string]any{
+			"events": timeline, "prev_batch": prevBatch.String(), "limited": limited,
+		},
+		"state":        map[string]any{"events": stateJSON},
+		"account_data": map[string]any{"events": adEvents},
+	}, nil
 }

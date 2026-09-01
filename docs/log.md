@@ -39,8 +39,23 @@ unlimited **and** its events form an unbroken chain from where the client left
 off, the `state` block is empty, because the timeline already carries every
 change. Only a gap or a fork makes a state block necessary.
 
-Remaining: one extra state entry in one room at the deepest rewind, plus the
-`leave` and `knock` sections and `to_device`.
+Then finished: the `invite`, `knock` and `leave` sections, and two bugs that
+only a deep rewind exposed.
+
+**`prev_events` is a list of `[event_id, hashes]` PAIRS in room versions 1 and
+2.** Reading an entry as a string yields the whole array, so the linearity check
+never matched and a v1 room always got a `state` block Synapse omits entirely.
+Nine of this server's 1,165 rooms are v1 or v2, and one is in the corpus.
+
+**The incremental timeline needs the same `load_limit` and always-include rules
+as the initial one.** Fetching `limit + 1` leaves the timeline short once
+visibility filtering runs, and a short timeline shifts both `prev_batch` and the
+state delta that hangs off its first event.
+
+Ten windows now match across both accounts. One caveat remains: at a
+1.3M-position rewind, a long-abandoned room gets 6 of its 10 state entries. The
+anchor and the `previous` subtraction are ruled out — that room has no events
+before the `since` at all — so the state-group walk is under-returning there.
 
 ## 2026-09-01 — M3 done: bundled aggregations, and a fully green baseline
 
