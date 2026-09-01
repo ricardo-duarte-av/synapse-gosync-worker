@@ -108,6 +108,60 @@ all**. `shared` means joined members see all history, including history from
 before they joined. The guard refused every room whose window reached back past
 the user's own join — which is every room, at a large enough limit.
 
+## Found by the comparator, on 2026-09-01 (M2, `/initialSync`)
+
+The two initialSync endpoints are less alike than they look. Four differences,
+all of which produced mismatches on the first run.
+
+### `/initialSync` never reveals `transaction_id`
+
+`_snapshot_all_rooms` builds its serializer config **without a requester**
+(`initial_sync.py:171`), while `_room_initial_sync_joined` passes
+`requester=requester`. `unsigned.transaction_id` is gated on the requester
+matching the sender, so `/initialSync` omits it always and
+`/rooms/{roomId}/initialSync` includes it for your own events.
+
+It reads like an upstream oversight. It is still the behaviour to match.
+
+### The two endpoints use different receipt queries
+
+- `_get_linearized_receipts_for_room` (singular) — used by the per-room
+  endpoint — does not even `SELECT thread_id`, and emits the stored data
+  unchanged.
+- `_get_linearized_receipts_for_rooms` (plural) — used by `/initialSync` —
+  selects `thread_id` and merges through `ReceiptInRoom.merge_to_content`, which
+  stamps `thread_id` into threaded receipts and applies MSC4102 (an unthreaded
+  receipt replaces a threaded one for the same user and event).
+
+So the same receipt is rendered two ways depending on which endpoint you ask.
+
+**And the two can contaminate each other.** The plural method is a
+`@cachedList` over the singular one, so a plural call populates the singular
+method's cache. When both are called with the same receipt token, whichever ran
+first decides the shape for both. Receipts advance constantly here, so the
+tokens usually differ and each endpoint runs its own query — but the collision
+is real, and `syncdiff` tolerates `thread_id` in either direction because of it.
+
+### `/initialSync` re-reads its clock per room
+
+`time_now = self.clock.time_msec()` sits **inside** `handle_room`, and there is
+another reading at the end for presence. Synapse's own response is therefore not
+internally consistent: two rooms in one snapshot carry ages computed
+milliseconds apart.
+
+This bounds what pinning can achieve. However the clock pin is chosen, a single
+instant cannot reproduce a response built from several. `syncdiff` accepts
+age-like fields within 1000ms and reports the largest gap seen — 14–18ms in
+practice. That is far tighter than any real defect: a wrong `age_ts`, a stale
+stored `age`, or a missing age are off by hours or years, not milliseconds.
+
+### `visibility` in `/initialSync` is the room directory, not history visibility
+
+Each room carries `"visibility": "public" | "private"`, from `rooms.is_public` —
+whether the room is published in the directory. Nothing to do with
+`m.room.history_visibility`, which governs who may read history. Two unrelated
+concepts, one word.
+
 ### Reading Synapse's source
 
 | What | Where |

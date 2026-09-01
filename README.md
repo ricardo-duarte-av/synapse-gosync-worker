@@ -14,7 +14,7 @@ answers are trusted.
 | Endpoint | State |
 |---|---|
 | `/_matrix/client/*/rooms/{roomId}/initialSync` | **served**, at parity with Synapse on all 9 test rooms |
-| `/_matrix/client/*/initialSync` | not implemented |
+| `/_matrix/client/*/initialSync` | **served**, at parity (except `archived=true`) |
 | `/_matrix/client/*/sync` | not implemented |
 | `/_matrix/client/*/events` | not implemented |
 
@@ -23,9 +23,9 @@ answers are trusted.
 Both are answered with `501` rather than approximated, on the principle that a
 loud failure beats a quiet wrong answer:
 
-- **Rooms the user has left.** Synapse serves a snapshot of the room state as it
-  was at the leave event; resolving that needs state groups, which are not built
-  yet.
+- **Rooms the user has left**, including `/initialSync?archived=true`. Synapse
+  serves a snapshot of the room state as it was at the leave event; resolving
+  that needs state groups, which are not built yet.
 - **Rooms needing per-event state resolution.** History visibility other than
   `shared` or `world_readable`, a room whose visibility has changed over its
   life, a room with an erased sender, or a room with a retention policy.

@@ -104,6 +104,8 @@ go run ./cmd/syncdiff \
   -limit 20
 ```
 
+Add `-endpoint initial_sync` for the whole-account snapshot.
+
 With no `-rooms`, it compares every room the test account has joined. Do that:
 the two rooms it was already in, not the seven purpose-built ones, are what
 caught all four serialisation defects on 2026-09-01.

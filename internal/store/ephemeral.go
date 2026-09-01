@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/streamtoken"
 )
 
@@ -15,7 +17,10 @@ type ReceiptRow struct {
 	EventID      string
 	InstanceName string
 	StreamID     int64
-	Data         json.RawMessage
+	// ThreadID is empty for an unthreaded receipt. Only the multi-room query
+	// reads it; see receiptEvent for why the two endpoints differ.
+	ThreadID string
+	Data     json.RawMessage
 }
 
 // RoomReceipts loads a room's receipts up to a position.
@@ -158,7 +163,13 @@ func (s *Store) Presence(ctx context.Context, userIDs []string) ([]PresenceState
 		return nil, fmt.Errorf("store: presence: %w", err)
 	}
 	defer rows.Close()
+	return scanPresence(rows)
+}
 
+// scanPresence reads presence rows. Every column but user_id is nullable, and a
+// NULL is not the same as a zero: a user with no last_active_ts must have no
+// last_active_ago field at all, not one reading "now".
+func scanPresence(rows pgx.Rows) ([]PresenceState, error) {
 	var out []PresenceState
 	for rows.Next() {
 		var (

@@ -9,8 +9,8 @@ Status is recorded here; what actually happened is in [log.md](log.md).
 | # | Milestone | Status |
 |---|---|---|
 | M1 | Skeleton, auth, `/rooms/{roomId}/initialSync` | **done — 9/9 rooms at parity** |
-| M2 | `/initialSync` | next |
-| M3 | Initial `/sync` (no `since`) | not started |
+| M2 | `/initialSync` | **done — at parity** |
+| M3 | Initial `/sync` (no `since`) | next |
 | M4 | Stream tokens and incremental `/sync` | token package done in M1 |
 | M5 | Long-polling and Redis replication | not started |
 | M6 | Filters and lazy-loading | not started |
@@ -34,6 +34,14 @@ Two deliberate gaps, both answered 501 rather than approximated:
 Both are lifted by the same piece of work — a state-group resolver — which is
 also what M3's `compute_state_delta` needs. It is the largest single unbuilt
 thing in the project.
+
+## M2 — done
+
+`/initialSync` matches Synapse across all 9 rooms, stable over repeated runs.
+The two initialSync endpoints differ upstream in four ways that are easy to miss;
+see [synapse-notes.md](synapse-notes.md) before touching either.
+
+`archived=true` returns 501: left rooms need the state at the leave event.
 
 ## M5 is not just long-polling
 

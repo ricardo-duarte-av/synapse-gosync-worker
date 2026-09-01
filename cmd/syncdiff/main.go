@@ -42,6 +42,7 @@ func main() {
 		tokenFile = flag.String("token-file", "", "file holding the test account's access token")
 		rooms     = flag.String("rooms", "", "comma-separated room IDs; default is every joined room")
 		limit     = flag.Int("limit", 10, "pagination limit to request")
+		endpoint  = flag.String("endpoint", "room_initial_sync", "room_initial_sync | initial_sync")
 		verbose   = flag.Bool("v", false, "print each compared response")
 	)
 	flag.Parse()
@@ -61,6 +62,24 @@ func main() {
 	ref := unixClient(*refSocket)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+
+	if *endpoint == "initial_sync" {
+		res := compareInitialSync(ctx, ours, ref, token, *limit, *verbose)
+		switch res.kind {
+		case resultMatch:
+			fmt.Println("  ok        /initialSync")
+		case resultSkip:
+			fmt.Printf("  skip      /initialSync: %s\n", res.detail)
+		default:
+			fmt.Printf("  MISMATCH  /initialSync\n%s\n", indent(res.detail))
+		}
+		report(boolToInt(res.kind == resultMatch), boolToInt(res.kind == resultMismatch),
+			boolToInt(res.kind == resultSkip))
+		if res.kind == resultMismatch {
+			os.Exit(1)
+		}
+		return
+	}
 
 	roomIDs := splitNonEmpty(*rooms)
 	if len(roomIDs) == 0 {
@@ -91,18 +110,180 @@ func main() {
 		}
 	}
 
-	fmt.Printf("\n%d matched, %d mismatched, %d skipped", matched, mismatched, skipped)
-	if tolerated > 0 {
-		fmt.Printf(" (%d tolerated upstream-only fields: Synapse's event-cache leaking prev_content)", tolerated)
-	}
-	fmt.Println()
+	report(matched, mismatched, skipped)
 	if mismatched > 0 {
 		os.Exit(1)
 	}
 }
 
+func report(matched, mismatched, skipped int) {
+	fmt.Printf("\n%d matched, %d mismatched, %d skipped", matched, mismatched, skipped)
+	if tolerated > 0 {
+		fmt.Printf("\n  %d tolerated cache-dependent fields (prev_content on state, receipt thread_id)", tolerated)
+	}
+	if clockSkewCount > 0 {
+		fmt.Printf("\n  %d age-like fields within clock skew (max %dms; Synapse re-reads its clock per room)",
+			clockSkewCount, clockSkewMaxMS)
+	}
+	fmt.Println()
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// compareInitialSync compares the whole-account snapshot.
+//
+// The pin is recovered the same way as for a single room, but from a nested
+// path: the response has no top-level event list, so the clock comes from the
+// first room that has any state.
+func compareInitialSync(ctx context.Context, ours, ref *http.Client, token string,
+	limit int, verbose bool) result {
+
+	path := "/_matrix/client/r0/initialSync"
+	q := url.Values{"limit": {fmt.Sprint(limit)}}
+
+	refBody, status, err := get(ctx, ref, path+"?"+q.Encode(), token)
+	if err != nil {
+		return result{resultSkip, fmt.Sprintf("reference request failed: %v", err)}
+	}
+	if status != http.StatusOK {
+		return result{resultSkip, fmt.Sprintf("reference returned %d: %s", status, truncate(refBody))}
+	}
+	var refResp map[string]any
+	if err := json.Unmarshal(refBody, &refResp); err != nil {
+		return result{resultSkip, fmt.Sprintf("reference body is not JSON: %v", err)}
+	}
+
+	end, ok := refResp["end"].(string)
+	if !ok {
+		return result{resultSkip, "reference response has no end token"}
+	}
+	timeNow, ok := recoverTimeNowFromRooms(refResp)
+	if !ok {
+		return result{resultSkip, "cannot recover the reference clock from any room"}
+	}
+
+	q.Set("_gosync_now", end)
+	q.Set("_gosync_time_now", fmt.Sprint(timeNow))
+	ourBody, status, err := get(ctx, ours, path+"?"+q.Encode(), token)
+	if err != nil {
+		return result{resultMismatch, fmt.Sprintf("our request failed: %v", err)}
+	}
+	if status != http.StatusOK {
+		return result{resultMismatch, fmt.Sprintf("we returned %d: %s", status, truncate(ourBody))}
+	}
+	var ourResp map[string]any
+	if err := json.Unmarshal(ourBody, &ourResp); err != nil {
+		return result{resultMismatch, fmt.Sprintf("our body is not JSON: %v", err)}
+	}
+	if verbose {
+		fmt.Printf("--- /initialSync ---\n%s\n", truncate(ourBody))
+	}
+
+	var diffs []string
+	diff("", ourResp, refResp, &diffs)
+	if len(diffs) == 0 {
+		return result{resultMatch, ""}
+	}
+	return result{resultMismatch, strings.Join(diffs, "\n")}
+}
+
+func recoverTimeNowFromRooms(resp map[string]any) (int64, bool) {
+	roomList, ok := resp["rooms"].([]any)
+	if !ok {
+		return 0, false
+	}
+	for _, item := range roomList {
+		room, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		state, ok := room["state"].([]any)
+		if !ok {
+			continue
+		}
+		for _, e := range state {
+			ev, ok := e.(map[string]any)
+			if !ok {
+				continue
+			}
+			ts, tsOK := ev["origin_server_ts"].(float64)
+			unsigned, uOK := ev["unsigned"].(map[string]any)
+			if !tsOK || !uOK {
+				continue
+			}
+			if age, ok := unsigned["age"].(float64); ok {
+				return int64(ts) + int64(age), true
+			}
+		}
+	}
+	return 0, false
+}
+
 // tolerated counts upstream-only fields accepted by isToleratedUpstreamOnly.
 var tolerated int
+
+// clockSkew tracks age-like fields accepted by isClockDerived, and the largest
+// discrepancy seen.
+var (
+	clockSkewCount int
+	clockSkewMaxMS int64
+)
+
+// clockSkewToleranceMS bounds how far an age-like field may differ before it is
+// a mismatch rather than clock jitter.
+//
+// /initialSync re-reads the clock **per room** -- `time_now =
+// self.clock.time_msec()` sits inside handle_room -- and once more at the end
+// for presence. So Synapse's own response is not internally consistent: two
+// rooms in one snapshot carry ages computed milliseconds apart. Pinning our
+// clock to one instant therefore cannot match exactly, however the pin is
+// chosen.
+//
+// One second is far tighter than any real defect. The failures this is meant to
+// still catch are wrong `age_ts`, a stale stored `age` passed through, or a
+// missing age entirely -- all of which are off by hours or years, not
+// milliseconds.
+const clockSkewToleranceMS = 1000
+
+// isClockDerived reports whether a field is computed from the serialiser's
+// wall clock.
+func isClockDerived(path string) bool {
+	for _, suffix := range []string{".age", ".unsigned.age", ".last_active_ago"} {
+		if strings.HasSuffix(path, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// withinClockSkew records and accepts a small difference in an age-like field.
+func withinClockSkew(path string, got, want any) bool {
+	if !isClockDerived(path) {
+		return false
+	}
+	g, gok := got.(float64)
+	w, wok := want.(float64)
+	if !gok || !wok {
+		return false
+	}
+	delta := int64(g - w)
+	if delta < 0 {
+		delta = -delta
+	}
+	if delta > clockSkewToleranceMS {
+		return false
+	}
+	clockSkewCount++
+	if delta > clockSkewMaxMS {
+		clockSkewMaxMS = delta
+	}
+	return true
+}
 
 type resultKind int
 
@@ -209,10 +390,37 @@ func recoverTimeNow(resp map[string]any) (int64, bool) {
 // `messages.chunk` is deliberately absent: a timeline IS ordered, and a
 // reordered timeline is a real bug.
 var setPaths = map[string]string{
-	".state":        "event_id",
-	".presence":     "",
-	".receipts":     "",
+	".state": "event_id",
+	// Keyed by the user so a per-entry difference is reported against the right
+	// user -- and so last_active_ago can be compared field by field and pass
+	// through the clock-skew tolerance, instead of the whole set differing.
+	".presence": "content.user_id",
+	// Keyed by room so a difference is reported against the right room and the
+	// right field, rather than as one opaque "set differs".
+	".receipts":     "room_id",
 	".account_data": "",
+	// /initialSync fans out over a dict of rooms, so its order is Synapse's
+	// iteration order and means nothing. Matched on room_id.
+	".rooms": "room_id",
+}
+
+// setPathFor maps a response path to its set-comparison rule, if it has one.
+//
+// An /initialSync per-room path such as `.rooms[!x:y].state` gets the same rule
+// as a single room's `.state`, so the two endpoints agree on what is ordered
+// and what is not.
+func setPathFor(path string) (string, bool) {
+	if key, ok := setPaths[path]; ok {
+		return key, true
+	}
+	if strings.HasPrefix(path, ".rooms[") {
+		if idx := strings.Index(path, "]"); idx >= 0 {
+			if key, ok := setPaths[path[idx+1:]]; ok {
+				return key, true
+			}
+		}
+	}
+	return "", false
 }
 
 // toleratedUpstreamOnly are fields Synapse sometimes emits and we deliberately
@@ -227,17 +435,34 @@ var setPaths = map[string]string{
 // load the event first, so it is not reproducible. Emitting them where Synapse
 // does not would still be our bug, and is still reported.
 func isToleratedUpstreamOnly(path string) bool {
-	if !strings.HasPrefix(path, ".state[") {
-		return false
-	}
-	for _, suffix := range []string{
-		".prev_content", ".unsigned.prev_content", ".unsigned.prev_sender",
-	} {
-		if strings.HasSuffix(path, suffix) {
-			return true
+	if strings.Contains(path, ".state[") {
+		for _, suffix := range []string{
+			".prev_content", ".unsigned.prev_content", ".unsigned.prev_sender",
+		} {
+			if strings.HasSuffix(path, suffix) {
+				return true
+			}
 		}
 	}
-	return false
+	return isReceiptThreadID(path)
+}
+
+// isReceiptThreadID matches a receipt's thread_id, which Synapse may or may not
+// include depending on which endpoint warmed a shared cache.
+//
+// The two initialSync endpoints use different receipt queries -- the plural one
+// selects thread_id and merges through ReceiptInRoom.merge_to_content, the
+// singular one does not select it at all -- but `_get_linearized_receipts_for_rooms`
+// is a @cachedList over `_get_linearized_receipts_for_room`, so a plural call
+// populates the singular method's cache. When both endpoints are called with
+// the same receipt token, whichever ran first decides the shape for both.
+//
+// Receipts advance constantly on a busy server, so the tokens usually differ
+// and each endpoint runs its own query, which is what we mirror. The collision
+// is rare but real, and tolerating it in one narrow key beats a comparator that
+// flaps.
+func isReceiptThreadID(path string) bool {
+	return strings.HasPrefix(path, ".receipts[") && strings.HasSuffix(path, ".thread_id")
 }
 
 func diff(path string, got, want any, out *[]string) {
@@ -269,6 +494,10 @@ func diff(path string, got, want any, out *[]string) {
 				}
 				*out = append(*out, fmt.Sprintf("%s.%s: missing from our response (Synapse: %s)", path, k, brief(wv)))
 			case !inWant:
+				if isReceiptThreadID(path + "." + k) {
+					tolerated++
+					continue
+				}
 				*out = append(*out, fmt.Sprintf("%s.%s: we sent it, Synapse did not (%s)", path, k, brief(gv)))
 			default:
 				diff(path+"."+k, gv, wv, out)
@@ -281,7 +510,7 @@ func diff(path string, got, want any, out *[]string) {
 			*out = append(*out, fmt.Sprintf("%s: we sent %T, Synapse sent a list", path, got))
 			return
 		}
-		if key, isSet := setPaths[path]; isSet {
+		if key, isSet := setPathFor(path); isSet {
 			compareAsSet(path, key, g, w, out)
 			return
 		}
@@ -294,9 +523,13 @@ func diff(path string, got, want any, out *[]string) {
 		}
 
 	default:
-		if fmt.Sprint(got) != fmt.Sprint(want) {
-			*out = append(*out, fmt.Sprintf("%s: ours=%s synapse=%s", path, brief(got), brief(want)))
+		if fmt.Sprint(got) == fmt.Sprint(want) {
+			return
 		}
+		if withinClockSkew(path, got, want) {
+			return
+		}
+		*out = append(*out, fmt.Sprintf("%s: ours=%s synapse=%s", path, brief(got), brief(want)))
 	}
 }
 
@@ -315,11 +548,9 @@ func compareAsSet(path, key string, got, want []any, out *[]string) {
 	index := func(list []any) map[string]any {
 		m := map[string]any{}
 		for _, item := range list {
-			if ev, ok := item.(map[string]any); ok {
-				if id, ok := ev[key].(string); ok {
-					m[id] = ev
-					continue
-				}
+			if id, ok := digString(itemAsMap(item), strings.Split(key, ".")...); ok {
+				m[id] = item
+				continue
 			}
 			m[canonical(item)] = item
 		}
@@ -345,6 +576,11 @@ func compareAsSet(path, key string, got, want []any, out *[]string) {
 			diff(fmt.Sprintf("%s[%s]", path, id), gv, wv, out)
 		}
 	}
+}
+
+func itemAsMap(v any) map[string]any {
+	m, _ := v.(map[string]any)
+	return m
 }
 
 func canonical(v any) string {

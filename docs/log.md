@@ -2,6 +2,38 @@
 
 Newest first. Numbers are measurements, not estimates.
 
+## 2026-09-01 — M2 complete: `/initialSync` at parity
+
+`/initialSync` matches Synapse across all 9 rooms in one snapshot, stable over
+repeated runs. `/rooms/{roomId}/initialSync` still matches 9/9, so M1 did not
+regress.
+
+`cmd/syncdiff` grew `-endpoint initial_sync`, and its diff now keys `.rooms` by
+room_id, `.presence` by user_id and `.receipts` by room_id, so a difference is
+reported against the right entry and the right field instead of as one opaque
+"set differs".
+
+**Four upstream differences between the two initialSync endpoints**, all written
+up in [synapse-notes.md](synapse-notes.md):
+
+- `/initialSync` builds its serializer config without a requester, so it **never**
+  reveals `unsigned.transaction_id` — while the per-room endpoint does.
+- The endpoints use **different receipt queries**: the plural one selects
+  `thread_id` and applies MSC4102, the singular one does not select it at all.
+  And they share a cache, so with the same receipt token they contaminate each
+  other. Tolerated in that one key.
+- `/initialSync` **re-reads its clock per room**, so its own response is not
+  internally consistent. syncdiff accepts age-like fields within 1000ms and
+  reports the largest gap: 14–18ms in practice.
+- `visibility` on a room is the **room directory's** public/private, not history
+  visibility.
+
+*Verified non-vacuous:* building the worker so `/initialSync` passes a requester
+made syncdiff report every leaked `transaction_id` and exit non-zero.
+
+**Deliberate gap:** `archived=true` returns 501. Left rooms need the state as it
+was at the leave event.
+
 ## 2026-09-01 — M1 complete: `/rooms/{roomId}/initialSync` at parity
 
 **9 of 9 joined rooms match Synapse exactly, at limits 1, 5, 20 and 100.**

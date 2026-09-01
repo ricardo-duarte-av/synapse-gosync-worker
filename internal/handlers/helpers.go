@@ -75,12 +75,10 @@ func internalError(d Deps, what string, err error) *matrixerr.Error {
 	return &matrixerr.Error{ErrCode: matrixerr.CodeUnknown, Error: "Internal server error"}
 }
 
-// roomReceipts renders a room's receipts as the single m.receipt event the
-// legacy endpoints emit, or an empty list.
+// roomReceipts renders one room's receipts for the single-room endpoint.
 //
-// Private read receipts of *other* users are removed. Synapse does this in
-// ReceiptEventSource.filter_out_private_receipts, and skipping it would publish
-// exactly the information m.read.private exists to keep private.
+// withThreads is false: the singular query does not select thread_id at all.
+// See receiptEvent for why the two initialSync endpoints differ here.
 func roomReceipts(ctx context.Context, d Deps, roomID, userID string,
 	to streamtoken.MultiWriter) ([]json.RawMessage, error) {
 
@@ -88,39 +86,20 @@ func roomReceipts(ctx context.Context, d Deps, roomID, userID string,
 	if err != nil {
 		return nil, err
 	}
-
-	// event_id -> receipt_type -> user_id -> data
-	content := map[string]map[string]map[string]json.RawMessage{}
+	kept := make([]store.ReceiptRow, 0, len(rows))
 	for _, row := range rows {
-		if !inRange(to, row.InstanceName, row.StreamID) {
-			continue
+		if inRange(to, row.InstanceName, row.StreamID) {
+			kept = append(kept, row)
 		}
-		if row.ReceiptType == "m.read.private" && row.UserID != userID {
-			continue
-		}
-		byType, ok := content[row.EventID]
-		if !ok {
-			byType = map[string]map[string]json.RawMessage{}
-			content[row.EventID] = byType
-		}
-		byUser, ok := byType[row.ReceiptType]
-		if !ok {
-			byUser = map[string]json.RawMessage{}
-			byType[row.ReceiptType] = byUser
-		}
-		byUser[row.UserID] = row.Data
 	}
-
-	if len(content) == 0 {
-		return []json.RawMessage{}, nil
-	}
-	body, err := json.Marshal(map[string]any{
-		"type": "m.receipt", "room_id": roomID, "content": content,
-	})
+	ev, err := receiptEvent(roomID, kept, userID, false)
 	if err != nil {
 		return nil, err
 	}
-	return []json.RawMessage{body}, nil
+	if ev == nil {
+		return []json.RawMessage{}, nil
+	}
+	return []json.RawMessage{ev}, nil
 }
 
 // inRange is MultiWriterStreamToken.is_stream_position_in_range for a token
