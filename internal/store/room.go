@@ -1,0 +1,448 @@
+package store
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
+
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/clientevent"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/streamtoken"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/visibility"
+)
+
+// ErrNotFound is returned when a room or event does not exist.
+var ErrNotFound = errors.New("not found")
+
+// RoomInfo is what the handler needs to know about a room before serving it.
+type RoomInfo struct {
+	RoomVersion string
+	Blocked     bool
+}
+
+// RoomInfo loads a room's version and whether it has been blocked.
+//
+// Synapse checks `is_room_blocked` first and answers 403 before doing anything
+// else, so this is one query rather than two.
+func (s *Store) RoomInfo(ctx context.Context, roomID string) (RoomInfo, error) {
+	const q = `
+		SELECT r.room_version,
+		       EXISTS (SELECT 1 FROM blocked_rooms b WHERE b.room_id = r.room_id)
+		  FROM rooms r
+		 WHERE r.room_id = $1`
+	var info RoomInfo
+	err := s.pool.QueryRow(ctx, q, roomID).Scan(&info.RoomVersion, &info.Blocked)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return RoomInfo{}, ErrNotFound
+	}
+	if err != nil {
+		return RoomInfo{}, fmt.Errorf("store: room info: %w", err)
+	}
+	return info, nil
+}
+
+// Membership is a user's current membership in a room.
+type Membership struct {
+	// Membership is join, leave, invite, knock or ban. Empty if the user has
+	// no membership event at all in the room.
+	Membership string
+	// EventID is the membership event. Empty when Membership is.
+	EventID string
+}
+
+// CurrentMembership reads the user's membership from the room's current state.
+//
+// This is the current-state view, which is what Synapse's
+// check_user_in_room_or_world_readable uses. It deliberately says nothing about
+// what the membership was at some earlier point in the timeline; that is a
+// different question, answered per event during visibility filtering.
+func (s *Store) CurrentMembership(ctx context.Context, roomID, userID string) (Membership, error) {
+	const q = `
+		SELECT COALESCE(membership, ''), event_id
+		  FROM current_state_events
+		 WHERE room_id = $1 AND type = 'm.room.member' AND state_key = $2`
+	var m Membership
+	err := s.pool.QueryRow(ctx, q, roomID, userID).Scan(&m.Membership, &m.EventID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Membership{}, nil
+	}
+	if err != nil {
+		return Membership{}, fmt.Errorf("store: current membership: %w", err)
+	}
+	return m, nil
+}
+
+// StateEvent is one entry of a room's current state.
+type StateEvent struct {
+	clientevent.Stored
+	StateKey string
+	// Sender is kept out of the serialised JSON path but is needed to work out
+	// which users' presence to include.
+	Sender string
+}
+
+// CurrentState loads every current state event of a room.
+//
+// Ordered by (type, state_key) so the result is stable. Synapse returns a dict
+// and therefore has no order at all, which means the comparator must treat the
+// state block as a set -- but an unstable order here would still make our own
+// output differ run to run, which makes debugging needlessly hard.
+func (s *Store) CurrentState(ctx context.Context, roomID, roomVersion string) ([]StateEvent, error) {
+	const q = `
+		SELECT cse.event_id, cse.type, cse.state_key, e.sender,
+		       ej.json, ej.internal_metadata
+		  FROM current_state_events cse
+		  JOIN events e USING (event_id)
+		  JOIN event_json ej USING (event_id)
+		 WHERE cse.room_id = $1
+		 ORDER BY cse.type, cse.state_key`
+	rows, err := s.pool.Query(ctx, q, roomID)
+	if err != nil {
+		return nil, fmt.Errorf("store: current state: %w", err)
+	}
+	defer rows.Close()
+
+	var out []StateEvent
+	for rows.Next() {
+		var ev StateEvent
+		if err := rows.Scan(&ev.EventID, &ev.Type, &ev.StateKey, &ev.Sender,
+			&ev.JSON, &ev.InternalMetadata); err != nil {
+			return nil, fmt.Errorf("store: current state: %w", err)
+		}
+		ev.RoomID = roomID
+		ev.RoomVersion = roomVersion
+		out = append(out, ev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: current state: %w", err)
+	}
+	return out, nil
+}
+
+// TimelineEvent is one event of a room's recent history.
+type TimelineEvent struct {
+	clientevent.Stored
+	Sender           string
+	StreamOrdering   int64
+	TopologicalOrder int64
+	InstanceName     string
+	// IsState is true when the event has a state_key. Retention and the ignore
+	// list treat state events differently from messages.
+	IsState bool
+}
+
+// RecentEvents returns the most recent events in a room, in ascending order,
+// along with a token pointing just before the earliest one returned.
+//
+// This is Synapse's get_recent_events_for_room ->
+// _paginate_room_events_by_topological_ordering_txn, paginating BACKWARDS from
+// end. Three details of that function are load-bearing:
+//
+//   - It selects `limit * 2` rows, because the result set is filtered
+//     afterwards (by the vector-clock bound, and by visibility upstream) and it
+//     would otherwise come up short.
+//   - It orders by topological_ordering then stream_ordering, not by stream
+//     alone. For live tokens these agree; for backfilled history they do not.
+//   - The returned token is `stream - 1` of the OLDEST row, because tokens name
+//     positions between events. Off by one here means a client paginating
+//     backwards silently re-fetches or skips an event.
+func (s *Store) RecentEvents(ctx context.Context, roomID, roomVersion string, limit int,
+	end streamtoken.RoomKey) ([]TimelineEvent, streamtoken.RoomKey, error) {
+
+	if limit <= 0 {
+		return nil, end, nil
+	}
+
+	// Synapse bounds by the highest position any writer reached and filters the
+	// rows afterwards, because a writer ahead of the agreed minimum has already
+	// persisted events the token covers.
+	var (
+		sql  string
+		args []any
+	)
+	if end.IsHistorical() {
+		sql = `
+			SELECT e.event_id, e.type, e.sender, e.stream_ordering,
+			       e.topological_ordering, COALESCE(e.instance_name, ''),
+			       e.state_key IS NOT NULL, ej.json, ej.internal_metadata
+			  FROM events e JOIN event_json ej USING (event_id)
+			 WHERE e.outlier = FALSE AND e.room_id = $1
+			   AND (e.topological_ordering < $2
+			        OR (e.topological_ordering = $2 AND e.stream_ordering <= $3))
+			 ORDER BY e.topological_ordering DESC, e.stream_ordering DESC
+			 LIMIT $4`
+		args = []any{roomID, end.Topological, end.Stream, limit * 2}
+	} else {
+		sql = `
+			SELECT e.event_id, e.type, e.sender, e.stream_ordering,
+			       e.topological_ordering, COALESCE(e.instance_name, ''),
+			       e.state_key IS NOT NULL, ej.json, ej.internal_metadata
+			  FROM events e JOIN event_json ej USING (event_id)
+			 WHERE e.outlier = FALSE AND e.room_id = $1
+			   AND e.stream_ordering <= $2
+			 ORDER BY e.topological_ordering DESC, e.stream_ordering DESC
+			 LIMIT $3`
+		args = []any{roomID, end.MaxStreamPos(), limit * 2}
+	}
+
+	rows, err := s.pool.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, end, fmt.Errorf("store: recent events: %w", err)
+	}
+	defer rows.Close()
+
+	// Descending: newest first.
+	var descending []TimelineEvent
+	for rows.Next() {
+		var ev TimelineEvent
+		if err := rows.Scan(&ev.EventID, &ev.Type, &ev.Sender, &ev.StreamOrdering,
+			&ev.TopologicalOrder, &ev.InstanceName, &ev.IsState,
+			&ev.JSON, &ev.InternalMetadata); err != nil {
+			return nil, end, fmt.Errorf("store: recent events: %w", err)
+		}
+		ev.RoomID = roomID
+		ev.RoomVersion = roomVersion
+		descending = append(descending, ev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, end, fmt.Errorf("store: recent events: %w", err)
+	}
+
+	if len(descending) > limit {
+		descending = descending[:limit]
+	}
+	if len(descending) == 0 {
+		return nil, end, nil
+	}
+
+	// A token names a position *between* events, so the start of this chunk is
+	// one before the oldest event in it.
+	oldest := descending[len(descending)-1]
+	start := streamtoken.Historical(oldest.TopologicalOrder, oldest.StreamOrdering-1)
+
+	ascending := make([]TimelineEvent, len(descending))
+	for i, ev := range descending {
+		ascending[len(descending)-1-i] = ev
+	}
+	return ascending, start, nil
+}
+
+// VisibilityContext gathers what internal/visibility needs to decide a window.
+//
+// senders are the distinct senders of the events in the window.
+func (s *Store) VisibilityContext(ctx context.Context, roomID, userID string,
+	senders []string) (visibility.Context, error) {
+
+	const q = `
+		SELECT
+			-- Current effective history visibility, "" when the room has none.
+			COALESCE((
+				SELECT ej.json::jsonb -> 'content' ->> 'history_visibility'
+				  FROM current_state_events cse JOIN event_json ej USING (event_id)
+				 WHERE cse.room_id = $1 AND cse.type = 'm.room.history_visibility'
+				   AND cse.state_key = ''), ''),
+			-- How many times it has ever been set. More than once means the
+			-- current value does not describe the whole window.
+			(SELECT COUNT(*) FROM events
+			  WHERE room_id = $1 AND type = 'm.room.history_visibility'),
+			-- Has any sender in the window been erased?
+			(SELECT COUNT(*) FROM erased_users WHERE user_id = ANY($2)),
+			-- Does the room have a retention policy?
+			(SELECT COUNT(*) FROM room_retention WHERE room_id = $1),
+			-- The caller's ignore list, or NULL.
+			(SELECT content FROM account_data
+			  WHERE user_id = $3 AND account_data_type = 'm.ignored_user_list')`
+
+	var (
+		vis                         string
+		visCount, erased, retention int64
+		ignoredRaw                  *string
+	)
+	if err := s.pool.QueryRow(ctx, q, roomID, senders, userID).Scan(
+		&vis, &visCount, &erased, &retention, &ignoredRaw); err != nil {
+		return visibility.Context{}, fmt.Errorf("store: visibility context: %w", err)
+	}
+
+	vc := visibility.Context{
+		Visibility:           vis,
+		VisibilityEventCount: int(visCount),
+		HasErasedSender:      erased > 0,
+		HasRetentionPolicy:   retention > 0,
+	}
+	if ignoredRaw != nil {
+		var parsed struct {
+			IgnoredUsers map[string]json.RawMessage `json:"ignored_users"`
+		}
+		if err := json.Unmarshal([]byte(*ignoredRaw), &parsed); err != nil {
+			return visibility.Context{}, fmt.Errorf("store: parsing ignore list: %w", err)
+		}
+		if len(parsed.IgnoredUsers) > 0 {
+			vc.IgnoredSenders = make(map[string]bool, len(parsed.IgnoredUsers))
+			for user := range parsed.IgnoredUsers {
+				vc.IgnoredSenders[user] = true
+			}
+		}
+	}
+	return vc, nil
+}
+
+// AttachPrevContent fills in `unsigned.prev_content` and `unsigned.prev_sender`
+// for state events that replace an earlier one.
+//
+// Synapse does this in the storage layer, not the serialiser
+// (events_worker.py:790, `get_prev_content`), which matters for ordering: the
+// fields are in `unsigned` *before* the client format transform runs, so the
+// v1 format lifts `prev_content` to the top level along with the other five
+// copy keys. Doing it after serialisation would produce `unsigned.prev_content`
+// with no top-level twin, and differ from Synapse on every membership change.
+//
+// The events to look up come from `unsigned.replaces_state`. They are fetched
+// in one query rather than one per event: a room's state block can contain
+// hundreds of membership events, and Synapse's own per-event `get_event` calls
+// are served from a cache this worker does not have.
+func (s *Store) AttachPrevContent(ctx context.Context, events []*clientevent.Stored) error {
+	type target struct {
+		event    *clientevent.Stored
+		replaces string
+	}
+	var targets []target
+	idSet := map[string]bool{}
+	for _, ev := range events {
+		unsigned := gjson.GetBytes(ev.JSON, "unsigned")
+		replaces := unsigned.Get("replaces_state")
+		if !replaces.Exists() || replaces.Type != gjson.String {
+			continue
+		}
+		// Synapse skips events that already carry both fields.
+		if unsigned.Get("prev_content").Exists() && unsigned.Get("prev_sender").Exists() {
+			continue
+		}
+		targets = append(targets, target{event: ev, replaces: replaces.String()})
+		idSet[replaces.String()] = true
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+
+	ids := make([]string, 0, len(idSet))
+	for id := range idSet {
+		ids = append(ids, id)
+	}
+
+	const q = `
+		SELECT e.event_id, e.sender, ej.json
+		  FROM events e JOIN event_json ej USING (event_id)
+		 WHERE e.event_id = ANY($1)`
+	rows, err := s.pool.Query(ctx, q, ids)
+	if err != nil {
+		return fmt.Errorf("store: prev content: %w", err)
+	}
+	defer rows.Close()
+
+	type prev struct {
+		sender  string
+		content json.RawMessage
+	}
+	prevs := make(map[string]prev, len(ids))
+	for rows.Next() {
+		var id, sender string
+		var body []byte
+		if err := rows.Scan(&id, &sender, &body); err != nil {
+			return fmt.Errorf("store: prev content: %w", err)
+		}
+		prevs[id] = prev{sender: sender, content: json.RawMessage(gjson.GetBytes(body, "content").Raw)}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("store: prev content: %w", err)
+	}
+
+	for _, t := range targets {
+		p, ok := prevs[t.replaces]
+		if !ok {
+			// Synapse passes allow_none=True: a replaced event that has been
+			// purged simply yields no prev_content.
+			continue
+		}
+		body, err := sjson.SetRawBytes(t.event.JSON, "unsigned.prev_content", p.content)
+		if err != nil {
+			return fmt.Errorf("store: prev content: %w", err)
+		}
+		body, err = sjson.SetBytes(body, "unsigned.prev_sender", p.sender)
+		if err != nil {
+			return fmt.Errorf("store: prev content: %w", err)
+		}
+		t.event.JSON = body
+	}
+	return nil
+}
+
+// MembershipChange is one of a user's membership events in a room.
+type MembershipChange struct {
+	StreamOrdering int64
+	Membership     string
+}
+
+// UserMembershipTimeline returns the user's membership events in a room, in
+// ascending stream order, from the given position onwards.
+//
+// This answers MSC4115's `unsigned.membership`: the requesting user's
+// membership *at each event*. Synapse gets it from the state resolved at every
+// event, but for a single user the answer is far cheaper than that -- their
+// membership at an event is simply the most recent m.room.member event for
+// them at or before it. State-group resolution buys nothing here, because
+// there is only ever one state key in play.
+//
+// This matters more than it looks. An earlier version stamped the user's
+// *current* membership on every timeline event, which is right only for a user
+// who has been joined since the room was created. In a room joined later,
+// Synapse reports "leave" for events from before the join, and we reported
+// "join" -- wrong on every historical event.
+func (s *Store) UserMembershipTimeline(ctx context.Context, roomID, userID string,
+	fromStreamOrdering int64) ([]MembershipChange, error) {
+
+	const q = `
+		SELECT e.stream_ordering, COALESCE(m.membership, '')
+		  FROM events e LEFT JOIN room_memberships m USING (event_id)
+		 WHERE e.room_id = $1 AND e.type = 'm.room.member' AND e.state_key = $2
+		   AND e.outlier = FALSE
+		 ORDER BY e.stream_ordering`
+	rows, err := s.pool.Query(ctx, q, roomID, userID)
+	if err != nil {
+		return nil, fmt.Errorf("store: membership timeline: %w", err)
+	}
+	defer rows.Close()
+
+	var out []MembershipChange
+	for rows.Next() {
+		var c MembershipChange
+		if err := rows.Scan(&c.StreamOrdering, &c.Membership); err != nil {
+			return nil, fmt.Errorf("store: membership timeline: %w", err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: membership timeline: %w", err)
+	}
+	return out, nil
+}
+
+// MembershipAt reports the user's membership at a stream position.
+//
+// Synapse defaults an absent membership to "leave": a user who was never in
+// the room is, for visibility purposes, indistinguishable from one who left.
+func MembershipAt(timeline []MembershipChange, streamOrdering int64) string {
+	membership := "leave"
+	for _, c := range timeline {
+		if c.StreamOrdering > streamOrdering {
+			break
+		}
+		if c.Membership != "" {
+			membership = c.Membership
+		}
+	}
+	return membership
+}

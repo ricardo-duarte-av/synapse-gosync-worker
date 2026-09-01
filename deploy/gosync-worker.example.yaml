@@ -1,0 +1,124 @@
+# Synapse gosync-worker configuration.
+#
+# A Go reimplementation of Synapse's classic /sync worker. It reads Synapse's
+# PostgreSQL directly and follows Synapse's replication stream over Redis.
+#
+# Nothing is routed to this worker. It exists to be driven deliberately by
+# cmd/syncdiff and by a test account, and compared against a real Synapse sync
+# worker, until its answers are trusted.
+
+server_name: aguiarvieira.pt
+
+listen:
+  # NOT under /var/sockets/nginx. Everything in that directory is an nginx
+  # upstream by convention, and this worker must never receive real client
+  # traffic by accident.
+  socket: /var/sockets/gosync-worker.sock
+  # 0660 is enough: only the comparator and the operator connect here. Synapse's
+  # own worker sockets are 0666 because nginx runs in another container as a
+  # different uid, which does not apply to us.
+  socket_mode: "0660"
+
+# Read-only access to Synapse's PostgreSQL.
+#
+# The unix socket needs no password and no network path.
+#
+# This deployment reuses `gopro_ro`, the role synapse-gopro-worker already runs
+# as: it has SELECT on every table, default_transaction_read_only, and a
+# statement_timeout, which is exactly what is wanted here. A second role would
+# have added a superuser step and a second thing to keep in step with schema
+# migrations for no additional guarantee. deploy/readonly-role.sql remains for
+# a deployment that has no such role yet.
+#
+# Read-only is not merely a convention here. Synapse's own /sync DELETES
+# to-device messages it has just returned, and a read-only role means we
+# physically cannot -- see the note in README.md before serving to_device.
+database:
+  dsn: "host=/var/sockets user=gopro_ro dbname=synapse-db"
+  # Bounded well below Synapse's own pool so this worker cannot starve it.
+  max_conns: 16
+  connect_timeout_seconds: 10
+
+# Synapse's replication stream, over Redis (KeyDB here).
+#
+# Every long-poll wakeup comes from here. On a worker, Synapse's notifier is
+# driven entirely by replication -- a worker never learns about a new event by
+# persisting it -- so without this subscription /sync would answer correctly but
+# only ever on timeout, never promptly.
+#
+# It is read-only (SUBSCRIBE only) and needs no credentials beyond reaching
+# Redis. This is the *stream* replication every Synapse worker consumes, not the
+# HTTP `replication` listener and instance_map entry, which only writers need.
+replication:
+  enabled: true
+  # Unix socket path, or host:port.
+  address: /var/sockets/keydb
+  # MUST equal Synapse's server_name: the channel is named after it, and one
+  # Redis can carry several homeservers' streams. Subscribing to the wrong
+  # channel raises no error and delivers nothing, so the worker would simply
+  # never wake up and would look merely idle. Defaults to server_name above.
+  channel: aguiarvieira.pt
+  # password: ""
+  # db: 0
+
+# Access-token authentication, by asking Synapse.
+#
+# Deliberately NOT a SELECT against access_tokens, even though Synapse's own
+# lookup is a plain `WHERE token = ?` with no hashing. Three kinds of caller
+# would be wrongly rejected by that query: appservice tokens live in
+# registration files and never reach the database; delegated auth (MAS) keeps
+# tokens outside Synapse entirely; and guest tokens are macaroons, verifiable
+# only with macaroon_secret_key -- which this worker must never hold. There are
+# 79 guest accounts on this homeserver, so that last one is not hypothetical.
+#
+# whoami also returns the device_id, which /sync cannot work without: to-device
+# messages and device-list updates are per-device, not per-user.
+auth:
+  whoami_socket: /var/sockets/nginx/av-request-worker-1.sock
+  positive_ttl: 5m
+  # A rejection is cached too, so a bad token cannot become a stream of requests
+  # to Synapse. Short, because a token can be granted at any moment.
+  negative_ttl: 30s
+  max_entries: 20000
+  timeout_seconds: 10
+
+# The Synapse sync worker that cmd/syncdiff compares against.
+#
+# It MUST have `sync_response_cache_duration: 0`. Synapse caches a sync response
+# keyed by (user, timeout, since, filter, full_state, device_id, ...) for two
+# minutes by default -- five on av-sync-worker-1. A comparator that replays a
+# request against a caching worker is handed a frozen earlier answer and told it
+# matched, which is the most dangerous possible failure mode: it reports success.
+#
+# For the same reason this must not be av-sync-worker-1, which serves real
+# clients and whose cache is deliberately longer (5m, set explicitly).
+#
+# av-sync-worker-2 is up with the cache disabled. Note that its socket lives
+# under /var/sockets/nginx/ by Synapse's worker convention even though nginx
+# routes nothing to it.
+reference:
+  socket: /var/sockets/nginx/av-sync-worker-2.sock
+
+testing:
+  # Enables ?_gosync_now=<token>, which forces the now_token this worker
+  # computes against instead of reading the current stream position.
+  #
+  # This is the hinge the entire verification story turns on. Ask two sync
+  # implementations the same question a second apart and they will legitimately
+  # disagree, because each snapshots the stream position at its own start:
+  # anything persisted in between appears in one answer and not the other. There
+  # is no amount of care in the comparator that fixes that from the outside.
+  # Pinning both sides to one token is what makes a difference mean a bug.
+  #
+  # It also accepts a window that has not happened yet, so it MUST be false in
+  # production.
+  allow_pin_now: false
+
+metrics:
+  addr: ":9201"
+
+log:
+  level: info
+  # Human-readable coloured console output instead of JSON. For eyes only;
+  # leave it off if anything downstream parses the log.
+  pretty: false

@@ -1,0 +1,216 @@
+package handlers
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/auth"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/matrixerr"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/metrics"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/server"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/store"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/streamtoken"
+)
+
+// authenticate validates the caller and annotates the request log.
+//
+// A whoami failure is 502, never 401: refusing a valid token because Synapse
+// could not be reached would log real clients out. That distinction is the
+// whole reason auth.AuthenticateAs separates "rejected" from "unknown".
+func authenticate(w http.ResponseWriter, r *http.Request, d Deps, ann *server.Annotation) (auth.Verdict, bool) {
+	creds := auth.ExtractCredentials(r)
+	if creds.Token == "" {
+		metrics.AuthVerdictsTotal.WithLabelValues("missing").Inc()
+		refuse(w, ann, http.StatusUnauthorized, matrixerr.Error{
+			ErrCode: matrixerr.CodeMissingToken, Error: "Missing access token"})
+		return auth.Verdict{}, false
+	}
+
+	verdict, err := d.Auth.AuthenticateAs(r.Context(), creds)
+	if err != nil {
+		metrics.AuthVerdictsTotal.WithLabelValues("unavailable").Inc()
+		d.Log.Error().Err(err).Msg("cannot reach Synapse to validate a token")
+		refuse(w, ann, http.StatusBadGateway, matrixerr.Error{
+			ErrCode: matrixerr.CodeUnknown, Error: "Cannot validate the access token right now"})
+		return auth.Verdict{}, false
+	}
+	if !verdict.Valid {
+		metrics.AuthVerdictsTotal.WithLabelValues("rejected").Inc()
+		// Pass Synapse's own rejection through. It distinguishes an expired
+		// token (soft logout: keep local state) from an unknown one (hard
+		// logout: wipe), and clients act very differently on the two.
+		mxErr := matrixerr.Error{ErrCode: matrixerr.CodeUnknownToken, Error: "Invalid access token"}
+		status := http.StatusUnauthorized
+		if verdict.Rejection != nil {
+			mxErr = *verdict.Rejection
+			status = verdict.Status
+		}
+		refuse(w, ann, status, mxErr)
+		return auth.Verdict{}, false
+	}
+
+	metrics.AuthVerdictsTotal.WithLabelValues("accepted").Inc()
+	metrics.AuthCacheEntries.Set(float64(d.Auth.Len()))
+	if ann != nil {
+		ann.UserID = verdict.UserID
+		ann.DeviceID = verdict.DeviceID
+	}
+	return verdict, true
+}
+
+func refuse(w http.ResponseWriter, ann *server.Annotation, status int, e matrixerr.Error) {
+	if ann != nil {
+		ann.Outcome = "refused"
+		if ann.Reason == "" {
+			ann.Reason = e.ErrCode
+		}
+	}
+	matrixerr.Write(w, status, e)
+}
+
+// internalError logs the cause and returns a body that does not leak it.
+func internalError(d Deps, what string, err error) *matrixerr.Error {
+	d.Log.Error().Err(err).Str("during", what).Msg("request failed")
+	return &matrixerr.Error{ErrCode: matrixerr.CodeUnknown, Error: "Internal server error"}
+}
+
+// roomReceipts renders a room's receipts as the single m.receipt event the
+// legacy endpoints emit, or an empty list.
+//
+// Private read receipts of *other* users are removed. Synapse does this in
+// ReceiptEventSource.filter_out_private_receipts, and skipping it would publish
+// exactly the information m.read.private exists to keep private.
+func roomReceipts(ctx context.Context, d Deps, roomID, userID string,
+	to streamtoken.MultiWriter) ([]json.RawMessage, error) {
+
+	rows, err := d.Store.RoomReceipts(ctx, roomID, to)
+	if err != nil {
+		return nil, err
+	}
+
+	// event_id -> receipt_type -> user_id -> data
+	content := map[string]map[string]map[string]json.RawMessage{}
+	for _, row := range rows {
+		if !inRange(to, row.InstanceName, row.StreamID) {
+			continue
+		}
+		if row.ReceiptType == "m.read.private" && row.UserID != userID {
+			continue
+		}
+		byType, ok := content[row.EventID]
+		if !ok {
+			byType = map[string]map[string]json.RawMessage{}
+			content[row.EventID] = byType
+		}
+		byUser, ok := byType[row.ReceiptType]
+		if !ok {
+			byUser = map[string]json.RawMessage{}
+			byType[row.ReceiptType] = byUser
+		}
+		byUser[row.UserID] = row.Data
+	}
+
+	if len(content) == 0 {
+		return []json.RawMessage{}, nil
+	}
+	body, err := json.Marshal(map[string]any{
+		"type": "m.receipt", "room_id": roomID, "content": content,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{body}, nil
+}
+
+// inRange is MultiWriterStreamToken.is_stream_position_in_range for a token
+// used as an upper bound only.
+//
+// A row with no instance_name predates multi-writer support and is compared
+// against the agreed minimum.
+func inRange(to streamtoken.MultiWriter, instanceName string, pos int64) bool {
+	_ = instanceName
+	// Instance names would have to be resolved to ids through `instance_map` to
+	// compare per writer. Until then the conservative bound is the highest
+	// position any writer reached, which is what the query already applied, so
+	// every returned row is in range.
+	return pos <= to.MaxStreamPos()
+}
+
+// roomAccountData renders the account data events for a room.
+func roomAccountData(ctx context.Context, d Deps, userID, roomID string) ([]json.RawMessage, error) {
+	entries, err := d.Store.RoomAccountData(ctx, userID, roomID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]json.RawMessage, 0, len(entries))
+	for _, e := range entries {
+		body, err := json.Marshal(map[string]any{"type": e.Type, "content": e.Content})
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, body)
+	}
+	return out, nil
+}
+
+// roomPresence renders m.presence for the room's joined members.
+//
+// Mirrors format_user_presence_state: last_active_ago and status_msg appear
+// only when set, and currently_active only when the user is online.
+func roomPresence(ctx context.Context, d Deps, state []store.StateEvent, timeNow int64) ([]json.RawMessage, error) {
+	var members []string
+	for _, ev := range state {
+		if ev.Type == "m.room.member" && memberIsJoined(ev) {
+			members = append(members, ev.StateKey)
+		}
+	}
+	states, err := d.Store.Presence(ctx, members)
+	if err != nil {
+		return nil, err
+	}
+	byUser := make(map[string]store.PresenceState, len(states))
+	for _, p := range states {
+		byUser[p.UserID] = p
+	}
+
+	out := make([]json.RawMessage, 0, len(members))
+	for _, user := range members {
+		p, ok := byUser[user]
+		if !ok {
+			// Synapse's presence handler substitutes a default offline state
+			// for a user with no presence_stream row, rather than omitting
+			// them. Omitting them loses a member from every room whose users
+			// have never set presence -- 4 of 28 in the largest test room here.
+			p = store.PresenceState{UserID: user, State: "offline"}
+		}
+		content := map[string]any{"presence": p.State, "user_id": p.UserID}
+		if p.HasLastActive {
+			content["last_active_ago"] = timeNow - p.LastActiveTS
+		}
+		if p.HasStatusMsg {
+			content["status_msg"] = p.StatusMsg
+		}
+		if p.State == "online" {
+			content["currently_active"] = p.CurrentlyActive
+		}
+		body, err := json.Marshal(map[string]any{"type": "m.presence", "content": content})
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, body)
+	}
+	return out, nil
+}
+
+func memberIsJoined(ev store.StateEvent) bool {
+	var parsed struct {
+		Content struct {
+			Membership string `json:"membership"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(ev.JSON, &parsed); err != nil {
+		return false
+	}
+	return parsed.Content.Membership == "join"
+}

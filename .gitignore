@@ -30,3 +30,6 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Deployment specifics and test credentials. Points at things that are secret.
+.claude/
