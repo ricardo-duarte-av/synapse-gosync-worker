@@ -2,6 +2,33 @@
 
 Newest first. Numbers are measurements, not estimates.
 
+## 2026-09-01 — M3 started: initial `/sync` serving, two gaps left
+
+An initial `/sync` is served and most of it matches. Building it turned up four
+more ways `/sync` differs from the legacy endpoints, all in
+[synapse-notes.md](synapse-notes.md):
+
+- **`/sync` paginates by stream ordering**, the legacy endpoints
+  topologically — so `prev_batch` is a live `s...` token there and a historical
+  `t...-...` here, and backfilled events (negative stream orderings) are ordered
+  quite differently by the two.
+- **`summary` is only computed when the filter enables lazy-loading.** With the
+  default filter Synapse sends `"summary": {}`.
+- **The per-room and whole-account account-data queries disagree** about MSC3391
+  deleted entries, exactly as the two receipt queries disagree about `thread_id`.
+  That is now two such pairs: which accessor a handler calls is part of the
+  contract, not an implementation detail.
+- **`device_one_time_keys_count` always reports `signed_curve25519`**, even at
+  zero.
+
+Remaining for M3: `m.push_rules` is not yet synthesised into `account_data`
+(Synapse layers the `push_rules` table over a long built-in base ruleset), and
+one state-block divergence on a key that changed outside the timeline, where
+`_calculate_state` may itself be order-dependent.
+
+M1 and M2 still match on both accounts: 9/9 and 30/30 rooms, and `/initialSync`
+for each.
+
 ## 2026-09-01 — state-group resolver: every gap closed
 
 **Both accounts, both endpoints, fully at parity.** `@test` now matches on all

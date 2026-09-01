@@ -31,6 +31,8 @@ type Routes struct {
 	RoomInitialSync http.Handler
 	// InitialSync serves /initialSync.
 	InitialSync http.Handler
+	// Sync serves /sync.
+	Sync http.Handler
 }
 
 // NewMux assembles the router.
@@ -57,6 +59,12 @@ func NewMux(routes Routes) *http.ServeMux {
 	if routes.InitialSync != nil {
 		for _, v := range legacyVersions {
 			mux.Handle("GET /_matrix/client/"+v+"/initialSync", routes.InitialSync)
+		}
+	}
+
+	if routes.Sync != nil {
+		for _, v := range modernVersions {
+			mux.Handle("GET /_matrix/client/"+v+"/sync", routes.Sync)
 		}
 	}
 

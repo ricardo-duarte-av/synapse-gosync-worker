@@ -68,7 +68,14 @@ type AccountDataEntry struct {
 // Synapse emits the tags first, as a synthetic `m.tag` event, then the stored
 // room account data. Tags live in their own table rather than in
 // room_account_data, so they would be missed entirely by the obvious query.
-func (s *Store) RoomAccountData(ctx context.Context, userID, roomID string, msc3391 bool) ([]AccountDataEntry, error) {
+// Note: NO msc3391 filter, deliberately. `get_account_data_for_room` --
+// the per-room query, used by /rooms/{roomId}/initialSync -- is a plain
+// simple_select_list with no `content != '{}'` clause, while
+// `get_room_account_data_for_user` -- the whole-account query behind
+// /initialSync and /sync -- has one. So a deleted entry is hidden by one
+// endpoint and shown by the other. The same asymmetry as the two receipt
+// queries; mirror it rather than pick a side.
+func (s *Store) RoomAccountData(ctx context.Context, userID, roomID string) ([]AccountDataEntry, error) {
 	var out []AccountDataEntry
 
 	tags, err := s.roomTags(ctx, userID, roomID)
@@ -79,14 +86,11 @@ func (s *Store) RoomAccountData(ctx context.Context, userID, roomID string, msc3
 		out = append(out, AccountDataEntry{Type: "m.tag", Content: tags})
 	}
 
-	q := `
+	const q = `
 		SELECT account_data_type, content
 		  FROM room_account_data
-		 WHERE user_id = $1 AND room_id = $2`
-	if msc3391 {
-		q += ` AND content != '{}'`
-	}
-	q += ` ORDER BY account_data_type`
+		 WHERE user_id = $1 AND room_id = $2
+		 ORDER BY account_data_type`
 	rows, err := s.pool.Query(ctx, q, userID, roomID)
 	if err != nil {
 		return nil, fmt.Errorf("store: room account data: %w", err)

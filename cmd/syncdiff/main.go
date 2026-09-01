@@ -42,7 +42,7 @@ func main() {
 		tokenFile = flag.String("token-file", "", "file holding the test account's access token")
 		rooms     = flag.String("rooms", "", "comma-separated room IDs; default is every joined room")
 		limit     = flag.Int("limit", 10, "pagination limit to request")
-		endpoint  = flag.String("endpoint", "room_initial_sync", "room_initial_sync | initial_sync")
+		endpoint  = flag.String("endpoint", "room_initial_sync", "room_initial_sync | initial_sync | sync")
 		verbose   = flag.Bool("v", false, "print each compared response")
 	)
 	flag.Parse()
@@ -63,16 +63,20 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
+	if *endpoint == "sync" {
+		res := compareSync(ctx, ours, ref, token, *limit, *verbose)
+		printOne("/sync", res)
+		report(boolToInt(res.kind == resultMatch), boolToInt(res.kind == resultMismatch),
+			boolToInt(res.kind == resultSkip))
+		if res.kind == resultMismatch {
+			os.Exit(1)
+		}
+		return
+	}
+
 	if *endpoint == "initial_sync" {
 		res := compareInitialSync(ctx, ours, ref, token, *limit, *verbose)
-		switch res.kind {
-		case resultMatch:
-			fmt.Println("  ok        /initialSync")
-		case resultSkip:
-			fmt.Printf("  skip      /initialSync: %s\n", res.detail)
-		default:
-			fmt.Printf("  MISMATCH  /initialSync\n%s\n", indent(res.detail))
-		}
+		printOne("/initialSync", res)
 		report(boolToInt(res.kind == resultMatch), boolToInt(res.kind == resultMismatch),
 			boolToInt(res.kind == resultSkip))
 		if res.kind == resultMismatch {
@@ -434,6 +438,14 @@ var setPaths = map[string]string{
 	// /initialSync fans out over a dict of rooms, so its order is Synapse's
 	// iteration order and means nothing. Matched on room_id.
 	".rooms": "room_id",
+	// /sync nests invite state under the room.
+	".invite_state.events": "event_id",
+	// /sync's state and account data blocks are unordered sets of events; its
+	// timeline is not.
+	".state.events":        "event_id",
+	".account_data.events": "",
+	".ephemeral.events":    "",
+	".presence.events":     "sender",
 }
 
 // setPathFor maps a response path to its set-comparison rule, if it has one.
@@ -445,11 +457,13 @@ func setPathFor(path string) (string, bool) {
 	if key, ok := setPaths[path]; ok {
 		return key, true
 	}
-	if strings.HasPrefix(path, ".rooms[") {
-		if idx := strings.Index(path, "]"); idx >= 0 {
-			if key, ok := setPaths[path[idx+1:]]; ok {
-				return key, true
-			}
+	// A nested path such as `.rooms.join.!x:y.state.events` gets the same rule
+	// as the bare section name, so the two endpoints and every room agree on
+	// what is ordered and what is not. Matched by suffix because a room id
+	// contains dots and colons and cannot be parsed out reliably.
+	for suffix, key := range setPaths {
+		if strings.HasSuffix(path, suffix) {
+			return key, true
 		}
 	}
 	return "", false
@@ -467,7 +481,9 @@ func setPathFor(path string) (string, bool) {
 // load the event first, so it is not reproducible. Emitting them where Synapse
 // does not would still be our bug, and is still reported.
 func isToleratedUpstreamOnly(path string) bool {
-	if strings.Contains(path, ".state[") {
+	// `.state[...]` on the legacy endpoints, `.state.events[...]` on /sync:
+	// the same shared-event-cache artefact reaches both.
+	if strings.Contains(path, ".state[") || strings.Contains(path, ".state.events[") {
 		for _, suffix := range []string{
 			".prev_content", ".unsigned.prev_content", ".unsigned.prev_sender",
 		} {
@@ -741,4 +757,97 @@ func expandHome(path string) string {
 		}
 	}
 	return path
+}
+
+func printOne(name string, res result) {
+	switch res.kind {
+	case resultMatch:
+		fmt.Println("  ok        " + name)
+	case resultSkip:
+		fmt.Printf("  skip      %s: %s\n", name, res.detail)
+	default:
+		fmt.Printf("  MISMATCH  %s\n%s\n", name, indent(res.detail))
+	}
+}
+
+// compareSync compares an initial /sync.
+//
+// set_presence=offline throughout: a sync marks the user online and emits
+// USER_SYNC over replication, and a comparator must not perturb the deployment
+// it is measuring.
+func compareSync(ctx context.Context, ours, ref *http.Client, token string,
+	limit int, verbose bool) result {
+
+	path := "/_matrix/client/v3/sync"
+	q := url.Values{"timeout": {"0"}, "set_presence": {"offline"}}
+
+	refBody, status, err := get(ctx, ref, path+"?"+q.Encode(), token)
+	if err != nil {
+		return result{resultSkip, fmt.Sprintf("reference request failed: %v", err)}
+	}
+	if status != http.StatusOK {
+		return result{resultSkip, fmt.Sprintf("reference returned %d: %s", status, truncate(refBody))}
+	}
+	var refResp map[string]any
+	if err := json.Unmarshal(refBody, &refResp); err != nil {
+		return result{resultSkip, fmt.Sprintf("reference body is not JSON: %v", err)}
+	}
+	end, ok := refResp["next_batch"].(string)
+	if !ok {
+		return result{resultSkip, "reference response has no next_batch"}
+	}
+	timeNow, ok := recoverTimeNowFromSync(refResp)
+	if !ok {
+		return result{resultSkip, "cannot recover the reference clock from any room"}
+	}
+
+	q.Set("_gosync_now", end)
+	q.Set("_gosync_time_now", fmt.Sprint(timeNow))
+	ourBody, status, err := get(ctx, ours, path+"?"+q.Encode(), token)
+	if err != nil {
+		return result{resultMismatch, fmt.Sprintf("our request failed: %v", err)}
+	}
+	if status != http.StatusOK {
+		return result{resultMismatch, fmt.Sprintf("we returned %d: %s", status, truncate(ourBody))}
+	}
+	var ourResp map[string]any
+	if err := json.Unmarshal(ourBody, &ourResp); err != nil {
+		return result{resultMismatch, fmt.Sprintf("our body is not JSON: %v", err)}
+	}
+	if verbose {
+		fmt.Printf("--- /sync ---\n%s\n", truncate(ourBody))
+	}
+
+	var diffs []string
+	diff("", ourResp, refResp, &diffs)
+	if len(diffs) == 0 {
+		return result{resultMatch, ""}
+	}
+	return result{resultMismatch, strings.Join(diffs, "\n")}
+}
+
+// recoverTimeNowFromSync reconstructs the millisecond the reference used, from
+// any event carrying both origin_server_ts and unsigned.age.
+func recoverTimeNowFromSync(resp map[string]any) (int64, bool) {
+	rooms, _ := resp["rooms"].(map[string]any)
+	join, _ := rooms["join"].(map[string]any)
+	for _, room := range join {
+		r, _ := room.(map[string]any)
+		for _, section := range []string{"state", "timeline"} {
+			block, _ := r[section].(map[string]any)
+			events, _ := block["events"].([]any)
+			for _, e := range events {
+				ev, _ := e.(map[string]any)
+				ts, tsOK := ev["origin_server_ts"].(float64)
+				unsigned, uOK := ev["unsigned"].(map[string]any)
+				if !tsOK || !uOK {
+					continue
+				}
+				if age, ok := unsigned["age"].(float64); ok {
+					return int64(ts) + int64(age), true
+				}
+			}
+		}
+	}
+	return 0, false
 }

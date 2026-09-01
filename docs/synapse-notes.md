@@ -296,6 +296,47 @@ replace v8's `restricted_join_rule` — it joins it. A first attempt to extract 
 table by regex silently dropped every inherited flag. The Go table is flattened
 by hand for that reason, with the inheritance spelled out in a comment.
 
+## `/sync` is not `/initialSync` with different keys (2026-09-01)
+
+Four differences found while building M3, none of them cosmetic.
+
+### `/sync` paginates by stream ordering; the legacy endpoints paginate topologically
+
+`/rooms/{id}/initialSync` hands back a historical `t426-2633508` token;
+`/sync` hands back a live `s13907984`. They are not two spellings of one
+position: stream ordering is the server's insertion order and goes **negative**
+for backfilled events, so a room with imported history is ordered quite
+differently by the two, and `/sync` will not return backfilled events at all
+where the legacy endpoint does.
+
+`prev_batch` in a sync timeline is `RoomStreamToken(stream=first.stream_ordering - 1)`
+(`handlers/sync.py:800`) -- always the live form.
+
+### `summary` is only computed when the filter enables lazy-loading
+
+`compute_summary` is guarded on `sync_config.filter_collection.lazy_load_members()`
+(`handlers/sync.py:3244`), because heroes exist for clients that lack the
+memberships to name a room themselves. With the default filter Synapse sends
+`"summary": {}` -- an empty object, not a populated one and not a missing key.
+
+### The per-room and whole-account account-data queries disagree, exactly like receipts
+
+`get_account_data_for_room` -- the per-room query behind
+`/rooms/{roomId}/initialSync` -- is a plain select with no MSC3391 clause, while
+`get_room_account_data_for_user`, behind `/initialSync` and `/sync`, filters out
+empty content. So a *deleted* account-data entry is hidden by one endpoint and
+shown by the other.
+
+That is the second such pair, after the two receipt queries. The lesson
+generalises: **on these endpoints, "which query does this handler call" is part
+of the contract**, not an implementation detail, because Synapse's singular and
+plural accessors have drifted apart.
+
+### `device_one_time_keys_count` always reports `signed_curve25519`
+
+Even at zero. Synapse's comment cites element-hq/element-android#3725: a client
+cannot otherwise tell "no keys left" from "this server does not report counts".
+
 ### Reading Synapse's source
 
 | What | Where |

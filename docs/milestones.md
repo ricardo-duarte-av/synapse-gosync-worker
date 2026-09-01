@@ -10,7 +10,7 @@ Status is recorded here; what actually happened is in [log.md](log.md).
 |---|---|---|
 | M1 | Skeleton, auth, `/rooms/{roomId}/initialSync` | **done — 9/9 rooms at parity** |
 | M2 | `/initialSync` | **done — at parity** |
-| M3 | Initial `/sync` (no `since`) | next |
+| M3 | Initial `/sync` (no `since`) | **in progress** — serving, two known gaps |
 | M4 | Stream tokens and incremental `/sync` | token package done in M1 |
 | M5 | Long-polling and Redis replication | not started |
 | M6 | Filters and lazy-loading | not started |
@@ -40,6 +40,26 @@ The two initialSync endpoints differ upstream in four ways that are easy to miss
 see [synapse-notes.md](synapse-notes.md) before touching either.
 
 `archived=true` returns 501: left rooms need the state at the leave event.
+
+## M3 — in progress
+
+An initial `/sync` (no `since`) is served and most of it matches. Two gaps
+remain:
+
+- **`m.push_rules` is not injected into `account_data`.** Synapse synthesises
+  it from the `push_rules` table layered over its built-in base rules. This is
+  the larger of the two: the base ruleset is a long hardcoded list that has to
+  be reproduced exactly.
+- **One state-block divergence**, on a key whose state event changed *outside*
+  the timeline. `_calculate_state` unions the state at both ends of the timeline
+  into a set of event IDs and then rebuilds a map keyed by state key, so when
+  both ends carry a different event for the same key, which one survives depends
+  on Python set iteration order. Needs pinning down before it can be called
+  either a bug of ours or nondeterminism of Synapse's.
+
+An incremental `/sync` (`since` present) returns 501 rather than being answered
+as though it were an initial sync, which would resend the client's whole
+history. That is M4.
 
 ## M5 is not just long-polling
 
