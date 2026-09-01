@@ -10,7 +10,7 @@ Status is recorded here; what actually happened is in [log.md](log.md).
 |---|---|---|
 | M1 | Skeleton, auth, `/rooms/{roomId}/initialSync` | **done — 9/9 rooms at parity** |
 | M2 | `/initialSync` | **done — at parity** |
-| M3 | Initial `/sync` (no `since`) | **in progress** — serving, two known gaps |
+| M3 | Initial `/sync` (no `since`) | **nearly done** — matches for one account; 3 items on the other |
 | M4 | Stream tokens and incremental `/sync` | token package done in M1 |
 | M5 | Long-polling and Redis replication | not started |
 | M6 | Filters and lazy-loading | not started |
@@ -41,25 +41,18 @@ see [synapse-notes.md](synapse-notes.md) before touching either.
 
 `archived=true` returns 501: left rooms need the state at the leave event.
 
-## M3 — in progress
+## M3 — nearly done
 
-An initial `/sync` (no `since`) is served and most of it matches. Two gaps
-remain:
+An initial `/sync` matches Synapse in full for `@goworker` (9 rooms). For
+`@test` (30 rooms, far more varied) three narrow items remain:
 
-- **`m.push_rules` is not injected into `account_data`.** Synapse synthesises
-  it from the `push_rules` table layered over its built-in base rules. This is
-  the larger of the two: the base ruleset is a long hardcoded list that has to
-  be reproduced exactly.
-- **One state-block divergence**, on a key whose state event changed *outside*
-  the timeline. `_calculate_state` unions the state at both ends of the timeline
-  into a set of event IDs and then rebuilds a map keyed by state key, so when
-  both ends carry a different event for the same key, which one survives depends
-  on Python set iteration order. Needs pinning down before it can be called
-  either a bug of ours or nondeterminism of Synapse's.
+- MSC2654's `unread_count` is low in 2 rooms.
+- 5 state entries across 2 rooms: our `state` block and Synapse's pick different
+  events for a key, or we carry keys it does not.
+- The ephemeral receipt set differs in 2 rooms.
 
-An incremental `/sync` (`since` present) returns 501 rather than being answered
-as though it were an initial sync, which would resend the client's whole
-history. That is M4.
+`m.push_rules` is done and matches exactly. An incremental `/sync` (`since`
+present) returns 501; that is M4.
 
 ## M5 is not just long-polling
 

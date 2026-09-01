@@ -2,10 +2,12 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/pushrules"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/streamtoken"
 )
 
@@ -196,33 +198,82 @@ func firstN(xs []string, n int) []string {
 type UnreadCounts struct {
 	NotifyCount    int
 	HighlightCount int
+	// UnreadCount is MSC2654's count, a different number from NotifyCount: it
+	// counts events marked `unread` rather than events that would notify. A
+	// muted room accumulates unread events and no notifications.
+	UnreadCount int
 }
 
-// UnreadNotifications reads a user's unread counts for a room.
+// UnreadNotifications reads a user's unread counts for a room's main timeline.
 //
-// event_push_summary is a rollup maintained by a background job, covering
-// everything up to its stream_ordering; anything newer is still in
-// event_push_actions and has to be added on. Reading only the summary
-// undercounts by however far behind the rollup is.
+// A port of _get_unread_counts_by_receipt_txn. Three things make this more than
+// a SELECT SUM:
+//
+//   - Counts are relative to the user's latest READ RECEIPT, not to the start
+//     of the room. Without that bound every count is the room's whole history.
+//     A user with no receipt at all is measured from their own membership
+//     event, which Synapse assumes is a join.
+//   - event_push_summary is a rollup, and a row is only usable when its
+//     `last_receipt_stream_ordering` matches the receipt actually in force. A
+//     newer receipt means the rollup has not caught up and the row must be
+//     ignored, not added.
+//   - Highlights are never summarised, so they are always counted from
+//     event_push_actions directly.
+//
+// Only the main timeline is reported here; per-thread counts belong in
+// unread_thread_notifications.
 func (s *Store) UnreadNotifications(ctx context.Context, roomID, userID string) (UnreadCounts, error) {
 	const q = `
-		WITH summary AS (
+		WITH receipt AS (
+			-- The user's latest unthreaded read receipt, or failing that their
+			-- own membership event.
+			SELECT COALESCE(
+				(SELECT MAX(event_stream_ordering) FROM receipts_linearized
+				  WHERE user_id = $2 AND room_id = $1 AND thread_id IS NULL
+				    AND receipt_type IN ('m.read', 'm.read.private')),
+				(SELECT e.stream_ordering FROM local_current_membership c
+				   JOIN events e ON e.event_id = c.event_id
+				  WHERE c.room_id = $1 AND c.user_id = $2),
+				0) AS pos
+		),
+		rotated AS (
+			SELECT COALESCE((SELECT stream_ordering FROM event_push_summary_stream_ordering), 0) AS pos
+		),
+		summary AS (
+			-- Usable only when the rollup reflects the receipt in force.
 			SELECT COALESCE(SUM(notif_count), 0) AS notif,
-			       COALESCE(MAX(stream_ordering), 0) AS pos
-			  FROM event_push_summary
+			       COALESCE(SUM(COALESCE(unread_count, 0)), 0) AS unread,
+			       COUNT(*) AS rows
+			  FROM event_push_summary, receipt
 			 WHERE room_id = $1 AND user_id = $2 AND thread_id = 'main'
+			   AND ((last_receipt_stream_ordering IS NULL AND stream_ordering > receipt.pos)
+			        OR last_receipt_stream_ordering = receipt.pos)
+			   -- An all-zero rollup row does not count as a summary. Treating
+			   -- it as one makes the thread look already-counted, and only
+			   -- events after the last rotation get added -- which undercounts
+			   -- by everything between the receipt and the rotation.
+			   AND (notif_count != 0 OR COALESCE(unread_count, 0) != 0)
 		)
-		SELECT summary.notif
-		     + COALESCE((SELECT COUNT(*) FROM event_push_actions a
-		                  WHERE a.room_id = $1 AND a.user_id = $2
-		                    AND a.notif = 1 AND a.thread_id = 'main'
-		                    AND a.stream_ordering > summary.pos), 0),
-		       COALESCE((SELECT COUNT(*) FROM event_push_actions a
-		                  WHERE a.room_id = $1 AND a.user_id = $2
-		                    AND a.highlight = 1 AND a.thread_id = 'main'), 0)
+		SELECT
+			summary.notif
+			  + COALESCE((SELECT COUNT(*) FROM event_push_actions a, receipt, rotated
+			               WHERE a.room_id = $1 AND a.user_id = $2 AND a.thread_id = 'main'
+			                 AND a.notif = 1 AND a.stream_ordering > receipt.pos
+			                 -- A summarised range is already counted; only
+			                 -- what came after the last rotation is added.
+			                 AND (summary.rows = 0 OR a.stream_ordering > rotated.pos)), 0),
+			COALESCE((SELECT COUNT(*) FROM event_push_actions a, receipt
+			           WHERE a.room_id = $1 AND a.user_id = $2 AND a.thread_id = 'main'
+			             AND a.highlight = 1 AND a.stream_ordering > receipt.pos), 0),
+			summary.unread
+			  + COALESCE((SELECT COUNT(*) FROM event_push_actions a, receipt, rotated
+			               WHERE a.room_id = $1 AND a.user_id = $2 AND a.thread_id = 'main'
+			                 AND a.unread = 1 AND a.stream_ordering > receipt.pos
+			                 AND (summary.rows = 0 OR a.stream_ordering > rotated.pos)), 0)
 		  FROM summary`
 	var c UnreadCounts
-	if err := s.pool.QueryRow(ctx, q, roomID, userID).Scan(&c.NotifyCount, &c.HighlightCount); err != nil {
+	if err := s.pool.QueryRow(ctx, q, roomID, userID).Scan(
+		&c.NotifyCount, &c.HighlightCount, &c.UnreadCount); err != nil {
 		return UnreadCounts{}, fmt.Errorf("store: unread notifications: %w", err)
 	}
 	return c, nil
@@ -325,34 +376,59 @@ func (s *Store) EventsByID(ctx context.Context, eventIDs []string, roomVersion s
 	return out, nil
 }
 
-// RecentEventsByStream returns a room's most recent events ordered by stream
-// ordering, with a token pointing just before the earliest returned.
+// PaginateBackwards loads a page of a room's history, newest first, in the
+// room's topological order.
 //
-// /sync paginates by STREAM ordering; the legacy initialSync endpoints
-// paginate topologically. The difference is visible in the token they hand
-// back -- a live `s...` here, a historical `t...-...` there -- and in what they
-// return: backfilled events carry negative stream orderings, so a room's
-// imported history is ordered quite differently by the two.
-func (s *Store) RecentEventsByStream(ctx context.Context, roomID, roomVersion string,
-	limit int, end streamtoken.RoomKey) ([]TimelineEvent, streamtoken.RoomKey, error) {
+// This is Synapse's _paginate_room_events_by_topological_ordering_txn, and an
+// initial /sync uses it -- NOT the stream-ordering variant. `pagination_method`
+// picks topological when there is no `since` and stream ordering only for
+// updates (handlers/sync.py:852). The difference is visible in any room with
+// backfilled history, where stream ordering is negative and bears no relation
+// to the room's own order.
+//
+// Returns the page in ascending order, a token just before its earliest event,
+// and whether more events were available than were returned.
+func (s *Store) PaginateBackwards(ctx context.Context, roomID, roomVersion string,
+	limit int, from streamtoken.RoomKey) ([]TimelineEvent, streamtoken.RoomKey, bool, error) {
 
 	if limit <= 0 {
-		return nil, end, nil
+		return nil, from, false, nil
 	}
-	const q = `
-		SELECT e.event_id, e.type, e.sender, e.stream_ordering,
-		       e.topological_ordering, COALESCE(e.instance_name, ''),
-		       COALESCE(e.state_key, ''), e.state_key IS NOT NULL,
-		       ej.json, ej.internal_metadata
+
+	// Synapse fetches twice what it was asked for, because the result set is
+	// filtered afterwards and would otherwise come up short.
+	requested := limit * 2
+
+	var (
+		sql  string
+		args []any
+	)
+	const cols = `e.event_id, e.type, e.sender, e.stream_ordering,
+	       e.topological_ordering, COALESCE(e.instance_name, ''),
+	       COALESCE(e.state_key, ''), e.state_key IS NOT NULL,
+	       ej.json, ej.internal_metadata`
+	if from.IsHistorical() {
+		sql = `SELECT ` + cols + `
 		  FROM events e JOIN event_json ej USING (event_id)
-		 WHERE e.outlier = FALSE AND e.room_id = $1 AND e.stream_ordering <= $2
-		 ORDER BY e.stream_ordering DESC
+		 WHERE e.outlier = FALSE AND e.room_id = $1
+		   AND (e.topological_ordering < $2
+		        OR (e.topological_ordering = $2 AND e.stream_ordering <= $3))
+		 ORDER BY e.topological_ordering DESC, e.stream_ordering DESC
+		 LIMIT $4`
+		args = []any{roomID, from.Topological, from.Stream, requested}
+	} else {
+		sql = `SELECT ` + cols + `
+		  FROM events e JOIN event_json ej USING (event_id)
+		 WHERE e.outlier = FALSE AND e.room_id = $1
+		   AND e.stream_ordering <= $2
+		 ORDER BY e.topological_ordering DESC, e.stream_ordering DESC
 		 LIMIT $3`
-	// Twice the limit, because the result set is filtered for visibility
-	// afterwards and would otherwise come up short.
-	rows, err := s.pool.Query(ctx, q, roomID, end.MaxStreamPos(), limit*2)
+		args = []any{roomID, from.MaxStreamPos(), requested}
+	}
+
+	rows, err := s.pool.Query(ctx, sql, args...)
 	if err != nil {
-		return nil, end, fmt.Errorf("store: recent events by stream: %w", err)
+		return nil, from, false, fmt.Errorf("store: paginate backwards: %w", err)
 	}
 	defer rows.Close()
 
@@ -362,31 +438,150 @@ func (s *Store) RecentEventsByStream(ctx context.Context, roomID, roomVersion st
 		if err := rows.Scan(&ev.EventID, &ev.Type, &ev.Sender, &ev.StreamOrdering,
 			&ev.TopologicalOrder, &ev.InstanceName, &ev.StateKey, &ev.IsState,
 			&ev.JSON, &ev.InternalMetadata); err != nil {
-			return nil, end, fmt.Errorf("store: recent events by stream: %w", err)
+			return nil, from, false, fmt.Errorf("store: paginate backwards: %w", err)
 		}
 		ev.RoomID = roomID
 		ev.RoomVersion = roomVersion
 		descending = append(descending, ev)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, end, fmt.Errorf("store: recent events by stream: %w", err)
+		return nil, from, false, fmt.Errorf("store: paginate backwards: %w", err)
 	}
 
+	limited := len(descending) >= requested
 	if len(descending) > limit {
+		limited = true
 		descending = descending[:limit]
 	}
 	if len(descending) == 0 {
-		return nil, end, nil
+		return nil, from, limited, nil
 	}
 
-	// A token names a position between events, so the batch starts one before
-	// its oldest event.
+	// A token names a position between events, so the page starts one before
+	// its oldest event. Historical form, because that is what the topological
+	// walk produced.
 	oldest := descending[len(descending)-1]
-	start := streamtoken.Live(oldest.StreamOrdering - 1)
+	next := streamtoken.Historical(oldest.TopologicalOrder, oldest.StreamOrdering-1)
 
 	ascending := make([]TimelineEvent, len(descending))
 	for i, ev := range descending {
 		ascending[len(descending)-1-i] = ev
 	}
-	return ascending, start, nil
+	return ascending, next, limited, nil
+}
+
+// EventsInCurrentState reports which of the given events are part of the
+// room's current state.
+//
+// A state event that is still current is shown in the timeline regardless of
+// history visibility (`always_include_ids` in filter_events_for_client): a
+// client that can see the room's current state gains nothing from having the
+// event that established it withheld.
+func (s *Store) EventsInCurrentState(ctx context.Context, eventIDs []string) (map[string]bool, error) {
+	if len(eventIDs) == 0 {
+		return nil, nil
+	}
+	const q = `SELECT event_id FROM current_state_events WHERE event_id = ANY($1)`
+	rows, err := s.pool.Query(ctx, q, eventIDs)
+	if err != nil {
+		return nil, fmt.Errorf("store: events in current state: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("store: events in current state: %w", err)
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
+}
+
+// PushRules loads a user's stored push rules and their enabled flags.
+//
+// Synapse stores only a user's *deviations* from the built-in ruleset, so this
+// is usually empty and the reported ruleset is entirely the base one.
+//
+// Sorted by (priority_class DESC, priority DESC), which is the order
+// get_push_rules_for_user applies before handing the rows to the Rust. Rule
+// order decides which notification a user gets, so this is not cosmetic.
+func (s *Store) PushRules(ctx context.Context, userID string) ([]pushrules.UserRule, map[string]bool, error) {
+	const q = `
+		SELECT rule_id, priority_class, priority, conditions, actions
+		  FROM push_rules WHERE user_name = $1
+		 ORDER BY priority_class DESC, priority DESC`
+	rows, err := s.pool.Query(ctx, q, userID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("store: push rules: %w", err)
+	}
+	var rules []pushrules.UserRule
+	for rows.Next() {
+		var r pushrules.UserRule
+		if err := rows.Scan(&r.RuleID, &r.PriorityClass, &r.Priority, &r.Conditions, &r.Actions); err != nil {
+			rows.Close()
+			return nil, nil, fmt.Errorf("store: push rules: %w", err)
+		}
+		rules = append(rules, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("store: push rules: %w", err)
+	}
+
+	erows, err := s.pool.Query(ctx,
+		`SELECT rule_id, enabled FROM push_rules_enable WHERE user_name = $1`, userID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("store: push rules enabled: %w", err)
+	}
+	defer erows.Close()
+	enabled := map[string]bool{}
+	for erows.Next() {
+		var ruleID string
+		var on *int
+		if err := erows.Scan(&ruleID, &on); err != nil {
+			return nil, nil, fmt.Errorf("store: push rules enabled: %w", err)
+		}
+		enabled[ruleID] = on != nil && *on != 0
+	}
+	if err := erows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("store: push rules enabled: %w", err)
+	}
+	return rules, enabled, nil
+}
+
+// StateIDsAt resolves the room state at a stream position.
+//
+// This is NOT the same as the room's current state, and using current state in
+// its place is wrong in exactly the case that matters: a busy room, where state
+// changes between the token being minted and the query running. The sync
+// response would then describe state the client's token does not cover.
+//
+// Mirrors get_state_ids_at: find the last event at or before the position, then
+// take the state after it. Synapse notes this returns an arbitrary one of
+// several forward extremities when the room had a fork at that moment; we
+// inherit that, because we resolve the same event it does.
+func (s *Store) StateIDsAt(ctx context.Context, roomID string, key streamtoken.RoomKey) (map[StateKey]string, error) {
+	const lastQ = `
+		SELECT event_id FROM events
+		 WHERE room_id = $1 AND stream_ordering <= $2 AND outlier = FALSE
+		 ORDER BY stream_ordering DESC LIMIT 1`
+	var eventID string
+	err := s.pool.QueryRow(ctx, lastQ, roomID, key.MaxStreamPos()).Scan(&eventID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return map[StateKey]string{}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: last event before position: %w", err)
+	}
+
+	groups, err := s.StateGroupsForEvents(ctx, []string{eventID})
+	if err != nil {
+		return nil, err
+	}
+	group, ok := groups[eventID]
+	if !ok {
+		return map[StateKey]string{}, nil
+	}
+	return s.FullStateForGroup(ctx, group)
 }

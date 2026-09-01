@@ -2,6 +2,42 @@
 
 Newest first. Numbers are measurements, not estimates.
 
+## 2026-09-01 — M3: push rules done, `/sync` matching for one account
+
+`m.push_rules` is synthesised and matches Synapse exactly. `/sync` now matches
+in full for `@goworker`; `@test` has three narrow items left (below). M1 and M2
+still match for both accounts on all 39 rooms.
+
+**Push rules.** `internal/pushrules` ports Synapse's forty built-in rules,
+extracted mechanically from `rust/src/push/base_rules.rs` by
+`tools/extract-base-rules.py`. The extractor dropped eight rules across two
+early versions — six whose `rule_id` wrapped onto its own line, two written
+inline — and the comparator caught both in seconds. That is the argument for
+generating rather than transcribing, and for having a comparator at all.
+
+**Other things M3 turned up**, in [synapse-notes.md](synapse-notes.md):
+
+- **Initial `/sync` paginates topologically**, not by stream ordering. Only
+  incremental syncs use stream ordering (`handlers/sync.py:852`). The earlier
+  reading was wrong, and it showed up only in a room with backfilled history.
+- **`timeline_contains` is the LAST state event per state key**, not every state
+  event in the timeline. Subtracting all of them drops a key whose state changed
+  twice inside the timeline, leaving the client interpreting it against nothing.
+- **The `state` block is the state at the now token, not current state.** They
+  differ whenever the room changed between the token being minted and the query
+  running.
+- **Unread counts are relative to a read receipt**, and an all-zero rollup row
+  does not count as a summary.
+- **`prev_batch` and `next_batch` can disagree within one response**, because
+  Synapse mutates its own `now_token` while building it.
+
+**Remaining for M3**, all on `@test` and none on `@goworker`:
+
+- 2 rooms where MSC2654's `unread_count` is still low.
+- 5 state entries across 2 rooms, where our `state` block and Synapse's pick
+  different events for a key, or we include keys it does not.
+- 2 rooms where the ephemeral receipt set differs.
+
 ## 2026-09-01 — M3 started: initial `/sync` serving, two gaps left
 
 An initial `/sync` is served and most of it matches. Building it turned up four

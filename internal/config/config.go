@@ -136,6 +136,18 @@ type Experimental struct {
 	// MSC3391Enabled treats account data with empty content as deleted, and
 	// omits it. Synapse defaults this to false; this deployment sets it true.
 	MSC3391Enabled bool `yaml:"msc3391_enabled"`
+
+	// The following gate individual base push rules. Each one adds or removes
+	// a rule from every user's reported ruleset, so a wrong value here is
+	// wrong for everybody. Synapse defaults them all to false.
+	MSC1767Enabled             bool `yaml:"msc1767_enabled"`
+	MSC3381PollsEnabled        bool `yaml:"msc3381_polls_enabled"`
+	MSC3664Enabled             bool `yaml:"msc3664_enabled"`
+	MSC4028PushEncryptedEvents bool `yaml:"msc4028_push_encrypted_events"`
+	// MSC4210 REMOVES the legacy mention rules when enabled, the opposite
+	// sense to the others.
+	MSC4210Enabled bool `yaml:"msc4210_enabled"`
+	MSC4306Enabled bool `yaml:"msc4306_enabled"`
 }
 
 // Testing gates behaviour that exists only to make the comparator possible.

@@ -129,6 +129,10 @@ func report(matched, mismatched, skipped int) {
 		fmt.Printf("\n  %d unpinnable live-data fields (presence timestamps: /initialSync reads presence with no stream bound)",
 			liveDataSkew)
 	}
+	if tokenCarrySkew > 0 {
+		fmt.Printf("\n  %d prev_batch tokens right in the room key, differing in carried streams (Synapse mutates its own now_token mid-response)",
+			tokenCarrySkew)
+	}
 	if clockSkewCount > 0 {
 		fmt.Printf("\n  %d age-like fields within clock skew (max %dms; Synapse re-reads its clock per room)",
 			clockSkewCount, clockSkewMaxMS)
@@ -279,6 +283,39 @@ func isClockDerived(path string) bool {
 
 // liveDataSkew counts fields that cannot be pinned at all.
 var liveDataSkew int
+
+// tokenCarrySkew counts prev_batch tokens that agree on the room key but not on
+// the streams carried alongside it.
+var tokenCarrySkew int
+
+// prevBatchDiffersOnlyOutsideRoomKey accepts a prev_batch whose room key is
+// right but whose other thirteen stream positions are not.
+//
+// A prev_batch is `now_token.copy_and_replace(ROOM, ...)`, and Synapse MUTATES
+// its own now_token while building the response -- `_generate_sync_entry_for_presence`
+// and `_generate_sync_entry_for_to_device` both reassign
+// `sync_result_builder.now_token` (handlers/sync.py:2529, :2158). So a room's
+// prev_batch carries whatever those streams were at when that room was built,
+// while next_batch carries their final values, and the two disagree within one
+// response.
+//
+// Pinning cannot fix that: we are given one token and Synapse used several.
+// Only the room key decides where pagination resumes, and that is still
+// compared exactly -- a wrong room key is still a mismatch.
+func prevBatchDiffersOnlyOutsideRoomKey(path string, got, want any) bool {
+	if !strings.HasSuffix(path, ".timeline.prev_batch") &&
+		!strings.HasSuffix(path, ".messages.start") {
+		return false
+	}
+	g, gok := got.(string)
+	w, wok := want.(string)
+	if !gok || !wok {
+		return false
+	}
+	gRoom, _, gFound := strings.Cut(g, "_")
+	wRoom, _, wFound := strings.Cut(w, "_")
+	return gFound && wFound && gRoom == wRoom
+}
 
 // isLiveData reports whether a field is read from a table with no stream bound,
 // and so genuinely differs between two calls however they are pinned.
@@ -579,6 +616,10 @@ func diff(path string, got, want any, out *[]string) {
 		}
 		if isLiveData(path) {
 			liveDataSkew++
+			return
+		}
+		if prevBatchDiffersOnlyOutsideRoomKey(path, got, want) {
+			tokenCarrySkew++
 			return
 		}
 		*out = append(*out, fmt.Sprintf("%s: ours=%s synapse=%s", path, brief(got), brief(want)))

@@ -13,6 +13,7 @@ import (
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/auth"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/clientevent"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/matrixerr"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/pushrules"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/server"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/store"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/streamtoken"
@@ -29,6 +30,8 @@ type Deps struct {
 	MSC4354Enabled bool
 	// MSC3391Enabled mirrors Synapse's experimental.msc3391_enabled.
 	MSC3391Enabled bool
+	// PushRuleFeatures gates individual base push rules.
+	PushRuleFeatures pushrules.Features
 }
 
 // defaultPaginationLimit is Synapse's PaginationConfig default for the legacy

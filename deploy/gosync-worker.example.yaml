@@ -111,6 +111,15 @@ reference:
 experimental:
   msc4354_enabled: true
   msc3391_enabled: true
+  # These gate individual base push rules. Each adds or removes a rule from
+  # every user's ruleset, so a wrong value here is wrong for everybody.
+  msc1767_enabled: true
+  msc3381_polls_enabled: true
+  msc3664_enabled: true
+  msc4028_push_encrypted_events: true
+  # Note the inverted sense: MSC4210 REMOVES the legacy mention rules.
+  msc4210_enabled: true
+  msc4306_enabled: true
 
 testing:
   # Enables ?_gosync_now=<token>, which forces the now_token this worker

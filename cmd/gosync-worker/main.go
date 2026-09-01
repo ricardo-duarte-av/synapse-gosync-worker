@@ -24,6 +24,7 @@ import (
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/config"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/handlers"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/metrics"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/pushrules"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/server"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/store"
 )
@@ -135,6 +136,14 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 		AllowPinNow:    cfg.Testing.AllowPinNow,
 		MSC4354Enabled: cfg.Experimental.MSC4354Enabled,
 		MSC3391Enabled: cfg.Experimental.MSC3391Enabled,
+		PushRuleFeatures: pushrules.Features{
+			MSC1767Enabled:             cfg.Experimental.MSC1767Enabled,
+			MSC3381PollsEnabled:        cfg.Experimental.MSC3381PollsEnabled,
+			MSC3664Enabled:             cfg.Experimental.MSC3664Enabled,
+			MSC4028PushEncryptedEvents: cfg.Experimental.MSC4028PushEncryptedEvents,
+			MSC4210Enabled:             cfg.Experimental.MSC4210Enabled,
+			MSC4306Enabled:             cfg.Experimental.MSC4306Enabled,
+		},
 	}
 	mux := server.NewMux(server.Routes{
 		RoomInitialSync: handlers.RoomInitialSync(deps),

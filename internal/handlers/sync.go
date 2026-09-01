@@ -11,6 +11,7 @@ import (
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/auth"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/clientevent"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/matrixerr"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/pushrules"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/server"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/store"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/streamtoken"
@@ -132,11 +133,31 @@ func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict) ([]byte, int, 
 	if err != nil {
 		return nil, http.StatusInternalServerError, internalError(d, "global account data", err)
 	}
-	if len(globalAD) > 0 {
-		events, err := accountDataEvents(globalAD)
-		if err != nil {
-			return nil, http.StatusInternalServerError, internalError(d, "global account data", err)
-		}
+	events, err := accountDataEvents(globalAD)
+	if err != nil {
+		return nil, http.StatusInternalServerError, internalError(d, "global account data", err)
+	}
+
+	// m.push_rules is synthesised, not stored: Synapse keeps only a user's
+	// deviations from a built-in ruleset and rebuilds the whole thing on every
+	// read. It is prepended, as _generate_sync_entry_for_account_data does.
+	userRules, ruleEnabled, err := d.Store.PushRules(ctx, verdict.UserID)
+	if err != nil {
+		return nil, http.StatusInternalServerError, internalError(d, "push rules", err)
+	}
+	rulesContent, err := pushrules.Format(verdict.UserID, userRules, ruleEnabled, d.PushRuleFeatures)
+	if err != nil {
+		return nil, http.StatusInternalServerError, internalError(d, "push rules", err)
+	}
+	rulesEvent, err := json.Marshal(map[string]any{
+		"type": "m.push_rules", "content": rulesContent,
+	})
+	if err != nil {
+		return nil, http.StatusInternalServerError, internalError(d, "push rules", err)
+	}
+	events = append([]json.RawMessage{rulesEvent}, events...)
+
+	if len(events) > 0 {
 		resp["account_data"] = map[string]any{"events": events}
 	}
 
@@ -210,20 +231,49 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 	endKey streamtoken.RoomKey, timeNow int64, cfg clientevent.Config,
 	accountData []store.AccountDataEntry, now streamtoken.Token) (map[string]any, error) {
 
-	messages, start, err := d.Store.RecentEventsByStream(ctx, room.RoomID, room.RoomVersion,
-		defaultTimelineLimit, endKey)
+	// Load twice the timeline limit, because visibility filtering happens after
+	// and would otherwise leave the timeline short. Synapse's
+	// `load_limit = max(timeline_limit * 2, 10)`.
+	loadLimit := defaultTimelineLimit * 2
+	if loadLimit < 10 {
+		loadLimit = 10
+	}
+	messages, pageStart, limited, err := d.Store.PaginateBackwards(ctx, room.RoomID,
+		room.RoomVersion, loadLimit, endKey)
 	if err != nil {
 		return nil, err
 	}
-	messages, memberships, err := filterVisible(ctx, d, room.RoomID, userID, messages, false, timeNow)
+
+	// A state event that is still part of current state is shown regardless of
+	// history visibility: a client that can see the current state gains nothing
+	// from having the event that established it withheld.
+	alwaysInclude, err := stateEventIDsInCurrentState(ctx, d, messages)
 	if err != nil {
 		return nil, err
+	}
+
+	messages, memberships, err := filterVisibleAlways(ctx, d, room.RoomID, userID, messages,
+		false, timeNow, alwaysInclude)
+	if err != nil {
+		return nil, err
+	}
+
+	// Trim to the requested limit, keeping the NEWEST events. The token form
+	// changes with it: a trimmed page reports a live position just before the
+	// first event kept, an untrimmed one reports where the topological walk
+	// stopped.
+	start := pageStart
+	if len(messages) > defaultTimelineLimit {
+		limited = true
+		messages = messages[len(messages)-defaultTimelineLimit:]
+		memberships = memberships[len(memberships)-defaultTimelineLimit:]
+		start = streamtoken.Live(messages[0].StreamOrdering - 1)
 	}
 
 	// The `state` block is what the client needs to interpret the timeline that
 	// follows it, so it is the state at the START of the timeline, minus
 	// anything the timeline itself carries. See _calculate_state.
-	stateIDs, err := syncStateBlock(ctx, d, room, messages)
+	stateIDs, err := syncStateBlock(ctx, d, room, messages, endKey)
 	if err != nil {
 		return nil, err
 	}
@@ -313,7 +363,7 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 		"timeline": map[string]any{
 			"events":     timeline,
 			"prev_batch": now.WithRoomKey(start).String(),
-			"limited":    len(messages) >= defaultTimelineLimit,
+			"limited":    limited,
 		},
 		"state":        map[string]any{"events": stateJSON},
 		"account_data": map[string]any{"events": adEvents},
@@ -329,7 +379,7 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 		// missing key.
 		"summary": map[string]any{},
 		// MSC2654, enabled on this deployment.
-		"org.matrix.msc2654.unread_count": unread.NotifyCount,
+		"org.matrix.msc2654.unread_count": unread.UnreadCount,
 	}, nil
 }
 
@@ -349,11 +399,14 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 // Events carried by the timeline itself are subtracted: sending them twice
 // would be redundant, and Synapse does not.
 func syncStateBlock(ctx context.Context, d Deps, room store.RoomForUser,
-	messages []store.TimelineEvent) (map[store.StateKey]string, error) {
+	messages []store.TimelineEvent, endKey streamtoken.RoomKey) (map[store.StateKey]string, error) {
 
-	// For a joined room the timeline ends at the now token, so the state there
-	// is the room's current state.
-	end, err := d.Store.CurrentStateIDs(ctx, room.RoomID)
+	// The state at the END of the timeline -- which is the now token, NOT the
+	// room's current state. They differ whenever the room changed between the
+	// token being minted and this query running, which in a busy room is most
+	// of the time, and the response would then describe state the client's
+	// token does not cover.
+	end, err := d.Store.StateIDsAt(ctx, room.RoomID, endKey)
 	if err != nil {
 		return nil, err
 	}
@@ -374,11 +427,24 @@ func syncStateBlock(ctx context.Context, d Deps, room store.RoomForUser,
 		}
 	}
 
-	inTimeline := map[string]bool{}
+	// What the timeline itself contributes to room state: the LAST state event
+	// per state key, not every state event in the timeline.
+	//
+	// The distinction decides whether an earlier state event in the same
+	// timeline is repeated in the `state` block. It must be: a client reads
+	// `state` as the state before the timeline, so if the timeline changes a
+	// key twice, the block has to carry the value in force at the start.
+	// Subtracting every state event in the timeline drops that key entirely,
+	// and the client is left interpreting the timeline against nothing.
+	timelineContains := map[store.StateKey]string{}
 	for _, ev := range messages {
 		if ev.IsState {
-			inTimeline[ev.EventID] = true
+			timelineContains[store.StateKey{Type: ev.Type, StateKey: ev.StateKey}] = ev.EventID
 		}
+	}
+	inTimeline := make(map[string]bool, len(timelineContains))
+	for _, id := range timelineContains {
+		inTimeline[id] = true
 	}
 
 	out := map[store.StateKey]string{}
@@ -403,4 +469,21 @@ func stripRoomID(body json.RawMessage) json.RawMessage {
 		return body
 	}
 	return out
+}
+
+// stateEventIDsInCurrentState returns the timeline's state events that are
+// still part of the room's current state.
+func stateEventIDsInCurrentState(ctx context.Context, d Deps,
+	messages []store.TimelineEvent) (map[string]bool, error) {
+
+	var ids []string
+	for _, ev := range messages {
+		if ev.IsState {
+			ids = append(ids, ev.EventID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	return d.Store.EventsInCurrentState(ctx, ids)
 }

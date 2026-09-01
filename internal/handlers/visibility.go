@@ -29,6 +29,15 @@ func visibilityKeys(userID string) []store.StateKey {
 // senders and the retention policy -- rather than per event.
 func filterVisible(ctx context.Context, d Deps, roomID, userID string,
 	events []store.TimelineEvent, isPeeking bool, nowMS int64) ([]store.TimelineEvent, []string, error) {
+	return filterVisibleAlways(ctx, d, roomID, userID, events, isPeeking, nowMS, nil)
+}
+
+// filterVisibleAlways is filterVisible with an escape hatch: events in
+// alwaysInclude bypass the visibility decision entirely, which is Synapse's
+// `always_include_ids`.
+func filterVisibleAlways(ctx context.Context, d Deps, roomID, userID string,
+	events []store.TimelineEvent, isPeeking bool, nowMS int64,
+	alwaysInclude map[string]bool) ([]store.TimelineEvent, []string, error) {
 
 	if len(events) == 0 {
 		return events, nil, nil
@@ -95,6 +104,10 @@ func filterVisible(ctx context.Context, d Deps, roomID, userID string,
 		}
 
 		verdict := visibility.Check(vctx, timelineToVisibilityEvent(ev), state)
+		if alwaysInclude[ev.EventID] {
+			verdict.Visible = true
+			verdict.Pruned = false
+		}
 		if !verdict.Visible {
 			continue
 		}

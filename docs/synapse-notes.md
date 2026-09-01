@@ -337,6 +337,74 @@ plural accessors have drifted apart.
 Even at zero. Synapse's comment cites element-hq/element-android#3725: a client
 cannot otherwise tell "no keys left" from "this server does not report counts".
 
+## Push rules are synthesised, not stored (2026-09-01)
+
+Synapse does not keep a user's ruleset. It keeps only their *deviations* from a
+built-in base ruleset and rebuilds the whole thing on every read, so reporting
+`m.push_rules` means reproducing forty base rules exactly and interleaving the
+user's rows into them in the right places.
+
+`internal/pushrules/baserules.go` is a port of
+`rust/src/push/base_rules.rs`, **extracted mechanically** by
+`tools/extract-base-rules.py` rather than typed out: the conditions serialise
+through serde, and hand-transcribing forty rules is a long list of silent
+opportunities to be subtly wrong. The extractor itself proved the point twice —
+its first version dropped six rules whose `rule_id` wrapped onto its own line,
+and lost two more that were written inline as `= &[PushRule {`. Both were caught
+by the comparator, in seconds, which is the argument for having one.
+
+Things that are easy to get wrong:
+
+- **The interleave order is the ruleset.** A client evaluates rules in order, so
+  the sequence `prepend override | user override | append override | user
+  content | append content | append postcontent | user room | user sender | user
+  underride | append underride` is not a detail.
+- **A user rule whose id matches a base rule replaces that rule's actions in
+  place**, keeping the base rule's conditions and position. Appending it would
+  both duplicate the rule and move it.
+- **`pattern_type` and `value_type` are placeholders**, substituted for the
+  requesting user's id or localpart and then removed. They exist so one base
+  ruleset can serve every user; a client must never see them.
+- **`room` and `sender` rules are identified by the pattern of their single
+  condition** — a `room` rule is named by the room it applies to — and report no
+  conditions at all.
+- **MSC4210 has the opposite sense to the other flags**: enabling it *removes*
+  the legacy mention rules.
+- **`.m.rule.master` defaults to disabled.** It is the silence-everything
+  switch, and the only base rule whose `default_enabled` is false.
+
+## Unread counts are relative to a read receipt (2026-09-01)
+
+Three things make `unread_notifications` more than a `SELECT SUM`:
+
+- Counts start at the user's **latest unthreaded read receipt**, not at the
+  start of the room. Without that bound every count is the room's whole
+  history — one room reported 3,950 against Synapse's 39.
+- `event_push_summary` is a rollup, and a row is usable only when its
+  `last_receipt_stream_ordering` matches the receipt actually in force. A newer
+  receipt means the rollup has not caught up and the row must be ignored.
+- **An all-zero rollup row does not count as a summary** (Synapse filters
+  `notif_count != 0 OR unread_count != 0`). Treating it as one makes the thread
+  look already-counted, so only post-rotation events get added, and the count
+  comes out low.
+
+MSC2654's `unread_count` is a *different number* from `notification_count`: it
+counts events marked `unread` rather than events that would notify, so a muted
+room accumulates one and not the other.
+
+## `prev_batch` and `next_batch` can disagree within one response
+
+`prev_batch` is `now_token.copy_and_replace(ROOM, ...)`, and Synapse **mutates
+its own `now_token` while building the response**: both
+`_generate_sync_entry_for_presence` and `_generate_sync_entry_for_to_device`
+reassign `sync_result_builder.now_token` (`handlers/sync.py:2529`, `:2158`). So
+a room's `prev_batch` carries whatever those streams were at when that room was
+built, while `next_batch` carries their final values.
+
+Pinning cannot fix this: the comparator is given one token and Synapse used
+several. syncdiff accepts a `prev_batch` whose **room key** is right — the only
+part that decides where pagination resumes — and reports the rest separately.
+
 ### Reading Synapse's source
 
 | What | Where |
