@@ -51,3 +51,43 @@ exactly why the pinned replay of §3 exists and why every parity run uses it.
 
 M5 is therefore not merely "add long-polling". It is **the milestone at which
 this worker can answer without being told what time it is.**
+
+## What replication fixed (2026-09-01)
+
+With the worker following the replication stream, **11 of the 14 token fields
+now match Synapse exactly**, including `typing`, which no query could ever have
+produced. Measured against a token minted seconds apart:
+
+| Field | Ours | Synapse | |
+|---|---|---|---|
+| room, receipt, account_data, to_device, device_list, un_partial, sticky, quarantined, profile, groups | — | — | exact |
+| typing | 129934 | 129934 | **exact, and impossible before** |
+| presence | 287022166 | 287022168 | moves ~1/s; the two requests were milliseconds apart |
+| push_rules | 1593 | 1594 | seeded from the table max; see below |
+| thread_subscriptions | 0 | 2 | seeded from the table max; see below |
+
+`push_rules` and `thread_subscriptions` are the two streams whose id generators
+allocate ids that no surviving row records, so the table maximum is a **lower
+bound**, and both streams are nearly silent — so the seed can stay behind for a
+long time. That is safe rather than merely tolerable: a position that is too low
+asks a client to re-receive something it already has, never to skip something it
+has not. A position that was too high would lose data.
+
+Closing the gap entirely would mean PUBLISHing a `REPLICATE` command to ask the
+other workers for their positions, as a real Synapse worker does on connect.
+This worker deliberately does not: it would make every other worker broadcast
+POSITION rows on our account, and the project's standing rule is not to perturb
+the deployment it measures.
+
+## Typing is only as complete as what we have seen
+
+Typing state lives nowhere but memory, so the worker knows about a typist only
+if it was connected when they started. A subscriber that has just connected has
+an empty view, and fills in as people type. Synapse's typing notifications
+expire after about half a minute, so the view converges quickly — measured as
+one missing typist on the first comparison after startup, and none on the two
+that followed.
+
+Losing the connection empties the view rather than keeping it: a stale list
+would leave a room showing somebody typing forever, which is worse than showing
+nobody.

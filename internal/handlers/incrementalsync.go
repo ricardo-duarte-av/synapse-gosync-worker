@@ -466,6 +466,12 @@ func incrementalRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, u
 		}
 	}
 
+	if ev, err := typingEvent(d, room.RoomID); err != nil {
+		return nil, err
+	} else if ev != nil {
+		ephemeral = append(ephemeral, ev)
+	}
+
 	// A room with nothing in it is left out of the response entirely.
 	if len(messages) == 0 && len(stateIDs) == 0 && len(adEvents) == 0 && len(ephemeral) == 0 {
 		return nil, nil

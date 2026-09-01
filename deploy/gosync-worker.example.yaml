@@ -46,8 +46,14 @@ database:
 # persisting it -- so without this subscription /sync would answer correctly but
 # only ever on timeout, never promptly.
 #
-# It is read-only (SUBSCRIBE only) and needs no credentials beyond reaching
-# Redis. This is the *stream* replication every Synapse worker consumes, not the
+# SUBSCRIBE only, deliberately. A real Synapse worker also PUBLISHes a
+# `REPLICATE` command on connect to ask the other workers for their current
+# stream positions; doing that here would make every one of them broadcast
+# POSITION rows on our account. Positions are seeded from the database and
+# corrected as traffic arrives instead.
+#
+# Without this, `timeout` is ignored (no long-polling), typing cannot be
+# reported at all, and stream positions are only as fresh as the startup seed. This is the *stream* replication every Synapse worker consumes, not the
 # HTTP `replication` listener and instance_map entry, which only writers need.
 replication:
   enabled: true

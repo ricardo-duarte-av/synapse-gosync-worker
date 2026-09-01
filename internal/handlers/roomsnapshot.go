@@ -259,3 +259,28 @@ func receiptEvent(roomID string, rows []store.ReceiptRow, userID string, withThr
 		"type": "m.receipt", "room_id": roomID, "content": content,
 	})
 }
+
+// typingEvent renders the m.typing EDU for a room, or nil when nobody is.
+//
+// This is the one part of a sync response that exists ONLY in memory. Typing is
+// never written down: Synapse keeps it in a counter on the typing worker, and
+// it reaches everyone else over the replication stream. Before this worker
+// followed that stream it could not produce the section at all -- syncdiff
+// counted it as a known gap.
+//
+// Nothing is reported while the subscription is unhealthy: a stale typist list
+// would leave a room showing somebody typing forever, which is worse than
+// showing nobody.
+func typingEvent(d Deps, roomID string) (json.RawMessage, error) {
+	if d.Replication == nil || !d.Replication.Live() {
+		return nil, nil
+	}
+	users := d.Replication.TypingIn(roomID)
+	if len(users) == 0 {
+		return nil, nil
+	}
+	return json.Marshal(map[string]any{
+		"type":    "m.typing",
+		"content": map[string]any{"user_ids": users},
+	})
+}

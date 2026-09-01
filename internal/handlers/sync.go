@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"sort"
+	"time"
 
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/auth"
@@ -52,7 +54,7 @@ func Sync(d Deps) http.Handler {
 			if ann != nil {
 				ann.Since = since
 			}
-			body, status, mxErr = incrementalSync(r, d, verdict, since, useStateAfter)
+			body, status, mxErr = longPoll(r, d, verdict, since, useStateAfter, ann)
 		} else {
 			body, status, mxErr = initialSyncV2(r, d, verdict, useStateAfter)
 		}
@@ -412,6 +414,12 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 		ephemeral = append(ephemeral, stripRoomID(ev))
 	}
 
+	if ev, err := typingEvent(d, room.RoomID); err != nil {
+		return nil, err
+	} else if ev != nil {
+		ephemeral = append(ephemeral, ev)
+	}
+
 	unread, err := d.Store.UnreadNotifications(ctx, room.RoomID, userID)
 	if err != nil {
 		return nil, err
@@ -582,4 +590,105 @@ func dropAliases(state map[store.StateKey]string) {
 			delete(state, k)
 		}
 	}
+}
+
+// longPoll answers an incremental sync, waiting for something to happen if
+// there is nothing yet.
+//
+// The order here is the whole point, and it is the thing Synapse's notifier
+// comments dwell on: the waiter REGISTERS ITS INTEREST BEFORE computing an
+// answer. An event that lands while the answer is being computed then still
+// wakes it. Registering afterwards loses everything that arrives in the gap,
+// and the client hangs for its full timeout on news that had already come.
+func longPoll(r *http.Request, d Deps, verdict auth.Verdict, since string,
+	useStateAfter bool, ann *server.Annotation) ([]byte, int, *matrixerr.Error) {
+
+	timeout := time.Duration(intParam(r, "timeout", 0)) * time.Millisecond
+	if ann != nil {
+		ann.Timeout = intParam(r, "timeout", 0)
+	}
+	// A pinned request is a comparison, not a client: waiting would only make
+	// the comparator slow, and the window is fixed anyway.
+	if timeout <= 0 || r.URL.Query().Get("_gosync_now") != "" || d.Notifier == nil {
+		return incrementalSync(r, d, verdict, since, useStateAfter)
+	}
+	if timeout > maxSyncTimeout {
+		timeout = maxSyncTimeout
+	}
+
+	ctx := r.Context()
+	deadline := time.Now().Add(timeout)
+	started := time.Now()
+
+	// The rooms this caller is in, so a wakeup elsewhere on the server does not
+	// wake them. Recomputed on each pass, because joining a room mid-poll
+	// should start mattering.
+	for {
+		rooms, err := d.Store.RoomsForUser(ctx, verdict.UserID, []string{"invite", "join"})
+		if err != nil {
+			return nil, http.StatusInternalServerError, internalError(d, "rooms for user", err)
+		}
+		roomIDs := make([]string, 0, len(rooms))
+		for _, room := range rooms {
+			roomIDs = append(roomIDs, room.RoomID)
+		}
+
+		handle := d.Notifier.Register(roomIDs, []string{verdict.UserID})
+
+		body, status, mxErr := incrementalSync(r, d, verdict, since, useStateAfter)
+		if mxErr != nil || !isEmptySync(body) {
+			handle.Close()
+			if ann != nil {
+				ann.Waited = time.Since(started)
+			}
+			return body, status, mxErr
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			handle.Close()
+			if ann != nil {
+				ann.Waited = time.Since(started)
+			}
+			return body, status, mxErr
+		}
+		woken := handle.Wait(ctx, remaining)
+		handle.Close()
+		if !woken {
+			if ann != nil {
+				ann.Waited = time.Since(started)
+			}
+			return body, status, mxErr
+		}
+		if ctx.Err() != nil {
+			// The client hung up. Ordinary for a long poll, and not a failure.
+			if ann != nil {
+				ann.Outcome = "client_gone"
+			}
+			return body, status, mxErr
+		}
+	}
+}
+
+// maxSyncTimeout caps how long a client may ask to wait.
+//
+// Without a cap a client can pin a connection and a goroutine indefinitely, and
+// the server's own idle timeouts are a blunter instrument than refusing.
+const maxSyncTimeout = 5 * time.Minute
+
+// isEmptySync reports whether a sync response carries nothing worth returning.
+//
+// Synapse asks the same question of its SyncResult before deciding to keep
+// waiting. The device key counts and next_batch are always present and never
+// count as content: returning on those alone would turn every long poll into a
+// busy loop.
+func isEmptySync(body []byte) bool {
+	for _, section := range []string{
+		"rooms", "presence", "account_data", "to_device", "device_lists",
+	} {
+		if gjson.GetBytes(body, section).Exists() {
+			return false
+		}
+	}
+	return true
 }

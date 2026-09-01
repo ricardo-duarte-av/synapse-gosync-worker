@@ -77,3 +77,30 @@ func (s *Store) CurrentToken(ctx context.Context) (streamtoken.Token, error) {
 		ProfileUpdates:       profileUpdates,
 	}, nil
 }
+
+// StreamPositions returns a lower bound for each replication stream, from the
+// database.
+//
+// A seed only: the replication stream corrects these, and three of them cannot
+// be right here. `typing` is absent entirely because it is never persisted --
+// seeding it from anywhere would be inventing a number.
+func (s *Store) StreamPositions(ctx context.Context) (map[string]int64, error) {
+	tok, err := s.CurrentToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]int64{
+		"events":                 tok.Room.Stream,
+		"presence":               tok.Presence,
+		"receipts":               tok.Receipt.Stream,
+		"account_data":           tok.AccountData,
+		"push_rules":             tok.PushRules,
+		"to_device":              tok.ToDevice,
+		"device_lists":           tok.DeviceList.Stream,
+		"un_partial_stated_room": tok.UnPartialStatedRooms,
+		"thread_subscriptions":   tok.ThreadSubscriptions,
+		"sticky_events":          tok.StickyEvents,
+		"quarantined_media":      tok.QuarantinedMedia.Stream,
+		"profile_updates":        tok.ProfileUpdates,
+	}, nil
+}

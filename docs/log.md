@@ -2,6 +2,43 @@
 
 Newest first. Numbers are measurements, not estimates.
 
+## 2026-09-01 — M5: replication, typing, and long-polling
+
+The worker now follows Synapse's replication stream, and three things follow
+from that.
+
+**Typing works.** It is the one part of a sync response that exists nowhere but
+memory — Synapse keeps it in a counter on the typing worker and never writes it
+down — so before this the comparator counted it as a known gap. It now matches:
+one missing typist on the first comparison after startup, and none on the two
+after that, as the view fills in.
+
+**Stream positions are real.** 11 of the 14 token fields now match Synapse
+exactly, `typing` among them. See [tokens.md](tokens.md) for the table and for
+why the two remaining ones are safe to be behind.
+
+**Long-polling works end to end.** Measured: a message sent three seconds into a
+thirty-second poll came back at 3.15s. Before this, `timeout` was ignored and
+every client would have hot-looped at full rate.
+
+The ordering inside the poll is the load-bearing part, and it is what Synapse's
+notifier comments dwell on: **interest is registered before the answer is
+computed**. An event landing during the computation still wakes the waiter.
+Register afterwards and everything arriving in that gap is lost, and the client
+hangs for its whole timeout on news that had already come.
+
+Two deliberate choices worth knowing:
+
+- The subscriber is **SUBSCRIBE-only**. A real Synapse worker also publishes a
+  `REPLICATE` command on connect to ask for current positions; doing that would
+  make every other worker broadcast POSITION rows on our account. Positions are
+  seeded from the database and corrected as traffic arrives instead.
+- Every position overlay is a **maximum**, so a stale replication value can
+  never drag a token backwards — which would ask a client to replay what it
+  already has.
+
+No regression: both accounts still match on all four comparator endpoints.
+
 ## 2026-09-01 — MSC4222 `state_after`
 
 Implemented and matching for **both accounts, on initial and incremental sync,

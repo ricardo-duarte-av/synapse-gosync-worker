@@ -60,6 +60,22 @@ var (
 		Help: "1 if the database role has default_transaction_read_only set.",
 	})
 
+	// ReplicationConnected is 1 while the replication subscription is healthy.
+	//
+	// The single most important gauge here: while it is 0 the worker cannot
+	// report typing, and its stream positions are only as fresh as the last
+	// database seed.
+	ReplicationConnected = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "gosync_replication_connected",
+		Help: "1 while the replication subscription is healthy.",
+	})
+
+	// SyncWaiters reports how many long polls are currently blocked.
+	SyncWaiters = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "gosync_sync_waiters",
+		Help: "Long-polling syncs currently waiting.",
+	})
+
 	// BuildInfo carries the version as a label on a constant 1.
 	BuildInfo = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "gosync_build_info",

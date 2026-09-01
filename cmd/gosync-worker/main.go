@@ -24,7 +24,9 @@ import (
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/config"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/handlers"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/metrics"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/notifier"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/pushrules"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/replication"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/server"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/store"
 )
@@ -129,6 +131,27 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 		return nil
 	}
 
+	// The notifier is the replication subscriber's listener: a stream advancing
+	// is what wakes a waiting sync.
+	notif := notifier.New()
+	sub := replication.New(replication.Config{
+		Enabled:  cfg.Replication.Enabled,
+		Address:  cfg.Replication.Address,
+		Channel:  cfg.Replication.Channel,
+		Password: cfg.Replication.Password,
+		DB:       cfg.Replication.DB,
+	}, log, notif)
+
+	// Seed from the database so the worker has an answer before any traffic
+	// arrives. Every seeded value is a lower bound that the first row on that
+	// stream replaces.
+	if seed, err := db.StreamPositions(ctx); err != nil {
+		log.Warn().Err(err).Msg("could not seed stream positions")
+	} else {
+		sub.Seed(seed)
+	}
+	go sub.Run(ctx)
+
 	deps := handlers.Deps{
 		Store:          db,
 		Auth:           authenticator,
@@ -137,6 +160,8 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 		MSC4354Enabled: cfg.Experimental.MSC4354Enabled,
 		MSC3391Enabled: cfg.Experimental.MSC3391Enabled,
 		MSC4222Enabled: cfg.Experimental.MSC4222Enabled,
+		Replication:    sub,
+		Notifier:       notif,
 		PushRuleFeatures: pushrules.Features{
 			MSC1767Enabled:             cfg.Experimental.MSC1767Enabled,
 			MSC3381PollsEnabled:        cfg.Experimental.MSC3381PollsEnabled,

@@ -13,7 +13,9 @@ import (
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/auth"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/clientevent"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/matrixerr"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/notifier"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/pushrules"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/replication"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/server"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/store"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/streamtoken"
@@ -34,6 +36,12 @@ type Deps struct {
 	PushRuleFeatures pushrules.Features
 	// MSC4222Enabled mirrors Synapse's experimental.msc4222_enabled.
 	MSC4222Enabled bool
+	// Replication supplies live stream positions and typing. Nil when
+	// replication is disabled, in which case positions fall back to the
+	// database and typing is never reported.
+	Replication *replication.Subscriber
+	// Notifier wakes long-polling syncs.
+	Notifier *notifier.Notifier
 }
 
 // defaultPaginationLimit is Synapse's PaginationConfig default for the legacy
@@ -275,7 +283,7 @@ func nowToken(r *http.Request, d Deps) (streamtoken.Token, bool, *matrixerr.Erro
 		}
 		return tok, true, nil
 	}
-	tok, err := d.Store.CurrentToken(r.Context())
+	tok, err := currentToken(r.Context(), d)
 	if err != nil {
 		return streamtoken.Token{}, false, &matrixerr.Error{
 			ErrCode: matrixerr.CodeUnknown, Error: "Internal server error"}

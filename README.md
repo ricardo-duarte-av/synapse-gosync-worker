@@ -9,6 +9,9 @@ Nothing is routed to this worker. It is driven deliberately by `cmd/syncdiff`
 and a test account, and compared against a real Synapse sync worker, until its
 answers are trusted.
 
+It follows Synapse's replication stream over Redis (SUBSCRIBE only), which is
+what lets it report typing, hold accurate stream positions, and long-poll.
+
 ## Status
 
 | Endpoint | State |
