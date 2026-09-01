@@ -2,6 +2,46 @@
 
 Newest first. Numbers are measurements, not estimates.
 
+## 2026-09-01 — M4: incremental `/sync` serving
+
+An incremental `/sync` matches for five of six test windows across both
+accounts. The initial-sync endpoints are unaffected: still 9/9, 30/30 and both
+`/initialSync`.
+
+The comparator builds a `since` by **rewinding the room key** of a token Synapse
+just minted, rather than taking two snapshots a moment apart — back-to-back
+tokens produce an empty delta, which proves nothing. Rewinding 3,000 / 30,000 /
+200,000 positions produces rooms that changed, rooms that did not, and
+membership transitions.
+
+Four things the comparator taught, in order of how much they mattered:
+
+- **A room joined inside the window is treated exactly like an initial sync**:
+  full state, a timeline paginated back from now rather than only events since
+  `since`, and `limited` set. The client has never seen the room, so a delta
+  against state it does not have would be meaningless. This was 235 of the first
+  run's diffs.
+- **Joining a room entitles you to the presence and device lists of everyone
+  already in it**, whatever those streams have been doing — and to the presence
+  of anyone who joined or was invited to a room you were already in. None of
+  them need have touched the presence stream, so none are found by a window
+  query.
+- **`device_lists.left` is decided by reading `unsigned.prev_content`** off
+  Synapse's in-memory event, which is reliably present on timeline events and
+  present on *state* events only when an earlier reader polluted the shared
+  cache. Derived from the timeline only, and tolerated as the same cache
+  artefact one step removed.
+- **Ephemeral stays bounded by `since` even for a newly joined room.** Receipts
+  are a stream like any other; joining does not entitle you to a replay.
+
+The `state` shortcut is worth noting for what it saves: when the timeline is
+unlimited **and** its events form an unbroken chain from where the client left
+off, the `state` block is empty, because the timeline already carries every
+change. Only a gap or a fork makes a state block necessary.
+
+Remaining: one extra state entry in one room at the deepest rewind, plus the
+`leave` and `knock` sections and `to_device`.
+
 ## 2026-09-01 — M3 done: bundled aggregations, and a fully green baseline
 
 **Both accounts match on all three endpoints.** 39 rooms across room versions 1,

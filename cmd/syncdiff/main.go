@@ -31,6 +31,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -42,7 +43,8 @@ func main() {
 		tokenFile = flag.String("token-file", "", "file holding the test account's access token")
 		rooms     = flag.String("rooms", "", "comma-separated room IDs; default is every joined room")
 		limit     = flag.Int("limit", 10, "pagination limit to request")
-		endpoint  = flag.String("endpoint", "room_initial_sync", "room_initial_sync | initial_sync | sync")
+		endpoint  = flag.String("endpoint", "room_initial_sync", "room_initial_sync | initial_sync | sync | incremental_sync")
+		rewind    = flag.Int("rewind", 2000, "for incremental_sync: how far to rewind the room key to build a `since`")
 		verbose   = flag.Bool("v", false, "print each compared response")
 	)
 	flag.Parse()
@@ -62,6 +64,17 @@ func main() {
 	ref := unixClient(*refSocket)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+
+	if *endpoint == "incremental_sync" {
+		res := compareIncrementalSync(ctx, ours, ref, token, *rewind, *verbose)
+		printOne("/sync (incremental)", res)
+		report(boolToInt(res.kind == resultMatch), boolToInt(res.kind == resultMismatch),
+			boolToInt(res.kind == resultSkip))
+		if res.kind == resultMismatch {
+			os.Exit(1)
+		}
+		return
+	}
 
 	if *endpoint == "sync" {
 		res := compareSync(ctx, ours, ref, token, *limit, *verbose)
@@ -505,6 +518,9 @@ var setPaths = map[string]string{
 	// reporting the whole set as changed.
 	".ephemeral.events": "type",
 	".presence.events":  "sender",
+	// device_lists is built from a Python set, so its order carries nothing.
+	".device_lists.changed": "",
+	".device_lists.left":    "",
 }
 
 // setPathFor maps a response path to its set-comparison rule, if it has one.
@@ -551,7 +567,14 @@ func isToleratedUpstreamOnly(path string) bool {
 			}
 		}
 	}
-	return isReceiptThreadID(path)
+	if isReceiptThreadID(path) {
+		return true
+	}
+	// device_lists.left is decided by reading unsigned.prev_content off
+	// Synapse's in-memory event, which is present on a STATE event only when
+	// some earlier reader polluted the shared cache. The same artefact as
+	// prev_content itself, one step removed.
+	return strings.HasPrefix(path, ".device_lists.left")
 }
 
 // isReceiptThreadID matches a receipt's thread_id, which Synapse may or may not
@@ -652,6 +675,13 @@ func diff(path string, got, want any, out *[]string) {
 // difference is reported against the right element rather than as a wholesale
 // reordering.
 func compareAsSet(path, key string, got, want []any, out *[]string) {
+	// Some sets differ wholesale for a reason that is not a defect; check
+	// before comparing rather than per entry, because an unkeyed set reports
+	// no entries.
+	if isToleratedUpstreamOnly(path) {
+		tolerated++
+		return
+	}
 	if key == "" {
 		gs, ws := canonicalStrings(got), canonicalStrings(want)
 		if strings.Join(gs, "\n") != strings.Join(ws, "\n") {
@@ -917,4 +947,108 @@ func recoverTimeNowFromSync(resp map[string]any) (int64, bool) {
 		}
 	}
 	return 0, false
+}
+
+// compareIncrementalSync compares a /sync carrying a `since`.
+//
+// The `since` is built by rewinding the room key of a token Synapse just
+// minted, rather than by taking two snapshots a moment apart. Back-to-back
+// tokens produce an empty delta, which would prove nothing; rewinding a few
+// thousand stream positions produces a response with real content in it --
+// rooms that changed, rooms that did not, and membership transitions.
+//
+// Everything else is pinned exactly as for an initial sync: the reference
+// answers first and its next_batch becomes our now.
+func compareIncrementalSync(ctx context.Context, ours, ref *http.Client, token string,
+	rewind int, verbose bool) result {
+
+	path := "/_matrix/client/v3/sync"
+
+	// A first request only to learn where the stream is.
+	probe := url.Values{"timeout": {"0"}, "set_presence": {"offline"}}
+	probeBody, status, err := get(ctx, ref, path+"?"+probe.Encode(), token)
+	if err != nil || status != http.StatusOK {
+		return result{resultSkip, fmt.Sprintf("probe failed: %v (status %d)", err, status)}
+	}
+	var probeResp map[string]any
+	if err := json.Unmarshal(probeBody, &probeResp); err != nil {
+		return result{resultSkip, fmt.Sprintf("probe body is not JSON: %v", err)}
+	}
+	current, ok := probeResp["next_batch"].(string)
+	if !ok {
+		return result{resultSkip, "probe returned no next_batch"}
+	}
+	since, err := rewindRoomKey(current, rewind)
+	if err != nil {
+		return result{resultSkip, err.Error()}
+	}
+
+	q := url.Values{"timeout": {"0"}, "set_presence": {"offline"}, "since": {since}}
+	refBody, status, err := get(ctx, ref, path+"?"+q.Encode(), token)
+	if err != nil {
+		return result{resultSkip, fmt.Sprintf("reference request failed: %v", err)}
+	}
+	if status != http.StatusOK {
+		return result{resultSkip, fmt.Sprintf("reference returned %d: %s", status, truncate(refBody))}
+	}
+	var refResp map[string]any
+	if err := json.Unmarshal(refBody, &refResp); err != nil {
+		return result{resultSkip, fmt.Sprintf("reference body is not JSON: %v", err)}
+	}
+	end, ok := refResp["next_batch"].(string)
+	if !ok {
+		return result{resultSkip, "reference response has no next_batch"}
+	}
+	timeNow, ok := recoverTimeNowFromSync(refResp)
+	if !ok {
+		// An incremental sync can legitimately contain no event at all, in
+		// which case there is no clock to recover and none is needed.
+		timeNow = 0
+	}
+
+	q.Set("_gosync_now", end)
+	if timeNow != 0 {
+		q.Set("_gosync_time_now", fmt.Sprint(timeNow))
+	}
+	ourBody, status, err := get(ctx, ours, path+"?"+q.Encode(), token)
+	if err != nil {
+		return result{resultMismatch, fmt.Sprintf("our request failed: %v", err)}
+	}
+	if status != http.StatusOK {
+		return result{resultMismatch, fmt.Sprintf("we returned %d: %s", status, truncate(ourBody))}
+	}
+	var ourResp map[string]any
+	if err := json.Unmarshal(ourBody, &ourResp); err != nil {
+		return result{resultMismatch, fmt.Sprintf("our body is not JSON: %v", err)}
+	}
+	if verbose {
+		fmt.Printf("--- since=%s ---\n%s\n", since, truncate(ourBody))
+	}
+
+	var diffs []string
+	diff("", ourResp, refResp, &diffs)
+	if len(diffs) == 0 {
+		return result{resultMatch, ""}
+	}
+	return result{resultMismatch, strings.Join(diffs, "\n")}
+}
+
+// rewindRoomKey moves a token's room key back by n stream positions, leaving
+// every other stream where it was.
+//
+// Only the room key is moved: rewinding the others would ask for a replay of
+// account data, receipts and device lists as well, which is a different test.
+func rewindRoomKey(tokenStr string, n int) (string, error) {
+	room, rest, ok := strings.Cut(tokenStr, "_")
+	if !ok || !strings.HasPrefix(room, "s") {
+		return "", fmt.Errorf("cannot rewind %q: expected a live room key", tokenStr)
+	}
+	pos, err := strconv.ParseInt(room[1:], 10, 64)
+	if err != nil {
+		return "", fmt.Errorf("cannot rewind %q: %w", tokenStr, err)
+	}
+	if pos-int64(n) < 0 {
+		return "", fmt.Errorf("cannot rewind %q by %d: would go negative", tokenStr, n)
+	}
+	return fmt.Sprintf("s%d_%s", pos-int64(n), rest), nil
 }

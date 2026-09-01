@@ -11,7 +11,7 @@ Status is recorded here; what actually happened is in [log.md](log.md).
 | M1 | Skeleton, auth, `/rooms/{roomId}/initialSync` | **done — 9/9 rooms at parity** |
 | M2 | `/initialSync` | **done — at parity** |
 | M3 | Initial `/sync` (no `since`) | **done** — both accounts, all endpoints |
-| M4 | Stream tokens and incremental `/sync` | **next** — token package done in M1 |
+| M4 | Stream tokens and incremental `/sync` | **nearly done** — 5 of 6 windows across two accounts |
 | M5 | Long-polling and Redis replication | not started |
 | M6 | Filters and lazy-loading | not started |
 | M7 | Ephemeral: receipts, typing, presence | not started |
@@ -53,6 +53,14 @@ persisted, so no query can produce it; it arrives only over the replication
 stream (M5). syncdiff counts it by name rather than treating it as a mismatch.
 
 An incremental `/sync` (`since` present) returns 501; that is M4.
+
+## M4 — nearly done
+
+An incremental `/sync` is served and matches for five of six test windows across
+the two accounts (rewinds of 3,000 / 30,000 / 200,000 stream positions). The
+sixth leaves one extra state entry in one room at the deepest rewind.
+
+Not yet implemented: the `leave` and `knock` sections, and `to_device`.
 
 ## M5 is not just long-polling
 

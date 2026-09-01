@@ -38,17 +38,19 @@ func Sync(d Deps) http.Handler {
 			return
 		}
 
+		var (
+			body   []byte
+			status int
+			mxErr  *matrixerr.Error
+		)
 		if since := r.URL.Query().Get("since"); since != "" {
 			if ann != nil {
 				ann.Since = since
 			}
-			refuse(w, ann, http.StatusNotImplemented, matrixerr.Error{
-				ErrCode: matrixerr.CodeUnknown,
-				Error:   "Incremental sync is not implemented yet"})
-			return
+			body, status, mxErr = incrementalSync(r, d, verdict, since)
+		} else {
+			body, status, mxErr = initialSyncV2(r, d, verdict)
 		}
-
-		body, status, mxErr := initialSyncV2(r, d, verdict)
 		if mxErr != nil {
 			refuse(w, ann, status, *mxErr)
 			return
