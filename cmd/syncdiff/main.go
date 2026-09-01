@@ -684,6 +684,10 @@ func compareAsSet(path, key string, got, want []any, out *[]string) {
 		wv, inWant := w[id]
 		switch {
 		case !inGot:
+			if isKnownGap(fmt.Sprintf("%s[%s]", path, id)) {
+				knownGaps++
+				continue
+			}
 			*out = append(*out, fmt.Sprintf("%s: missing entry %s", path, id))
 		case !inWant:
 			*out = append(*out, fmt.Sprintf("%s: extra entry %s", path, id))

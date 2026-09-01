@@ -10,8 +10,8 @@ Status is recorded here; what actually happened is in [log.md](log.md).
 |---|---|---|
 | M1 | Skeleton, auth, `/rooms/{roomId}/initialSync` | **done — 9/9 rooms at parity** |
 | M2 | `/initialSync` | **done — at parity** |
-| M3 | Initial `/sync` (no `since`) | **one feature short** — bundled aggregations |
-| M4 | Stream tokens and incremental `/sync` | token package done in M1 |
+| M3 | Initial `/sync` (no `since`) | **done** — both accounts, all endpoints |
+| M4 | Stream tokens and incremental `/sync` | **next** — token package done in M1 |
 | M5 | Long-polling and Redis replication | not started |
 | M6 | Filters and lazy-loading | not started |
 | M7 | Ephemeral: receipts, typing, presence | not started |
@@ -41,15 +41,16 @@ see [synapse-notes.md](synapse-notes.md) before touching either.
 
 `archived=true` returns 501: left rooms need the state at the leave event.
 
-## M3 — one feature short
+## M3 — done
 
-`/sync` matches in full for `@goworker`. For `@test` it differs only by
-**bundled aggregations** (`unsigned.m.relations`): Synapse bundles thread
-summaries, edits and references into a `limited` timeline, and an initial sync
-is always limited. Three events across three rooms here.
+Initial `/sync` matches Synapse for **both** test accounts, alongside
+`/initialSync` and `/rooms/{id}/initialSync`. That is 39 rooms across room
+versions 1, 10, 11 and 12, encrypted rooms, backfilled history, redactions,
+threads and edits.
 
-`m.typing` is absent and will stay absent until M5: typing is never persisted,
-so no query can produce it. syncdiff tracks it as a named known gap.
+One known gap remains and cannot be closed here: **`m.typing`**. Typing is never
+persisted, so no query can produce it; it arrives only over the replication
+stream (M5). syncdiff counts it by name rather than treating it as a mismatch.
 
 An incremental `/sync` (`since` present) returns 501; that is M4.
 

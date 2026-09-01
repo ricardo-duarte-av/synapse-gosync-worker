@@ -303,6 +303,37 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 		return nil, err
 	}
 
+	// Bundled aggregations, for a limited timeline only -- which an initial
+	// sync always is. A client given the whole history can aggregate for
+	// itself; one given a window cannot see the replies outside it.
+	var aggs map[string]aggregation
+	var nestedIDs []string
+	if limited {
+		vis, err := d.Store.VisibilityExtras(ctx, room.RoomID, userID, nil)
+		if err != nil {
+			return nil, err
+		}
+		aggs, nestedIDs, err = bundleAggregations(ctx, d, userID, messages, vis.IgnoredSenders)
+		if err != nil {
+			return nil, err
+		}
+	}
+	// The events nested inside a bundle -- a thread's latest reply, an edit --
+	// are serialised in full, so they have to be loaded.
+	var nested map[string]store.StateEvent
+	if len(aggs) > 0 {
+		want := append([]string(nil), nestedIDs...)
+		for _, a := range aggs {
+			if a.replaceID != "" {
+				want = append(want, a.replaceID)
+			}
+		}
+		nested, err = d.Store.EventsByID(ctx, want, room.RoomVersion)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	timeline := make([]json.RawMessage, 0, len(messages))
 	for i, ev := range messages {
 		stored := ev.Stored
@@ -313,6 +344,12 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 		body, err := clientevent.Serialize(stored, timeNow, cfg)
 		if err != nil {
 			return nil, err
+		}
+		if agg, ok := aggs[ev.EventID]; ok {
+			body, err = attachAggregations(body, agg, aggs, nested, timeNow, cfg)
+			if err != nil {
+				return nil, err
+			}
 		}
 		timeline = append(timeline, body)
 	}

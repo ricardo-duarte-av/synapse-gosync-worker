@@ -2,6 +2,34 @@
 
 Newest first. Numbers are measurements, not estimates.
 
+## 2026-09-01 — M3 done: bundled aggregations, and a fully green baseline
+
+**Both accounts match on all three endpoints.** 39 rooms across room versions 1,
+10, 11 and 12; encrypted rooms, backfilled history, redactions, threads, edits.
+The only remaining difference anywhere is `m.typing`, which cannot be produced
+without the replication stream and is counted by name rather than as a failure.
+
+Bundled aggregations were the last piece: an initial sync is always `limited`,
+and Synapse bundles `unsigned.m.relations` into a limited timeline — thread
+summaries (count, the fully serialised latest reply, whether the caller
+participated), edits, and references. A client given the whole history can
+aggregate for itself; one given a window cannot see the replies outside it.
+
+Two rules in there are easy to miss:
+
+- An event that is **itself** an edit or annotation gets no bundle, but a thread
+  reply does — so the relation *type* matters, not just its presence.
+- Threads are computed only for events that are not themselves a relation, so a
+  reply inside a thread does not sprout a nested thread summary. The thread's
+  latest reply does still get its own edits and references, one level deep.
+
+*Verified non-vacuous:* disabling the bundling made syncdiff name all three
+affected events and exit non-zero.
+
+This was done before M4 deliberately. Starting a large milestone against a
+comparator that already fails makes new breakage indistinguishable from old, and
+M4 inherits the aggregations anyway — a gappy incremental sync is `limited` too.
+
 ## 2026-09-01 — the three /sync items closed; one gap tracked, one found
 
 All three known items are fixed. `@goworker` matches on all three endpoints;

@@ -15,7 +15,7 @@ answers are trusted.
 |---|---|
 | `/_matrix/client/*/rooms/{roomId}/initialSync` | **served**, at parity on all 39 rooms of two test accounts |
 | `/_matrix/client/*/initialSync` | **served**, at parity for both test accounts (except `archived=true`) |
-| `/_matrix/client/*/sync` | **initial sync served** (no `since`), matching in full for one test account; `since` returns 501 |
+| `/_matrix/client/*/sync` | **initial sync served** (no `since`), at parity for both test accounts; `since` returns 501 |
 | `/_matrix/client/*/events` | not implemented |
 
 ### Deliberate deviations
