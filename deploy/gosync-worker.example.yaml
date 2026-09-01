@@ -99,6 +99,18 @@ auth:
 reference:
   socket: /var/sockets/nginx/av-sync-worker-2.sock
 
+# Parts of Synapse's experimental_features that change what a response contains.
+#
+# Synapse's own field names, so these paste straight across from
+# homeserver.yaml. They are configured here rather than read from that file,
+# which is never mounted: it carries macaroon_secret_key,
+# registration_shared_secret and the database password inline.
+#
+# Copy the ACTIVE settings. Getting msc4354_enabled wrong is invisible until an
+# event is actually sticky, and then every response containing one differs.
+experimental:
+  msc4354_enabled: true
+
 testing:
   # Enables ?_gosync_now=<token>, which forces the now_token this worker
   # computes against instead of reading the current stream position.

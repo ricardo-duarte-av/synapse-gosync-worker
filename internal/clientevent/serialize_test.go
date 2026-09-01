@@ -2,6 +2,7 @@ package clientevent
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"testing"
 )
@@ -133,29 +134,111 @@ func TestCreateEventRoomIDIsRestoredForHashRooms(t *testing.T) {
 	}
 }
 
-// A redaction names its target in a different place per room version. Synapse
-// mirrors it to the other so clients written against either version work.
+// MSC2174 moved `redacts` into content from room version 11, so the canonical
+// place depends on the version -- and Synapse copies it to the OTHER place for
+// clients written against either. Getting the direction backwards drops the
+// field entirely, because the read finds nothing.
 func TestRedactsIsMirrored(t *testing.T) {
-	t.Run("v11 top-level to content", func(t *testing.T) {
+	t.Run("v11 stores it in content, copies to top level", func(t *testing.T) {
 		ev := Stored{EventID: "$r", Type: "m.room.redaction", RoomVersion: "11",
-			JSON: []byte(`{"type":"m.room.redaction","redacts":"$victim","content":{},"unsigned":{}}`)}
-		got := serialize(t, FormatV2, ev, 0)
-		content := got["content"].(map[string]any)
-		if content["redacts"] != "$victim" {
-			t.Errorf("content.redacts = %v", content["redacts"])
-		}
-		if got["redacts"] != "$victim" {
-			t.Errorf("redacts = %v", got["redacts"])
-		}
-	})
-	t.Run("v10 content to top-level", func(t *testing.T) {
-		ev := Stored{EventID: "$r", Type: "m.room.redaction", RoomVersion: "10",
 			JSON: []byte(`{"type":"m.room.redaction","content":{"redacts":"$victim"},"unsigned":{}}`)}
 		got := serialize(t, FormatV2, ev, 0)
 		if got["redacts"] != "$victim" {
-			t.Errorf("redacts = %v", got["redacts"])
+			t.Errorf("top-level redacts = %v, want it copied up", got["redacts"])
+		}
+		if got["content"].(map[string]any)["redacts"] != "$victim" {
+			t.Error("content.redacts should survive")
 		}
 	})
+	t.Run("v10 stores it at top level, copies into content", func(t *testing.T) {
+		ev := Stored{EventID: "$r", Type: "m.room.redaction", RoomVersion: "10",
+			JSON: []byte(`{"type":"m.room.redaction","redacts":"$victim","content":{},"unsigned":{}}`)}
+		got := serialize(t, FormatV2, ev, 0)
+		if got["content"].(map[string]any)["redacts"] != "$victim" {
+			t.Errorf("content.redacts = %v, want it copied down", got["content"])
+		}
+		if got["redacts"] != "$victim" {
+			t.Error("top-level redacts should survive")
+		}
+	})
+}
+
+// MSC4354. The value is the time the event has LEFT to live, not its configured
+// duration, so it shrinks as the event ages and vanishes once expired.
+func TestStickyTTL(t *testing.T) {
+	sticky := func(durationMS int64, originTS int64) Stored {
+		return Stored{EventID: "$e", Type: "m.room.message",
+			JSON: []byte(fmt.Sprintf(`{"type":"m.room.message","sender":"@u:e","content":{},
+				"origin_server_ts":%d,"msc4354_sticky":{"duration_ms":%d},"unsigned":{}}`,
+				originTS, durationMS))}
+	}
+	ttl := func(t *testing.T, ev Stored, nowMS int64, enabled bool) (float64, bool) {
+		t.Helper()
+		out, err := Serialize(ev, nowMS, Config{Format: FormatV2, MSC4354Enabled: enabled})
+		if err != nil {
+			t.Fatal(err)
+		}
+		unsigned := decode(t, out)["unsigned"].(map[string]any)
+		v, ok := unsigned["msc4354_sticky_duration_ttl_ms"].(float64)
+		return v, ok
+	}
+
+	t.Run("remaining lifetime", func(t *testing.T) {
+		got, ok := ttl(t, sticky(10000, 1000), 4000, true)
+		if !ok || got != 7000 {
+			t.Errorf("ttl = %v (present=%v), want 7000", got, ok)
+		}
+	})
+	t.Run("expired events carry nothing", func(t *testing.T) {
+		if _, ok := ttl(t, sticky(1000, 1000), 5000, true); ok {
+			t.Error("an expired sticky event should carry no ttl")
+		}
+	})
+	t.Run("capped at one hour", func(t *testing.T) {
+		got, _ := ttl(t, sticky(99*60*60*1000, 1000), 1000, true)
+		if got != float64(stickyMaxDurationMS) {
+			t.Errorf("ttl = %v, want the one-hour cap %d", got, stickyMaxDurationMS)
+		}
+	})
+	// A remote server must not be able to claim a future timestamp and make its
+	// event stick for longer than the cap allows.
+	t.Run("a future origin_server_ts buys nothing", func(t *testing.T) {
+		got, _ := ttl(t, sticky(5000, 1_000_000), 1000, true)
+		if got != 5000 {
+			t.Errorf("ttl = %v, want 5000 (clamped to now, not the claimed future)", got)
+		}
+	})
+	t.Run("disabled", func(t *testing.T) {
+		if _, ok := ttl(t, sticky(10000, 1000), 4000, false); ok {
+			t.Error("no ttl should appear when the feature is off")
+		}
+	})
+	t.Run("malformed duration means not sticky", func(t *testing.T) {
+		ev := Stored{EventID: "$e", Type: "m.room.message",
+			JSON: []byte(`{"type":"m.room.message","sender":"@u:e","content":{},
+				"origin_server_ts":1000,"msc4354_sticky":{"duration_ms":"soon"},"unsigned":{}}`)}
+		if _, ok := ttl(t, ev, 2000, true); ok {
+			t.Error("a non-integer duration must be treated as non-sticky")
+		}
+	})
+}
+
+// The delay id uses the MSC-prefixed key, not a bare "delay_id".
+func TestDelayIDUsesMSCPrefixedKey(t *testing.T) {
+	ev := Stored{EventID: "$e", Type: "m.room.message", JSON: []byte(pdu),
+		InternalMetadata: []byte(`{"delay_id":"syd_abc"}`)}
+	out, err := Serialize(ev, 3000, Config{Format: FormatV2,
+		Requester: Requester{UserID: "@u:example.com"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unsigned := decode(t, out)["unsigned"].(map[string]any)
+	if unsigned["org.matrix.msc4140.delay_id"] != "syd_abc" {
+		t.Errorf("unsigned = %v, want org.matrix.msc4140.delay_id", unsigned)
+	}
+	if _, ok := unsigned["delay_id"]; ok {
+		t.Error("a bare delay_id key must not be emitted")
+	}
 }
 
 // The transaction ID is the sender's own idempotency key. Revealing it to

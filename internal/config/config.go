@@ -24,14 +24,15 @@ type Config struct {
 	// traffic is published on a channel named after the homeserver.
 	ServerName string `yaml:"server_name"`
 
-	Listen      Listen      `yaml:"listen"`
-	Database    Database    `yaml:"database"`
-	Replication Replication `yaml:"replication"`
-	Auth        Auth        `yaml:"auth"`
-	Reference   Reference   `yaml:"reference"`
-	Testing     Testing     `yaml:"testing"`
-	Metrics     Metrics     `yaml:"metrics"`
-	Log         Log         `yaml:"log"`
+	Listen       Listen       `yaml:"listen"`
+	Database     Database     `yaml:"database"`
+	Replication  Replication  `yaml:"replication"`
+	Auth         Auth         `yaml:"auth"`
+	Reference    Reference    `yaml:"reference"`
+	Experimental Experimental `yaml:"experimental"`
+	Testing      Testing      `yaml:"testing"`
+	Metrics      Metrics      `yaml:"metrics"`
+	Log          Log          `yaml:"log"`
 }
 
 // Listen describes where this worker serves the client API.
@@ -119,6 +120,19 @@ type Auth struct {
 type Reference struct {
 	Socket string `yaml:"socket"`
 	URL    string `yaml:"url"`
+}
+
+// Experimental mirrors the parts of Synapse's `experimental_features` block
+// that change what a response contains, using Synapse's own field names so the
+// settings paste straight across from homeserver.yaml.
+//
+// These are read from our config rather than from homeserver.yaml, which is
+// never mounted: it carries macaroon_secret_key, registration_shared_secret and
+// the database password inline.
+type Experimental struct {
+	// MSC4354Enabled adds `unsigned.msc4354_sticky_duration_ttl_ms` to sticky
+	// events. Synapse defaults this to false; this deployment sets it true.
+	MSC4354Enabled bool `yaml:"msc4354_enabled"`
 }
 
 // Testing gates behaviour that exists only to make the comparator possible.

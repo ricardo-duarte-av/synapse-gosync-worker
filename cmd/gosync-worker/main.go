@@ -129,10 +129,11 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 	}
 
 	deps := handlers.Deps{
-		Store:       db,
-		Auth:        authenticator,
-		Log:         log,
-		AllowPinNow: cfg.Testing.AllowPinNow,
+		Store:          db,
+		Auth:           authenticator,
+		Log:            log,
+		AllowPinNow:    cfg.Testing.AllowPinNow,
+		MSC4354Enabled: cfg.Experimental.MSC4354Enabled,
 	}
 	mux := server.NewMux(server.Routes{
 		RoomInitialSync: handlers.RoomInitialSync(deps),

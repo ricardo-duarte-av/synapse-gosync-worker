@@ -26,6 +26,8 @@ type Deps struct {
 	Log   zerolog.Logger
 	// AllowPinNow enables ?_gosync_now=<token>. See docs/comparability.md.
 	AllowPinNow bool
+	// MSC4354Enabled mirrors Synapse's experimental.msc4354_enabled.
+	MSC4354Enabled bool
 }
 
 // defaultPaginationLimit is Synapse's PaginationConfig default for the legacy
@@ -184,7 +186,8 @@ func roomInitialSync(r *http.Request, d Deps, verdict auth.Verdict, roomID strin
 		requester.TokenID = tokenID
 	}
 
-	cfg := clientevent.Config{Format: clientevent.FormatV1, Requester: requester}
+	cfg := clientevent.Config{Format: clientevent.FormatV1, Requester: requester,
+		MSC4354Enabled: d.MSC4354Enabled}
 
 	// Synapse wraps state events with FilteredEvent.state(), whose membership is
 	// None, so the state block carries no unsigned.membership. Timeline events
@@ -201,7 +204,7 @@ func roomInitialSync(r *http.Request, d Deps, verdict auth.Verdict, roomID strin
 	// MSC4115's unsigned.membership is the caller's membership *at each event*,
 	// not their membership now. In a room joined part way through its history,
 	// Synapse reports "leave" for everything before the join.
-	memberships, err := d.Store.UserMembershipTimeline(ctx, roomID, verdict.UserID, 0)
+	memberships, err := d.Store.UserMembershipTimeline(ctx, roomID, verdict.UserID)
 	if err != nil {
 		return nil, http.StatusInternalServerError, internalError(d, "membership timeline", err)
 	}
@@ -209,7 +212,7 @@ func roomInitialSync(r *http.Request, d Deps, verdict auth.Verdict, roomID strin
 	chunk := make([]json.RawMessage, 0, len(messages))
 	for _, ev := range messages {
 		stored := ev.Stored
-		stored.Membership = store.MembershipAt(memberships, ev.StreamOrdering)
+		stored.Membership = store.MembershipAt(memberships, ev.TopologicalOrder, ev.StreamOrdering)
 		b, err := clientevent.Serialize(stored, timeNow, cfg)
 		if err != nil {
 			return nil, http.StatusInternalServerError, internalError(d, "serialise timeline", err)

@@ -164,10 +164,15 @@ func roomPresence(ctx context.Context, d Deps, state []store.StateEvent, timeNow
 			p = store.PresenceState{UserID: user, State: "offline"}
 		}
 		content := map[string]any{"presence": p.State, "user_id": p.UserID}
-		if p.HasLastActive {
+		// Synapse guards these with plain Python truthiness -- `if
+		// state.last_active_ts:` -- so a stored 0 is omitted just like a NULL,
+		// and an empty status message is omitted just like a missing one.
+		// Treating NULL as the only absence emits `last_active_ago` equal to
+		// the whole epoch.
+		if p.HasLastActive && p.LastActiveTS != 0 {
 			content["last_active_ago"] = timeNow - p.LastActiveTS
 		}
-		if p.HasStatusMsg {
+		if p.HasStatusMsg && p.StatusMsg != "" {
 			content["status_msg"] = p.StatusMsg
 		}
 		if p.State == "online" {

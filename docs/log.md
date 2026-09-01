@@ -2,6 +2,47 @@
 
 Newest first. Numbers are measurements, not estimates.
 
+## 2026-09-01 — a second account found five more defects
+
+Ran both comparators as `@test:aguiarvieira.pt`: **30 joined rooms, versions 1,
+10, 11 and 12; `shared`, `world_readable` and `invited`; five encrypted; several
+federated with backfilled history.** The first account had 9 rooms, all local,
+all `shared`.
+
+First run: **17 matched, 13 mismatched.** After five fixes: **24 matched, 6
+mismatched, and all six are the documented 501 gaps** — four rooms with
+`invited` history visibility, two whose visibility has changed (2 and 3 times).
+The first account still passes 9/9 plus `/initialSync`.
+
+The five defects, all in [synapse-notes.md](synapse-notes.md):
+
+- **`stream_ordering` is not history order.** Backfilled events get *negative*
+  values — a room's early state at -23,964,688 while the user's invite sits at
+  +9,100,251 — so membership resolution has to order by
+  `(topological_ordering, stream_ordering)`. Ordering by stream reported every
+  backfilled event with the membership the user had before being invited.
+- **Presence uses Python truthiness.** A stored `last_active_ts` of 0 is omitted
+  like a NULL; treating NULL as the only absence emitted a `last_active_ago` of
+  1,788,254,542,122 — the whole epoch.
+- **The redaction copy runs the opposite way** to the obvious reading: MSC2174
+  moved `redacts` *into* content at v11, so `Event.redacts()` reads content for
+  v11+ and top level otherwise. Backwards, the field is dropped, not duplicated.
+- **`unsigned.delay_id` is `org.matrix.msc4140.delay_id`.**
+- **MSC4354 sticky events** carry `msc4354_sticky_duration_ttl_ms`, the time
+  *left*, capped at an hour, with the origin timestamp clamped to now. Enabled
+  on this deployment; Synapse defaults it off, so it lives in our own
+  `experimental:` config block.
+
+**What this says about the corpus.** None of these were reachable with the first
+account's rooms. The lesson is not "test more" but that the *shape* of the
+corpus decides what the comparator can see: room version 1, backfilled history,
+and a room joined after an invite each falsified one specific assumption.
+
+**What it says about the state-group resolver.** `/initialSync` for this account
+returns 501, because the snapshot is all-or-nothing and one of its 30 rooms
+needs per-event state. For any real account that is the likely outcome, which
+makes the resolver the blocking item rather than a nice-to-have.
+
 ## 2026-09-01 — M2 complete: `/initialSync` at parity
 
 `/initialSync` matches Synapse across all 9 rooms in one snapshot, stable over

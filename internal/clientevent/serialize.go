@@ -61,6 +61,47 @@ type Config struct {
 	// IncludeStrippedRoomState keeps `unsigned.invite_room_state` and
 	// `knock_room_state`. Off everywhere except the invite section of /sync.
 	IncludeStrippedRoomState bool
+	// MSC4354Enabled mirrors Synapse's experimental.msc4354_enabled. When set,
+	// a sticky event carries the time it has left to live.
+	MSC4354Enabled bool
+}
+
+// stickyMaxDurationMS caps how long an event may claim to be sticky.
+// rust/src/events/mod.rs:403.
+const stickyMaxDurationMS = int64(60 * 60 * 1000)
+
+// applyStickyTTL adds `unsigned.msc4354_sticky_duration_ttl_ms` (MSC4354).
+//
+// The remaining lifetime, not the configured duration: a client needs to know
+// how long the event stays pinned from now, so the value shrinks as the event
+// ages and the field disappears once it has expired.
+//
+// The `min(origin_server_ts, time_now)` is not redundant. It stops a remote
+// server claiming a timestamp in the future to make its event stick for longer
+// than the one-hour cap allows.
+func applyStickyTTL(out []byte, nowMS int64) ([]byte, error) {
+	sticky := gjson.GetBytes(out, "msc4354_sticky")
+	if !sticky.IsObject() {
+		return out, nil
+	}
+	duration := sticky.Get("duration_ms")
+	// The MSC requires a non-negative integer; anything else means not sticky.
+	if !duration.Exists() || duration.Type != gjson.Number || duration.Int() < 0 {
+		return out, nil
+	}
+	ms := duration.Int()
+	if ms > stickyMaxDurationMS {
+		ms = stickyMaxDurationMS
+	}
+	originTS := gjson.GetBytes(out, "origin_server_ts").Int()
+	if originTS > nowMS {
+		originTS = nowMS
+	}
+	expiresAt := originTS + ms
+	if expiresAt <= nowMS {
+		return out, nil
+	}
+	return sjson.SetBytes(out, "unsigned.msc4354_sticky_duration_ttl_ms", expiresAt-nowMS)
 }
 
 // persistedUnsignedFields is the complete set of `unsigned` keys Synapse keeps
@@ -192,6 +233,12 @@ func Serialize(ev Stored, nowMS int64, cfg Config) ([]byte, error) {
 		}
 	}
 
+	if cfg.MSC4354Enabled {
+		if out, err = applyStickyTTL(out, nowMS); err != nil {
+			return nil, err
+		}
+	}
+
 	// MSC4115: the sender's membership at the point of this event, so a client
 	// can render history without resolving state itself.
 	if ev.Membership != "" {
@@ -240,12 +287,18 @@ func applyFormat(out []byte, format Format) ([]byte, error) {
 }
 
 func mirrorRedacts(out []byte, rv RoomVersion) ([]byte, error) {
-	// Read whichever place is version-correct, write the other. A
-	// present-but-null value is skipped, matching Synapse's guard on
-	// `e.redacts is not None`.
-	from, to := "content.redacts", "redacts"
+	// MSC2174 moved `redacts` INTO content from room version 11, so the
+	// canonical place depends on the version -- and it is the opposite of what
+	// it looks like. Event.redacts() reads `content.redacts` when
+	// updated_redaction_rules is set and top-level `redacts` otherwise
+	// (rust/src/events/mod.rs:623); the serialiser then writes it to the OTHER
+	// place, for clients written against either version.
+	//
+	// Getting this backwards drops the field entirely rather than duplicating
+	// it, because the read finds nothing.
+	from, to := "redacts", "content.redacts"
 	if rv.UpdatedRedactionRules {
-		from, to = "redacts", "content.redacts"
+		from, to = "content.redacts", "redacts"
 	}
 	v := gjson.GetBytes(out, from)
 	if !v.Exists() || v.Type == gjson.Null {
@@ -294,7 +347,9 @@ func applyTransactionID(out []byte, ev Stored, req Requester) ([]byte, error) {
 
 	if delayID := meta.Get("delay_id"); delayID.Exists() && delayID.Type == gjson.String {
 		var err error
-		if out, err = sjson.SetBytes(out, "unsigned.delay_id", delayID.String()); err != nil {
+		// The unsigned key is the MSC-prefixed name, not a bare "delay_id"
+		// (rust/src/events/constants.rs, unsigned_field::DELAY_ID).
+		if out, err = sjson.SetBytes(out, "unsigned.org\\.matrix\\.msc4140\\.delay_id", delayID.String()); err != nil {
 			return nil, err
 		}
 	}

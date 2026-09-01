@@ -74,12 +74,13 @@ func buildRoomSnapshot(ctx context.Context, d Deps, room store.RoomForUser,
 		return snap, err
 	}
 
-	memberships, err := d.Store.UserMembershipTimeline(ctx, room.RoomID, userID, 0)
+	memberships, err := d.Store.UserMembershipTimeline(ctx, room.RoomID, userID)
 	if err != nil {
 		return snap, err
 	}
 
-	cfg := clientevent.Config{Format: clientevent.FormatV1, Requester: requester}
+	cfg := clientevent.Config{Format: clientevent.FormatV1, Requester: requester,
+		MSC4354Enabled: d.MSC4354Enabled}
 
 	snap.State = make([]json.RawMessage, 0, len(state))
 	for _, ev := range state {
@@ -95,7 +96,7 @@ func buildRoomSnapshot(ctx context.Context, d Deps, room store.RoomForUser,
 	snap.Chunk = make([]json.RawMessage, 0, len(messages))
 	for _, ev := range messages {
 		stored := ev.Stored
-		stored.Membership = store.MembershipAt(memberships, ev.StreamOrdering)
+		stored.Membership = store.MembershipAt(memberships, ev.TopologicalOrder, ev.StreamOrdering)
 		body, err := clientevent.Serialize(stored, timeNow, cfg)
 		if err != nil {
 			return snap, err
@@ -138,10 +139,15 @@ func presenceEvents(states []store.PresenceState, timeNow int64) ([]json.RawMess
 	out := make([]json.RawMessage, 0, len(states))
 	for _, p := range states {
 		content := map[string]any{"presence": p.State, "user_id": p.UserID}
-		if p.HasLastActive {
+		// Synapse guards these with plain Python truthiness -- `if
+		// state.last_active_ts:` -- so a stored 0 is omitted just like a NULL,
+		// and an empty status message is omitted just like a missing one.
+		// Treating NULL as the only absence emits `last_active_ago` equal to
+		// the whole epoch.
+		if p.HasLastActive && p.LastActiveTS != 0 {
 			content["last_active_ago"] = timeNow - p.LastActiveTS
 		}
-		if p.HasStatusMsg {
+		if p.HasStatusMsg && p.StatusMsg != "" {
 			content["status_msg"] = p.StatusMsg
 		}
 		if p.State == "online" {

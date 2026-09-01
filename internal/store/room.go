@@ -382,34 +382,37 @@ func (s *Store) AttachPrevContent(ctx context.Context, events []*clientevent.Sto
 
 // MembershipChange is one of a user's membership events in a room.
 type MembershipChange struct {
-	StreamOrdering int64
-	Membership     string
+	// Topological and Stream together give the event's position in the room's
+	// own history. Both are needed: see UserMembershipTimeline.
+	Topological int64
+	Stream      int64
+	Membership  string
 }
 
 // UserMembershipTimeline returns the user's membership events in a room, in
-// ascending stream order, from the given position onwards.
+// the room's own history order.
 //
 // This answers MSC4115's `unsigned.membership`: the requesting user's
 // membership *at each event*. Synapse gets it from the state resolved at every
-// event, but for a single user the answer is far cheaper than that -- their
-// membership at an event is simply the most recent m.room.member event for
-// them at or before it. State-group resolution buys nothing here, because
-// there is only ever one state key in play.
+// event, but for a single user the answer is far cheaper -- their membership at
+// an event is the most recent m.room.member event for them at or before it.
+// State-group resolution buys nothing, because there is only ever one state key
+// in play.
 //
-// This matters more than it looks. An earlier version stamped the user's
-// *current* membership on every timeline event, which is right only for a user
-// who has been joined since the room was created. In a room joined later,
-// Synapse reports "leave" for events from before the join, and we reported
-// "join" -- wrong on every historical event.
-func (s *Store) UserMembershipTimeline(ctx context.Context, roomID, userID string,
-	fromStreamOrdering int64) ([]MembershipChange, error) {
-
+// Ordered by (topological_ordering, stream_ordering), NOT by stream alone.
+// stream_ordering is a server-local insertion counter, and **backfilled events
+// get negative values**: a room joined after it already had history stores its
+// create and early state at around -23,964,688 while the user's own invite sits
+// at +9,100,251. Ordering by stream therefore puts the whole of the room's
+// earlier history *after* events that actually follow it, and every event
+// backfilled later is reported with the membership the user had before they
+// were ever invited.
+func (s *Store) UserMembershipTimeline(ctx context.Context, roomID, userID string) ([]MembershipChange, error) {
 	const q = `
-		SELECT e.stream_ordering, COALESCE(m.membership, '')
+		SELECT e.topological_ordering, e.stream_ordering, COALESCE(m.membership, '')
 		  FROM events e LEFT JOIN room_memberships m USING (event_id)
 		 WHERE e.room_id = $1 AND e.type = 'm.room.member' AND e.state_key = $2
-		   AND e.outlier = FALSE
-		 ORDER BY e.stream_ordering`
+		 ORDER BY e.topological_ordering, e.stream_ordering`
 	rows, err := s.pool.Query(ctx, q, roomID, userID)
 	if err != nil {
 		return nil, fmt.Errorf("store: membership timeline: %w", err)
@@ -419,7 +422,7 @@ func (s *Store) UserMembershipTimeline(ctx context.Context, roomID, userID strin
 	var out []MembershipChange
 	for rows.Next() {
 		var c MembershipChange
-		if err := rows.Scan(&c.StreamOrdering, &c.Membership); err != nil {
+		if err := rows.Scan(&c.Topological, &c.Stream, &c.Membership); err != nil {
 			return nil, fmt.Errorf("store: membership timeline: %w", err)
 		}
 		out = append(out, c)
@@ -430,14 +433,15 @@ func (s *Store) UserMembershipTimeline(ctx context.Context, roomID, userID strin
 	return out, nil
 }
 
-// MembershipAt reports the user's membership at a stream position.
+// MembershipAt reports the user's membership at a position in room history.
 //
-// Synapse defaults an absent membership to "leave": a user who was never in
-// the room is, for visibility purposes, indistinguishable from one who left.
-func MembershipAt(timeline []MembershipChange, streamOrdering int64) string {
+// Synapse defaults an absent membership to "leave": a user who was never in the
+// room is, for visibility purposes, indistinguishable from one who left.
+func MembershipAt(timeline []MembershipChange, topological, stream int64) string {
 	membership := "leave"
 	for _, c := range timeline {
-		if c.StreamOrdering > streamOrdering {
+		if c.Topological > topological ||
+			(c.Topological == topological && c.Stream > stream) {
 			break
 		}
 		if c.Membership != "" {

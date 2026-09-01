@@ -162,6 +162,72 @@ whether the room is published in the directory. Nothing to do with
 `m.room.history_visibility`, which governs who may read history. Two unrelated
 concepts, one word.
 
+## Found by widening to a second account, 2026-09-01
+
+The first test account had 9 rooms, all `shared`, all local, one room version
+apart. A second account with **30 joined rooms — versions 1, 10, 11 and 12;
+`shared`, `world_readable` and `invited`; five encrypted; several federated and
+backfilled** — found five more defects in an hour. None of them could have been
+found with the first account's rooms.
+
+The lesson is not "test more"; it is that the *shape* of the corpus decides
+what a comparator can see. Room version 1, backfilled history and a room the
+account was invited to before joining each falsified a specific assumption.
+
+### `stream_ordering` is not history order — backfill makes it negative
+
+`unsigned.membership` was computed by finding the user's most recent
+`m.room.member` event at or before the event's `stream_ordering`. That is wrong
+whenever a room has backfilled history.
+
+`stream_ordering` is a **server-local insertion counter**. In a room this server
+joined after it already had history, the create event and early state are stored
+at around **-23,964,688**, while the user's own invite sits at **+9,100,251**.
+Ordering by stream therefore puts the whole of the room's earlier history *after*
+events that follow it, and every backfilled event is reported with the
+membership the user had before they were ever invited.
+
+The room's own order is `(topological_ordering, stream_ordering)`. Membership
+resolution now uses that pair.
+
+### Presence uses Python truthiness, so a stored `0` is absent
+
+`format_user_presence_state` guards with `if state.last_active_ts:` and
+`if state.status_msg:`. A stored `0` is falsy and omitted exactly like a NULL,
+as is an empty status message. Treating NULL as the only absence emits a
+`last_active_ago` of **1,788,254,542,122** — the whole Unix epoch — for any user
+whose `last_active_ts` is zero.
+
+### The redaction copy goes the opposite way to the obvious reading
+
+MSC2174 moved `redacts` *into* `content` from room version 11, so the canonical
+place is the opposite of what the field name suggests. `Event.redacts()`
+(`rust/src/events/mod.rs:623`) reads **`content.redacts`** when
+`updated_redaction_rules` is set and **top-level `redacts`** otherwise; the
+serialiser then writes it to the *other* place for clients written against
+either version.
+
+Getting the direction backwards does not duplicate the field — it drops it
+entirely, because the read finds nothing.
+
+### `unsigned.delay_id` is `org.matrix.msc4140.delay_id`
+
+The unsigned key is the MSC-prefixed name
+(`rust/src/events/constants.rs`, `unsigned_field::DELAY_ID`), not a bare
+`delay_id`.
+
+### MSC4354 sticky events carry their remaining lifetime
+
+When `experimental.msc4354_enabled` is on — it is on this deployment, and
+Synapse defaults it off — an event with an `msc4354_sticky.duration_ms` gets
+`unsigned.msc4354_sticky_duration_ttl_ms`: the time it has **left**, not its
+configured duration, so the value shrinks as the event ages and disappears once
+it expires. Capped at one hour, and the origin timestamp is clamped to now so a
+remote server cannot claim a future timestamp to stick for longer than the cap.
+
+Since `homeserver.yaml` is never mounted, this is configured in our own
+`experimental:` block using Synapse's field name.
+
 ### Reading Synapse's source
 
 | What | Where |

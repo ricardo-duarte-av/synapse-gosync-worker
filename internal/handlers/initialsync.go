@@ -114,7 +114,7 @@ func initialSync(r *http.Request, d Deps, verdict auth.Verdict) ([]byte, int, *m
 	// revealed by /initialSync -- unlike /rooms/{roomId}/initialSync, which
 	// does pass the requester and does reveal it. The asymmetry looks like an
 	// oversight upstream; it is still the behaviour to match.
-	cfg := clientevent.Config{Format: clientevent.FormatV1}
+	cfg := clientevent.Config{Format: clientevent.FormatV1, MSC4354Enabled: d.MSC4354Enabled}
 
 	roomsOut := make([]map[string]any, 0, len(rooms))
 	for _, room := range rooms {

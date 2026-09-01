@@ -33,7 +33,9 @@ Two deliberate gaps, both answered 501 rather than approximated:
 
 Both are lifted by the same piece of work — a state-group resolver — which is
 also what M3's `compute_state_delta` needs. It is the largest single unbuilt
-thing in the project.
+thing in the project, and measuring a second account promoted it from
+nice-to-have to blocking: 6 of that account's 30 rooms need it, and because
+`/initialSync` is all-or-nothing, one such room makes the whole snapshot 501.
 
 ## M2 — done
 
