@@ -204,24 +204,29 @@ type UnreadCounts struct {
 	UnreadCount int
 }
 
-// UnreadNotifications reads a user's unread counts for a room's main timeline.
+// UnreadNotifications reads a user's unread counts for a room.
 //
-// A port of _get_unread_counts_by_receipt_txn. Three things make this more than
-// a SELECT SUM:
+// A port of _get_unread_counts_by_receipt_txn plus the aggregation
+// _generate_sync_entry_for_rooms does on top of it. Four things make this more
+// than a SELECT SUM:
 //
-//   - Counts are relative to the user's latest READ RECEIPT, not to the start
-//     of the room. Without that bound every count is the room's whole history.
-//     A user with no receipt at all is measured from their own membership
-//     event, which Synapse assumes is a join.
-//   - event_push_summary is a rollup, and a row is only usable when its
-//     `last_receipt_stream_ordering` matches the receipt actually in force. A
-//     newer receipt means the rollup has not caught up and the row must be
-//     ignored, not added.
-//   - Highlights are never summarised, so they are always counted from
-//     event_push_actions directly.
+//   - Counts are relative to the user's latest READ RECEIPT, not the start of
+//     the room. Without that bound every count is the room's whole history --
+//     one room here reported 3,950 against Synapse's 39.
+//   - The bound is PER THREAD: a threaded receipt ahead of the unthreaded one
+//     moves that thread's starting point on its own.
+//   - event_push_summary is a rollup, usable only when its
+//     last_receipt_stream_ordering matches the receipt in force. An all-zero
+//     row does not count as a summary at all; treating it as one makes the
+//     thread look already-counted and undercounts everything between the
+//     receipt and the last rotation.
+//   - With the default filter, threads are NOT reported separately: their
+//     counts are folded into the room's single figure
+//     (handlers/sync.py:3326). Counting only the main timeline is the other
+//     way to come out low.
 //
-// Only the main timeline is reported here; per-thread counts belong in
-// unread_thread_notifications.
+// Highlights are never summarised, so they are always counted from
+// event_push_actions and never bounded by the rotation point.
 func (s *Store) UnreadNotifications(ctx context.Context, roomID, userID string) (UnreadCounts, error) {
 	const q = `
 		WITH receipt AS (
@@ -239,38 +244,54 @@ func (s *Store) UnreadNotifications(ctx context.Context, roomID, userID string) 
 		rotated AS (
 			SELECT COALESCE((SELECT stream_ordering FROM event_push_summary_stream_ordering), 0) AS pos
 		),
+		thread_receipts AS (
+			-- Only receipts AHEAD of the unthreaded one move a thread's bound.
+			SELECT r.thread_id, MAX(r.event_stream_ordering) AS pos
+			  FROM receipts_linearized r, receipt
+			 WHERE r.user_id = $2 AND r.room_id = $1
+			   AND r.event_stream_ordering > receipt.pos
+			   AND r.receipt_type IN ('m.read', 'm.read.private')
+			 GROUP BY r.thread_id
+		),
 		summary AS (
-			-- Usable only when the rollup reflects the receipt in force.
-			SELECT COALESCE(SUM(notif_count), 0) AS notif,
-			       COALESCE(SUM(COALESCE(unread_count, 0)), 0) AS unread,
-			       COUNT(*) AS rows
-			  FROM event_push_summary, receipt
-			 WHERE room_id = $1 AND user_id = $2 AND thread_id = 'main'
-			   AND ((last_receipt_stream_ordering IS NULL AND stream_ordering > receipt.pos)
-			        OR last_receipt_stream_ordering = receipt.pos)
-			   -- An all-zero rollup row does not count as a summary. Treating
-			   -- it as one makes the thread look already-counted, and only
-			   -- events after the last rotation get added -- which undercounts
-			   -- by everything between the receipt and the rotation.
-			   AND (notif_count != 0 OR COALESCE(unread_count, 0) != 0)
+			SELECT s.thread_id, s.notif_count,
+			       COALESCE(s.unread_count, 0) AS unread_count
+			  FROM event_push_summary s
+			  LEFT JOIN thread_receipts tr ON tr.thread_id = s.thread_id
+			  CROSS JOIN receipt
+			 WHERE s.room_id = $1 AND s.user_id = $2
+			   AND ((s.last_receipt_stream_ordering IS NULL
+			         AND s.stream_ordering > COALESCE(tr.pos, receipt.pos))
+			        OR s.last_receipt_stream_ordering = COALESCE(tr.pos, receipt.pos))
+			   AND (s.notif_count != 0 OR COALESCE(s.unread_count, 0) != 0)
+		),
+		actions AS (
+			-- A summarised thread is already counted up to the last rotation,
+			-- so only what came after it is added. An unsummarised one is
+			-- counted from its receipt.
+			SELECT
+				COUNT(*) FILTER (WHERE a.notif = 1) AS notif,
+				COUNT(*) FILTER (WHERE a.unread = 1) AS unread
+			  FROM event_push_actions a
+			  LEFT JOIN thread_receipts tr ON tr.thread_id = a.thread_id
+			  LEFT JOIN summary su ON su.thread_id = a.thread_id
+			  CROSS JOIN receipt CROSS JOIN rotated
+			 WHERE a.room_id = $1 AND a.user_id = $2
+			   AND a.stream_ordering > COALESCE(tr.pos, receipt.pos)
+			   AND (su.thread_id IS NULL OR a.stream_ordering > rotated.pos)
+		),
+		highlights AS (
+			SELECT COUNT(*) AS n
+			  FROM event_push_actions a
+			  LEFT JOIN thread_receipts tr ON tr.thread_id = a.thread_id
+			  CROSS JOIN receipt
+			 WHERE a.room_id = $1 AND a.user_id = $2 AND a.highlight = 1
+			   AND a.stream_ordering > COALESCE(tr.pos, receipt.pos)
 		)
 		SELECT
-			summary.notif
-			  + COALESCE((SELECT COUNT(*) FROM event_push_actions a, receipt, rotated
-			               WHERE a.room_id = $1 AND a.user_id = $2 AND a.thread_id = 'main'
-			                 AND a.notif = 1 AND a.stream_ordering > receipt.pos
-			                 -- A summarised range is already counted; only
-			                 -- what came after the last rotation is added.
-			                 AND (summary.rows = 0 OR a.stream_ordering > rotated.pos)), 0),
-			COALESCE((SELECT COUNT(*) FROM event_push_actions a, receipt
-			           WHERE a.room_id = $1 AND a.user_id = $2 AND a.thread_id = 'main'
-			             AND a.highlight = 1 AND a.stream_ordering > receipt.pos), 0),
-			summary.unread
-			  + COALESCE((SELECT COUNT(*) FROM event_push_actions a, receipt, rotated
-			               WHERE a.room_id = $1 AND a.user_id = $2 AND a.thread_id = 'main'
-			                 AND a.unread = 1 AND a.stream_ordering > receipt.pos
-			                 AND (summary.rows = 0 OR a.stream_ordering > rotated.pos)), 0)
-		  FROM summary`
+			(SELECT COALESCE(SUM(notif_count), 0) FROM summary) + (SELECT notif FROM actions),
+			(SELECT n FROM highlights),
+			(SELECT COALESCE(SUM(unread_count), 0) FROM summary) + (SELECT unread FROM actions)`
 	var c UnreadCounts
 	if err := s.pool.QueryRow(ctx, q, roomID, userID).Scan(
 		&c.NotifyCount, &c.HighlightCount, &c.UnreadCount); err != nil {

@@ -405,6 +405,57 @@ Pinning cannot fix this: the comparator is given one token and Synapse used
 several. syncdiff accepts a `prev_batch` whose **room key** is right — the only
 part that decides where pagination resumes — and reports the rest separately.
 
+## Closing the last /sync gaps (2026-09-01)
+
+### `m.room.aliases` is dropped from the state block too
+
+Not only from the timeline. `compute_state_delta` ends with an explicit
+`if e.type != EventTypes.Aliases` (`handlers/sync.py:1313`), a second and
+separate place from `_check_filter_send_to_client`. Until MSC2261 a malicious
+alias event cannot be redacted, so Synapse refuses to carry the type anywhere.
+
+Note this is `/sync`-specific: the legacy initialSync endpoints do carry aliases
+in their state.
+
+### When both ends of the timeline disagree, the later event wins
+
+`_calculate_state` unions the state at the start and end of the timeline into a
+**set of event ids**, subtracts what the timeline carries, then rebuilds a map
+keyed by state key. If a key changed outside the timeline, both its events
+survive the subtraction and only one can be reported -- and which one depends on
+Python set iteration order, which is not defined.
+
+Observed consistently to be the *later* event, which is also the more useful
+answer: it is the state the client will have going forward. We resolve the
+collision that way deliberately.
+
+### Unread counts fold threads into the room total
+
+With the default filter, `unread_thread_notifications` is off, and Synapse then
+**adds every thread's counts into the room's single figure**
+(`handlers/sync.py:3326`). Counting only the main timeline comes out low --
+229 against 2,083 in one room here.
+
+The receipt bound is per thread as well: a threaded receipt ahead of the
+unthreaded one moves that thread's starting point on its own.
+
+### Typing is a missing response *section*, not just a token field
+
+The first concrete consequence of having no replication. Typing is never
+persisted -- it lives in an in-memory counter on the typing worker and reaches
+other workers only over the replication stream -- so a room where somebody is
+typing gets an `m.typing` EDU from Synapse and nothing from us. syncdiff counts
+it as a named known gap rather than a mismatch, so it stays visible without
+drowning the signal.
+
+### Bundled aggregations are not implemented
+
+An initial sync is `limited`, and Synapse bundles relations into a limited
+timeline: `unsigned.m.relations` carries thread summaries (count, the serialised
+latest event, whether the caller participated), edits, and references
+(`handlers/relations.py:418`). Three events across three rooms in this corpus
+have them.
+
 ### Reading Synapse's source
 
 | What | Where |

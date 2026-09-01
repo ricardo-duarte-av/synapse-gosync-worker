@@ -129,6 +129,9 @@ func report(matched, mismatched, skipped int) {
 		fmt.Printf("\n  %d unpinnable live-data fields (presence timestamps: /initialSync reads presence with no stream bound)",
 			liveDataSkew)
 	}
+	if knownGaps > 0 {
+		fmt.Printf("\n  %d known gaps (m.typing: never persisted, needs the replication stream -- M5)", knownGaps)
+	}
 	if tokenCarrySkew > 0 {
 		fmt.Printf("\n  %d prev_batch tokens right in the room key, differing in carried streams (Synapse mutates its own now_token mid-response)",
 			tokenCarrySkew)
@@ -287,6 +290,23 @@ var liveDataSkew int
 // tokenCarrySkew counts prev_batch tokens that agree on the room key but not on
 // the streams carried alongside it.
 var tokenCarrySkew int
+
+// knownGaps counts differences caused by something this worker cannot do yet,
+// as opposed to something it does wrongly.
+var knownGaps int
+
+// isKnownGap matches a difference that is expected until a milestone lands.
+//
+// m.typing is the only one so far. Typing is never persisted -- it lives in an
+// in-memory counter on the typing worker and reaches other workers over
+// replication -- so no query can produce it and no amount of care in this
+// worker will, until it subscribes to the replication stream (M5).
+//
+// Counted and named rather than silently ignored: a gap that leaves no trace in
+// the output is indistinguishable from a gap nobody remembered.
+func isKnownGap(path string) bool {
+	return strings.HasSuffix(path, ".ephemeral.events[m.typing]")
+}
 
 // prevBatchDiffersOnlyOutsideRoomKey accepts a prev_batch whose room key is
 // right but whose other thirteen stream positions are not.
@@ -481,8 +501,10 @@ var setPaths = map[string]string{
 	// timeline is not.
 	".state.events":        "event_id",
 	".account_data.events": "",
-	".ephemeral.events":    "",
-	".presence.events":     "sender",
+	// Keyed by type so a difference lands on the right EDU rather than
+	// reporting the whole set as changed.
+	".ephemeral.events": "type",
+	".presence.events":  "sender",
 }
 
 // setPathFor maps a response path to its set-comparison rule, if it has one.

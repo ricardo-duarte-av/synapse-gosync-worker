@@ -2,6 +2,32 @@
 
 Newest first. Numbers are measurements, not estimates.
 
+## 2026-09-01 — the three /sync items closed; one gap tracked, one found
+
+All three known items are fixed. `@goworker` matches on all three endpoints;
+`@test` matches on `/rooms/{id}/initialSync` (30/30) and `/initialSync`, and its
+`/sync` now differs only by bundled aggregations.
+
+- **`m.room.aliases` is dropped from the `state` block too**, a second and
+  separate place from the timeline filter (`handlers/sync.py:1313`). That was 3
+  of the 5 state entries.
+- **When both ends of the timeline carry a different event for one key**, only
+  one can be reported, and Synapse's choice comes from Python set iteration
+  order. Observed consistently to be the later event, which is also the more
+  useful answer. That was the other 2.
+- **Unread counts fold every thread into the room total** with the default
+  filter, and the receipt bound is per thread. Counting only the main timeline
+  gave 229 against Synapse's 2,083.
+- **`m.typing` is a missing response section**, not just a missing token field —
+  the first concrete consequence of having no replication. Tracked by syncdiff
+  as a named known gap so it stays visible without drowning the signal.
+
+**Newly surfaced, once the louder differences cleared:** bundled aggregations.
+An initial sync is `limited`, and Synapse bundles `unsigned.m.relations` into a
+limited timeline — thread summaries with the serialised latest event, edits and
+references. Three events across three rooms here. Not a quick fix: it needs
+`event_relations`, thread summaries, and a nested serialisation.
+
 ## 2026-09-01 — M3: push rules done, `/sync` matching for one account
 
 `m.push_rules` is synthesised and matches Synapse exactly. `/sync` now matches

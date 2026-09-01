@@ -448,9 +448,21 @@ func syncStateBlock(ctx context.Context, d Deps, room store.RoomForUser,
 	}
 
 	out := map[store.StateKey]string{}
-	for _, m := range []map[store.StateKey]string{end, start} {
+	// `end` last: when the state at both ends of the timeline carries a
+	// different event for one key, and neither is in the timeline itself, both
+	// survive the subtraction and only one can be reported. Synapse resolves
+	// that collision by iterating a Python set, so its choice is arbitrary --
+	// but observed consistently to be the later event, and the later one is
+	// what the client's state will be going forward.
+	for _, m := range []map[store.StateKey]string{start, end} {
 		for k, id := range m {
 			if inTimeline[id] {
+				continue
+			}
+			// m.room.aliases is dropped from the state block outright, a
+			// second and separate place from the timeline filter that drops
+			// it. Until MSC2261, a malicious alias event cannot be redacted.
+			if k.Type == "m.room.aliases" {
 				continue
 			}
 			out[k] = id

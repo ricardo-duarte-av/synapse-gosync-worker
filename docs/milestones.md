@@ -10,7 +10,7 @@ Status is recorded here; what actually happened is in [log.md](log.md).
 |---|---|---|
 | M1 | Skeleton, auth, `/rooms/{roomId}/initialSync` | **done — 9/9 rooms at parity** |
 | M2 | `/initialSync` | **done — at parity** |
-| M3 | Initial `/sync` (no `since`) | **nearly done** — matches for one account; 3 items on the other |
+| M3 | Initial `/sync` (no `since`) | **one feature short** — bundled aggregations |
 | M4 | Stream tokens and incremental `/sync` | token package done in M1 |
 | M5 | Long-polling and Redis replication | not started |
 | M6 | Filters and lazy-loading | not started |
@@ -41,18 +41,17 @@ see [synapse-notes.md](synapse-notes.md) before touching either.
 
 `archived=true` returns 501: left rooms need the state at the leave event.
 
-## M3 — nearly done
+## M3 — one feature short
 
-An initial `/sync` matches Synapse in full for `@goworker` (9 rooms). For
-`@test` (30 rooms, far more varied) three narrow items remain:
+`/sync` matches in full for `@goworker`. For `@test` it differs only by
+**bundled aggregations** (`unsigned.m.relations`): Synapse bundles thread
+summaries, edits and references into a `limited` timeline, and an initial sync
+is always limited. Three events across three rooms here.
 
-- MSC2654's `unread_count` is low in 2 rooms.
-- 5 state entries across 2 rooms: our `state` block and Synapse's pick different
-  events for a key, or we carry keys it does not.
-- The ephemeral receipt set differs in 2 rooms.
+`m.typing` is absent and will stay absent until M5: typing is never persisted,
+so no query can produce it. syncdiff tracks it as a named known gap.
 
-`m.push_rules` is done and matches exactly. An incremental `/sync` (`since`
-present) returns 501; that is M4.
+An incremental `/sync` (`since` present) returns 501; that is M4.
 
 ## M5 is not just long-polling
 
