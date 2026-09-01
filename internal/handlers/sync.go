@@ -43,13 +43,18 @@ func Sync(d Deps) http.Handler {
 			status int
 			mxErr  *matrixerr.Error
 		)
+		// MSC4222 is opt-in per request, and only offered when enabled, exactly
+		// as Synapse gates it.
+		useStateAfter := d.MSC4222Enabled &&
+			r.URL.Query().Get("org.matrix.msc4222.use_state_after") == "true"
+
 		if since := r.URL.Query().Get("since"); since != "" {
 			if ann != nil {
 				ann.Since = since
 			}
-			body, status, mxErr = incrementalSync(r, d, verdict, since)
+			body, status, mxErr = incrementalSync(r, d, verdict, since, useStateAfter)
 		} else {
-			body, status, mxErr = initialSyncV2(r, d, verdict)
+			body, status, mxErr = initialSyncV2(r, d, verdict, useStateAfter)
 		}
 		if mxErr != nil {
 			refuse(w, ann, status, *mxErr)
@@ -60,7 +65,7 @@ func Sync(d Deps) http.Handler {
 	})
 }
 
-func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict) ([]byte, int, *matrixerr.Error) {
+func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter bool) ([]byte, int, *matrixerr.Error) {
 	ctx := r.Context()
 	ann := server.Annotate(ctx)
 
@@ -122,7 +127,7 @@ func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict) ([]byte, int, 
 		}
 
 		entry, err := syncRoomEntry(ctx, d, room, verdict.UserID, now.Room, timeNow, cfg,
-			accountDataByRoom[room.RoomID], now)
+			accountDataByRoom[room.RoomID], now, useStateAfter)
 		if err != nil {
 			return nil, http.StatusInternalServerError, internalError(d, "room entry", err)
 		}
@@ -231,7 +236,8 @@ func syncPresenceEvents(states []store.PresenceState, timeNow int64) ([]json.Raw
 // syncRoomEntry builds one joined room's section of an initial /sync.
 func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID string,
 	endKey streamtoken.RoomKey, timeNow int64, cfg clientevent.Config,
-	accountData []store.AccountDataEntry, now streamtoken.Token) (map[string]any, error) {
+	accountData []store.AccountDataEntry, now streamtoken.Token,
+	useStateAfter bool) (map[string]any, error) {
 
 	// Load twice the timeline limit, because visibility filtering happens after
 	// and would otherwise leave the timeline short. Synapse's
@@ -275,9 +281,22 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 	// The `state` block is what the client needs to interpret the timeline that
 	// follows it, so it is the state at the START of the timeline, minus
 	// anything the timeline itself carries. See _calculate_state.
-	stateIDs, err := syncStateBlock(ctx, d, room, messages, endKey)
-	if err != nil {
-		return nil, err
+	// MSC4222 reports the state AFTER the timeline rather than before it, which
+	// is simply the state at the end token -- no union with the timeline start,
+	// and nothing subtracted, because the client is being told where the room
+	// ended up rather than what it must apply first.
+	var stateIDs map[store.StateKey]string
+	if useStateAfter {
+		stateIDs, err = d.Store.StateIDsAt(ctx, room.RoomID, endKey)
+		if err != nil {
+			return nil, err
+		}
+		dropAliases(stateIDs)
+	} else {
+		stateIDs, err = syncStateBlock(ctx, d, room, messages, endKey)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	stateEventIDs := make([]string, 0, len(stateIDs))
@@ -404,9 +423,9 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 			"prev_batch": now.WithRoomKey(start).String(),
 			"limited":    limited,
 		},
-		"state":        map[string]any{"events": stateJSON},
-		"account_data": map[string]any{"events": adEvents},
-		"ephemeral":    map[string]any{"events": ephemeral},
+		stateKeyName(useStateAfter): map[string]any{"events": stateJSON},
+		"account_data":              map[string]any{"events": adEvents},
+		"ephemeral":                 map[string]any{"events": ephemeral},
 		"unread_notifications": map[string]any{
 			"notification_count": unread.NotifyCount,
 			"highlight_count":    unread.HighlightCount,
@@ -537,4 +556,30 @@ func stateEventIDsInCurrentState(ctx context.Context, d Deps,
 		return nil, nil
 	}
 	return d.Store.EventsInCurrentState(ctx, ids)
+}
+
+// stateKeyName is the response field the state block goes under.
+//
+// MSC4222 deliberately uses a different key rather than changing what `state`
+// means: a client that did not opt in must not silently start receiving state
+// with the opposite meaning.
+func stateKeyName(useStateAfter bool) string {
+	if useStateAfter {
+		return "org.matrix.msc4222.state_after"
+	}
+	return "state"
+}
+
+// dropAliases removes every m.room.aliases entry from a state map.
+//
+// Their state key is the server name, not the empty string, so there is one per
+// server that ever set an alias -- deleting a single key misses them all but
+// the one lucky match. Synapse refuses to carry the type in any state block
+// until MSC2261 lands.
+func dropAliases(state map[store.StateKey]string) {
+	for k := range state {
+		if k.Type == "m.room.aliases" {
+			delete(state, k)
+		}
+	}
 }

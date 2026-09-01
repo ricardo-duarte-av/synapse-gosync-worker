@@ -136,6 +136,7 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 		AllowPinNow:    cfg.Testing.AllowPinNow,
 		MSC4354Enabled: cfg.Experimental.MSC4354Enabled,
 		MSC3391Enabled: cfg.Experimental.MSC3391Enabled,
+		MSC4222Enabled: cfg.Experimental.MSC4222Enabled,
 		PushRuleFeatures: pushrules.Features{
 			MSC1767Enabled:             cfg.Experimental.MSC1767Enabled,
 			MSC3381PollsEnabled:        cfg.Experimental.MSC3381PollsEnabled,

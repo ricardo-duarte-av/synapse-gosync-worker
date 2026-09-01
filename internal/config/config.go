@@ -148,6 +148,9 @@ type Experimental struct {
 	// sense to the others.
 	MSC4210Enabled bool `yaml:"msc4210_enabled"`
 	MSC4306Enabled bool `yaml:"msc4306_enabled"`
+	// MSC4222Enabled lets a client ask for `state_after` instead of `state`.
+	// Without it the query parameter is ignored, as Synapse ignores it.
+	MSC4222Enabled bool `yaml:"msc4222_enabled"`
 }
 
 // Testing gates behaviour that exists only to make the comparator possible.

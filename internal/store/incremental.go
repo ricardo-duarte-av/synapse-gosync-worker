@@ -484,3 +484,40 @@ func (s *Store) MembershipOfEvents(ctx context.Context, eventIDs []string) (map[
 	}
 	return out, rows.Err()
 }
+
+// CurrentStateDeltas returns the room's current-state changes in (since, now],
+// as (type, state_key) -> event_id.
+//
+// This is MSC4222's `state_after`: rather than the state block a client must
+// apply *before* the timeline, it reports what current state became. A delta
+// whose event_id is NULL is a state key being removed, which the MSC has no way
+// to express, so Synapse skips it and so do we.
+//
+// Ordered ascending so a key changed twice in the window ends on its last
+// value.
+func (s *Store) CurrentStateDeltas(ctx context.Context, roomID string,
+	since, now int64) (map[StateKey]string, error) {
+
+	const q = `
+		SELECT type, state_key, event_id FROM current_state_delta_stream
+		 WHERE room_id = $1 AND stream_id > $2 AND stream_id <= $3
+		 ORDER BY stream_id ASC`
+	rows, err := s.pool.Query(ctx, q, roomID, since, now)
+	if err != nil {
+		return nil, fmt.Errorf("store: current state deltas: %w", err)
+	}
+	defer rows.Close()
+	out := map[StateKey]string{}
+	for rows.Next() {
+		var k StateKey
+		var eventID *string
+		if err := rows.Scan(&k.Type, &k.StateKey, &eventID); err != nil {
+			return nil, fmt.Errorf("store: current state deltas: %w", err)
+		}
+		if eventID == nil {
+			continue
+		}
+		out[k] = *eventID
+	}
+	return out, rows.Err()
+}

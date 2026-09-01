@@ -120,6 +120,9 @@ experimental:
   # Note the inverted sense: MSC4210 REMOVES the legacy mention rules.
   msc4210_enabled: true
   msc4306_enabled: true
+  # MSC4222: lets a client ask for `state_after` instead of `state`. Opt-in per
+  # request, so enabling it changes nothing until a client asks.
+  msc4222_enabled: true
 
 testing:
   # Enables ?_gosync_now=<token>, which forces the now_token this worker

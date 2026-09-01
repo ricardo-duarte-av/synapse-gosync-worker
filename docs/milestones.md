@@ -14,6 +14,7 @@ Status is recorded here; what actually happened is in [log.md](log.md).
 | M4 | Stream tokens and incremental `/sync` | **done** — 10 windows, two accounts; one deep-history caveat |
 | M5 | Long-polling and Redis replication | not started |
 | M6 | Filters and lazy-loading | not started |
+| — | MSC4222 `state_after` | **done** |
 | M7 | Ephemeral: receipts, typing, presence | not started |
 | M8 | To-device and device lists | not started |
 | M9 | Soak, then possibly the promotion ladder | not started |

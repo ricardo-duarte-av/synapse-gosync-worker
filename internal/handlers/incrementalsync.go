@@ -22,7 +22,8 @@ import (
 // drops a room whose timeline, state, account data and ephemeral are all empty
 // (`_generate_room_entry`), and a response where nothing at all happened has no
 // `rooms` key whatsoever.
-func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw string) (
+func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw string,
+	useStateAfter bool) (
 	[]byte, int, *matrixerr.Error) {
 
 	ctx := r.Context()
@@ -116,7 +117,7 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 		if wasJoined != "join" {
 			newlyJoined = append(newlyJoined, room.RoomID)
 			entry, err := syncRoomEntry(ctx, d, room, verdict.UserID, now.Room, timeNow, cfg,
-				accountDataByRoom[room.RoomID], now)
+				accountDataByRoom[room.RoomID], now, useStateAfter)
 			if err != nil {
 				return nil, http.StatusInternalServerError, internalError(d, "room entry", err)
 			}
@@ -140,7 +141,7 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 
 		entry, err := incrementalRoomEntry(ctx, d, room, verdict.UserID, since, now,
 			timeNow, cfg, timelines[room.RoomID],
-			accountDataByRoom[room.RoomID], receiptsByRoom[room.RoomID], loadLimit)
+			accountDataByRoom[room.RoomID], receiptsByRoom[room.RoomID], loadLimit, useStateAfter)
 		if err != nil {
 			return nil, http.StatusInternalServerError, internalError(d, "room entry", err)
 		}
@@ -199,7 +200,7 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 				continue
 			}
 			entry, err := archivedRoomEntry(ctx, d, roomID, verdict.UserID, c,
-				since, now, timeNow, cfg, d.MSC3391Enabled)
+				since, now, timeNow, cfg, d.MSC3391Enabled, useStateAfter)
 			if err != nil {
 				return nil, http.StatusInternalServerError, internalError(d, "archived room", err)
 			}
@@ -405,7 +406,7 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 func incrementalRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID string,
 	since, now streamtoken.Token, timeNow int64, cfg clientevent.Config,
 	raw []store.TimelineEvent, accountData []store.AccountDataEntry,
-	receipts []store.ReceiptRow, loadLimit int) (map[string]any, error) {
+	receipts []store.ReceiptRow, loadLimit int, useStateAfter bool) (map[string]any, error) {
 
 	// More were loaded than will be returned, so hitting the load limit already
 	// means the window held more than fits.
@@ -431,9 +432,22 @@ func incrementalRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, u
 		memberships = memberships[len(memberships)-defaultTimelineLimit:]
 	}
 
-	stateIDs, err := incrementalStateDelta(ctx, d, room, messages, limited, since, now)
-	if err != nil {
-		return nil, err
+	// MSC4222 reports what current state BECAME over the window, taken straight
+	// from the state delta stream, rather than the state a client must apply
+	// before the timeline.
+	var stateIDs map[store.StateKey]string
+	if useStateAfter {
+		stateIDs, err = d.Store.CurrentStateDeltas(ctx, room.RoomID,
+			since.Room.MaxStreamPos(), now.Room.MaxStreamPos())
+		if err != nil {
+			return nil, err
+		}
+		dropAliases(stateIDs)
+	} else {
+		stateIDs, err = incrementalStateDelta(ctx, d, room, messages, limited, since, now)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	adEvents, err := accountDataEvents(accountData)
@@ -560,9 +574,9 @@ func incrementalRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, u
 			"prev_batch": prevBatch.String(),
 			"limited":    limited,
 		},
-		"state":        map[string]any{"events": stateJSON},
-		"account_data": map[string]any{"events": adEvents},
-		"ephemeral":    map[string]any{"events": ephemeral},
+		stateKeyName(useStateAfter): map[string]any{"events": stateJSON},
+		"account_data":              map[string]any{"events": adEvents},
+		"ephemeral":                 map[string]any{"events": ephemeral},
 		"unread_notifications": map[string]any{
 			"notification_count": unread.NotifyCount,
 			"highlight_count":    unread.HighlightCount,
@@ -758,7 +772,10 @@ func userChangesFromRooms(joined map[string]any) (joinedOrInvited []string, leav
 			continue
 		}
 		// Timeline only for the leave side; see the note on leaveCandidates.
-		for _, section := range []string{"state", "timeline"} {
+		// Both spellings of the state block: MSC4222 renames it, and the
+		// membership scan must follow it or the device-list and presence
+		// sections silently lose everyone who joined.
+		for _, section := range []string{"state", "org.matrix.msc4222.state_after", "timeline"} {
 			block, ok := room[section].(map[string]any)
 			if !ok {
 				continue
@@ -834,7 +851,7 @@ func isCurrentlyJoined(rooms []store.RoomForUser, roomID string) bool {
 // counts, no summary. Those describe a room you are in.
 func archivedRoomEntry(ctx context.Context, d Deps, roomID, userID string,
 	change store.MembershipChange, since, now streamtoken.Token, timeNow int64,
-	cfg clientevent.Config, msc3391 bool) (map[string]any, error) {
+	cfg clientevent.Config, msc3391, useStateAfter bool) (map[string]any, error) {
 
 	info, err := d.Store.RoomInfo(ctx, roomID)
 	if err != nil {
@@ -886,7 +903,13 @@ func archivedRoomEntry(ctx context.Context, d Deps, roomID, userID string,
 	endToken := now.WithRoomKey(leaveKey)
 	var stateIDs map[store.StateKey]string
 	if !change.OutOfBand {
-		stateIDs, err = incrementalStateDelta(ctx, d, room, messages, limited, since, endToken)
+		if useStateAfter {
+			stateIDs, err = d.Store.CurrentStateDeltas(ctx, roomID,
+				since.Room.MaxStreamPos(), leaveKey.MaxStreamPos())
+			dropAliases(stateIDs)
+		} else {
+			stateIDs, err = incrementalStateDelta(ctx, d, room, messages, limited, since, endToken)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -965,7 +988,7 @@ func archivedRoomEntry(ctx context.Context, d Deps, roomID, userID string,
 		"timeline": map[string]any{
 			"events": timeline, "prev_batch": prevBatch.String(), "limited": limited,
 		},
-		"state":        map[string]any{"events": stateJSON},
-		"account_data": map[string]any{"events": adEvents},
+		stateKeyName(useStateAfter): map[string]any{"events": stateJSON},
+		"account_data":              map[string]any{"events": adEvents},
 	}, nil
 }

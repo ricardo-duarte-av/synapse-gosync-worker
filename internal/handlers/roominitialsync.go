@@ -32,6 +32,8 @@ type Deps struct {
 	MSC3391Enabled bool
 	// PushRuleFeatures gates individual base push rules.
 	PushRuleFeatures pushrules.Features
+	// MSC4222Enabled mirrors Synapse's experimental.msc4222_enabled.
+	MSC4222Enabled bool
 }
 
 // defaultPaginationLimit is Synapse's PaginationConfig default for the legacy

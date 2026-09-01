@@ -456,6 +456,34 @@ latest event, whether the caller participated), edits, and references
 (`handlers/relations.py:418`). Three events across three rooms in this corpus
 have them.
 
+## MSC4222: `state_after` (2026-09-01)
+
+Opt-in per request via `?org.matrix.msc4222.use_state_after=true`, and only
+offered when the server enables it. The response field is a **different key**,
+`org.matrix.msc4222.state_after` — deliberately, so a client that did not opt in
+never starts receiving state with the opposite meaning.
+
+The two are computed quite differently, and neither is a filter over the other:
+
+- **Full sync** (initial, or a newly joined room): `state_after` is simply the
+  state at the end token. No union with the timeline start, nothing subtracted —
+  the client is being told where the room ended up, not what to apply first.
+- **Incremental sync**: it comes straight from `current_state_delta_stream` for
+  the window. A delta whose `event_id` is NULL is a state key being *removed*,
+  which the MSC cannot express, so Synapse skips it.
+
+Cheaper for us than for Synapse, which computes the full-sync case as
+current-state-rolled-back-by-deltas purely as an optimisation for joined rooms.
+
+Two things bit while implementing it:
+
+- **`m.room.aliases` state keys are server names**, not the empty string, so a
+  room has one per server that ever set an alias. Deleting a single key removes
+  at most one of them.
+- **The membership scan has to follow the renamed key.** `calculate_user_changes`
+  reads member events out of the state block to decide `device_lists` and the
+  extra presence; looking only for `"state"` silently loses everyone who joined.
+
 ### Reading Synapse's source
 
 | What | Where |

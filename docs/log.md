@@ -2,6 +2,22 @@
 
 Newest first. Numbers are measurements, not estimates.
 
+## 2026-09-01 — MSC4222 `state_after`
+
+Implemented and matching for **both accounts, on initial and incremental sync,
+at every rewind tested** — and with no regression to the default behaviour.
+
+It is not a filter over the normal state block. On a full sync `state_after` is
+the state at the end token, with nothing subtracted; on an incremental one it
+comes straight from `current_state_delta_stream`. Synapse computes the full-sync
+case as current-state-rolled-back only as an optimisation, so the resolver made
+this cheap.
+
+Two things bit: `m.room.aliases` state keys are **server names**, so deleting
+one key removes at most one alias event; and the membership scan that feeds
+`device_lists` and the extra presence has to follow the renamed key, or it
+silently loses everyone who joined.
+
 ## 2026-09-01 — M4: incremental `/sync` serving
 
 An incremental `/sync` matches for five of six test windows across both

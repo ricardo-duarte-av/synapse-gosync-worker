@@ -38,14 +38,15 @@ import (
 
 func main() {
 	var (
-		goSocket  = flag.String("go-socket", "", "unix socket of the worker under test")
-		refSocket = flag.String("ref-socket", "", "unix socket of the reference Synapse sync worker")
-		tokenFile = flag.String("token-file", "", "file holding the test account's access token")
-		rooms     = flag.String("rooms", "", "comma-separated room IDs; default is every joined room")
-		limit     = flag.Int("limit", 10, "pagination limit to request")
-		endpoint  = flag.String("endpoint", "room_initial_sync", "room_initial_sync | initial_sync | sync | incremental_sync")
-		rewind    = flag.Int("rewind", 2000, "for incremental_sync: how far to rewind the room key to build a `since`")
-		verbose   = flag.Bool("v", false, "print each compared response")
+		goSocket   = flag.String("go-socket", "", "unix socket of the worker under test")
+		refSocket  = flag.String("ref-socket", "", "unix socket of the reference Synapse sync worker")
+		tokenFile  = flag.String("token-file", "", "file holding the test account's access token")
+		rooms      = flag.String("rooms", "", "comma-separated room IDs; default is every joined room")
+		limit      = flag.Int("limit", 10, "pagination limit to request")
+		endpoint   = flag.String("endpoint", "room_initial_sync", "room_initial_sync | initial_sync | sync | incremental_sync")
+		stateAfter = flag.Bool("state-after", false, "request MSC4222 org.matrix.msc4222.state_after")
+		rewind     = flag.Int("rewind", 2000, "for incremental_sync: how far to rewind the room key to build a `since`")
+		verbose    = flag.Bool("v", false, "print each compared response")
 	)
 	flag.Parse()
 
@@ -66,7 +67,7 @@ func main() {
 	defer cancel()
 
 	if *endpoint == "incremental_sync" {
-		res := compareIncrementalSync(ctx, ours, ref, token, *rewind, *verbose)
+		res := compareIncrementalSync(ctx, ours, ref, token, *rewind, *verbose, *stateAfter)
 		printOne("/sync (incremental)", res)
 		report(boolToInt(res.kind == resultMatch), boolToInt(res.kind == resultMismatch),
 			boolToInt(res.kind == resultSkip))
@@ -77,7 +78,7 @@ func main() {
 	}
 
 	if *endpoint == "sync" {
-		res := compareSync(ctx, ours, ref, token, *limit, *verbose)
+		res := compareSync(ctx, ours, ref, token, *limit, *verbose, *stateAfter)
 		printOne("/sync", res)
 		report(boolToInt(res.kind == resultMatch), boolToInt(res.kind == resultMismatch),
 			boolToInt(res.kind == resultSkip))
@@ -512,8 +513,9 @@ var setPaths = map[string]string{
 	".invite_state.events": "event_id",
 	// /sync's state and account data blocks are unordered sets of events; its
 	// timeline is not.
-	".state.events":        "event_id",
-	".account_data.events": "",
+	".state.events":                          "event_id",
+	".org.matrix.msc4222.state_after.events": "event_id",
+	".account_data.events":                   "",
 	// Keyed by type so a difference lands on the right EDU rather than
 	// reporting the whole set as changed.
 	".ephemeral.events": "type",
@@ -556,9 +558,11 @@ func setPathFor(path string) (string, bool) {
 // load the event first, so it is not reproducible. Emitting them where Synapse
 // does not would still be our bug, and is still reported.
 func isToleratedUpstreamOnly(path string) bool {
-	// `.state[...]` on the legacy endpoints, `.state.events[...]` on /sync:
-	// the same shared-event-cache artefact reaches both.
-	if strings.Contains(path, ".state[") || strings.Contains(path, ".state.events[") {
+	// `.state[...]` on the legacy endpoints, `.state.events[...]` on /sync, and
+	// `.org.matrix.msc4222.state_after.events[...]` when a client opts into
+	// MSC4222: the same shared-event-cache artefact reaches all three.
+	if strings.Contains(path, ".state[") || strings.Contains(path, ".state.events[") ||
+		strings.Contains(path, ".state_after.events[") {
 		for _, suffix := range []string{
 			".prev_content", ".unsigned.prev_content", ".unsigned.prev_sender",
 		} {
@@ -873,10 +877,13 @@ func printOne(name string, res result) {
 // USER_SYNC over replication, and a comparator must not perturb the deployment
 // it is measuring.
 func compareSync(ctx context.Context, ours, ref *http.Client, token string,
-	limit int, verbose bool) result {
+	limit int, verbose, useStateAfter bool) result {
 
 	path := "/_matrix/client/v3/sync"
 	q := url.Values{"timeout": {"0"}, "set_presence": {"offline"}}
+	if useStateAfter {
+		q.Set("org.matrix.msc4222.use_state_after", "true")
+	}
 
 	refBody, status, err := get(ctx, ref, path+"?"+q.Encode(), token)
 	if err != nil {
@@ -960,7 +967,7 @@ func recoverTimeNowFromSync(resp map[string]any) (int64, bool) {
 // Everything else is pinned exactly as for an initial sync: the reference
 // answers first and its next_batch becomes our now.
 func compareIncrementalSync(ctx context.Context, ours, ref *http.Client, token string,
-	rewind int, verbose bool) result {
+	rewind int, verbose, useStateAfter bool) result {
 
 	path := "/_matrix/client/v3/sync"
 
@@ -984,6 +991,9 @@ func compareIncrementalSync(ctx context.Context, ours, ref *http.Client, token s
 	}
 
 	q := url.Values{"timeout": {"0"}, "set_presence": {"offline"}, "since": {since}}
+	if useStateAfter {
+		q.Set("org.matrix.msc4222.use_state_after", "true")
+	}
 	refBody, status, err := get(ctx, ref, path+"?"+q.Encode(), token)
 	if err != nil {
 		return result{resultSkip, fmt.Sprintf("reference request failed: %v", err)}
