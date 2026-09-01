@@ -16,7 +16,6 @@ import (
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/server"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/store"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/streamtoken"
-	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/visibility"
 )
 
 // Deps are what every handler needs.
@@ -28,6 +27,8 @@ type Deps struct {
 	AllowPinNow bool
 	// MSC4354Enabled mirrors Synapse's experimental.msc4354_enabled.
 	MSC4354Enabled bool
+	// MSC3391Enabled mirrors Synapse's experimental.msc3391_enabled.
+	MSC3391Enabled bool
 }
 
 // defaultPaginationLimit is Synapse's PaginationConfig default for the legacy
@@ -128,33 +129,12 @@ func roomInitialSync(r *http.Request, d Deps, verdict auth.Verdict, roomID strin
 
 	// Visibility before serialisation: nothing that fails this check should be
 	// rendered at all, let alone written to a response buffer.
-	senders := make([]string, 0, len(messages))
-	seen := map[string]bool{}
-	for _, ev := range messages {
-		if !seen[ev.Sender] {
-			seen[ev.Sender] = true
-			senders = append(senders, ev.Sender)
-		}
-	}
-	vis, err := d.Store.VisibilityContext(ctx, roomID, verdict.UserID, senders)
-	if err != nil {
-		return nil, http.StatusInternalServerError, internalError(d, "visibility context", err)
-	}
+	//
 	// is_peeking is false: the user is joined, checked above.
-	if err := vis.Check(false); err != nil {
-		d.Log.Warn().Err(err).Str("room_id", roomID).
-			Msg("refusing to serve a room that needs per-event state resolution")
-		return nil, http.StatusNotImplemented, &matrixerr.Error{
-			ErrCode: matrixerr.CodeUnknown,
-			Error:   "This room needs per-event state resolution, which is not implemented yet"}
+	messages, memberships, err := filterVisible(ctx, d, roomID, verdict.UserID, messages, false, timeNow)
+	if err != nil {
+		return nil, http.StatusInternalServerError, internalError(d, "visibility", err)
 	}
-	visible := messages[:0]
-	for _, ev := range messages {
-		if vis.Visible(visibility.Event{Type: ev.Type, Sender: ev.Sender, IsState: ev.IsState}) {
-			visible = append(visible, ev)
-		}
-	}
-	messages = visible
 
 	// Synapse attaches prev_content in the storage layer, before serialisation,
 	// so the v1 format lifts it to the top level along with the other copy keys.
@@ -189,30 +169,41 @@ func roomInitialSync(r *http.Request, d Deps, verdict auth.Verdict, roomID strin
 	cfg := clientevent.Config{Format: clientevent.FormatV1, Requester: requester,
 		MSC4354Enabled: d.MSC4354Enabled}
 
+	// State events are redacted on read too, not just the timeline: Synapse
+	// prunes in the storage layer, so a redacted m.room.topic in the current
+	// state is just as redacted as a message.
+	redactionIDs := timelineEventIDs(messages)
+	for _, ev := range state {
+		redactionIDs = append(redactionIDs, ev.EventID)
+	}
+	redactions, err := d.Store.Redactions(ctx, redactionIDs)
+	if err != nil {
+		return nil, http.StatusInternalServerError, internalError(d, "redactions", err)
+	}
+
 	// Synapse wraps state events with FilteredEvent.state(), whose membership is
 	// None, so the state block carries no unsigned.membership. Timeline events
 	// do carry it.
 	stateJSON := make([]json.RawMessage, 0, len(state))
 	for _, ev := range state {
-		b, err := clientevent.Serialize(ev.Stored, timeNow, cfg)
+		stored := ev.Stored
+		if err := attachRedaction(&stored, redactions, timeNow, cfg); err != nil {
+			return nil, http.StatusInternalServerError, internalError(d, "redaction", err)
+		}
+		b, err := clientevent.Serialize(stored, timeNow, cfg)
 		if err != nil {
 			return nil, http.StatusInternalServerError, internalError(d, "serialise state", err)
 		}
 		stateJSON = append(stateJSON, b)
 	}
 
-	// MSC4115's unsigned.membership is the caller's membership *at each event*,
-	// not their membership now. In a room joined part way through its history,
-	// Synapse reports "leave" for everything before the join.
-	memberships, err := d.Store.UserMembershipTimeline(ctx, roomID, verdict.UserID)
-	if err != nil {
-		return nil, http.StatusInternalServerError, internalError(d, "membership timeline", err)
-	}
-
 	chunk := make([]json.RawMessage, 0, len(messages))
-	for _, ev := range messages {
+	for i, ev := range messages {
 		stored := ev.Stored
-		stored.Membership = store.MembershipAt(memberships, ev.TopologicalOrder, ev.StreamOrdering)
+		stored.Membership = memberships[i]
+		if err := attachRedaction(&stored, redactions, timeNow, cfg); err != nil {
+			return nil, http.StatusInternalServerError, internalError(d, "redaction", err)
+		}
 		b, err := clientevent.Serialize(stored, timeNow, cfg)
 		if err != nil {
 			return nil, http.StatusInternalServerError, internalError(d, "serialise timeline", err)

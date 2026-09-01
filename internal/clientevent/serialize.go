@@ -147,6 +147,13 @@ type Stored struct {
 	// Membership is the sender's membership at this event, for MSC4115's
 	// `unsigned.membership`. Empty to omit.
 	Membership string
+
+	// RedactedBy is the id of the redaction event that applies, empty if none.
+	// When set the event is pruned before anything else happens.
+	RedactedBy string
+	// RedactedBecause is the already-serialised redaction event, attached to
+	// the pruned event so a client can see who redacted it and why.
+	RedactedBecause []byte
 }
 
 // Serialize renders a stored event for a client.
@@ -157,6 +164,17 @@ type Stored struct {
 func Serialize(ev Stored, nowMS int64, cfg Config) ([]byte, error) {
 	out := ev.JSON
 	var err error
+
+	rv := LookupRoomVersion(ev.RoomVersion)
+
+	// Redaction first: everything below operates on the pruned event, which is
+	// what Synapse's serialiser sees too -- it redacts in the storage layer,
+	// not here.
+	if ev.RedactedBy != "" {
+		if out, err = Redact(out, rv); err != nil {
+			return nil, err
+		}
+	}
 
 	// Room version v3+ PDUs do not carry their own event_id -- it is a hash of
 	// the event. Clients still expect the field, so it is always inserted.
@@ -206,11 +224,23 @@ func Serialize(ev Stored, nowMS int64, cfg Config) ([]byte, error) {
 		}
 	}
 
+	// Before the format transform: `redacted_because` is one of the six keys
+	// the v1 format lifts out of unsigned to the top level, so adding it
+	// afterwards would emit the unsigned copy with no top-level twin.
+	if ev.RedactedBy != "" {
+		if out, err = sjson.SetBytes(out, "unsigned.redacted_by", ev.RedactedBy); err != nil {
+			return nil, err
+		}
+		if len(ev.RedactedBecause) > 0 {
+			if out, err = sjson.SetRawBytes(out, "unsigned.redacted_because", ev.RedactedBecause); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	if out, err = applyFormat(out, cfg.Format); err != nil {
 		return nil, err
 	}
-
-	rv := LookupRoomVersion(ev.RoomVersion)
 
 	// An MSC4291 room derives its ID from the create event's hash, so that
 	// event has no room_id of its own. Put it back, or a client cannot tell

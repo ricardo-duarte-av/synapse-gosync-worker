@@ -16,11 +16,22 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/lru"
 )
 
 // Store holds a pool of read-only connections to Synapse's database.
 type Store struct {
-	pool *pgxpool.Pool
+	pool   *pgxpool.Pool
+	caches *caches
+}
+
+// caches hold immutable derived data. A state group's contents are fixed once
+// written, so none of this needs invalidating on the write path; see
+// Store.PurgeCaches for the one case that does.
+type caches struct {
+	eventStateGroup *lru.Cache[string, int64]
+	filteredState   *lru.Cache[string, map[StateKey]StateEntry]
 }
 
 // Config describes how to reach the database.
@@ -33,6 +44,11 @@ type Config struct {
 	MaxConns int32
 	// ConnectTimeout bounds the initial connection.
 	ConnectTimeout time.Duration
+	// EventStateGroupCacheEntries and FilteredStateCacheEntries bound the state
+	// caches. Zero takes a default; negative disables the cache, which makes
+	// "is the cache hiding a bug?" an answerable question.
+	EventStateGroupCacheEntries int
+	FilteredStateCacheEntries   int
 }
 
 // Open connects and verifies the database is reachable.
@@ -63,7 +79,23 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 		pool.Close()
 		return nil, fmt.Errorf("store: ping: %w", err)
 	}
-	return &Store{pool: pool}, nil
+	return &Store{pool: pool, caches: newCaches(cfg)}, nil
+}
+
+func newCaches(cfg Config) *caches {
+	groups, filtered := cfg.EventStateGroupCacheEntries, cfg.FilteredStateCacheEntries
+	if groups == 0 {
+		groups = 50000
+	}
+	if filtered == 0 {
+		// Filtered views are a handful of entries each, so many more fit than
+		// whole state maps would.
+		filtered = 20000
+	}
+	return &caches{
+		eventStateGroup: lru.New[string, int64](groups),
+		filteredState:   lru.New[string, map[StateKey]StateEntry](filtered),
+	}
 }
 
 // Close releases the pool.

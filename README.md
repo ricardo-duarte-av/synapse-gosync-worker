@@ -13,8 +13,8 @@ answers are trusted.
 
 | Endpoint | State |
 |---|---|
-| `/_matrix/client/*/rooms/{roomId}/initialSync` | **served**, at parity with Synapse on all 9 test rooms |
-| `/_matrix/client/*/initialSync` | **served**, at parity (except `archived=true`) |
+| `/_matrix/client/*/rooms/{roomId}/initialSync` | **served**, at parity on all 39 rooms of two test accounts |
+| `/_matrix/client/*/initialSync` | **served**, at parity for both test accounts (except `archived=true`) |
 | `/_matrix/client/*/sync` | not implemented |
 | `/_matrix/client/*/events` | not implemented |
 
@@ -24,11 +24,12 @@ Both are answered with `501` rather than approximated, on the principle that a
 loud failure beats a quiet wrong answer:
 
 - **Rooms the user has left**, including `/initialSync?archived=true`. Synapse
-  serves a snapshot of the room state as it was at the leave event; resolving
-  that needs state groups, which are not built yet.
-- **Rooms needing per-event state resolution.** History visibility other than
-  `shared` or `world_readable`, a room whose visibility has changed over its
-  life, a room with an erased sender, or a room with a retention policy.
+  serves a snapshot of the room state as it was at the leave event. The state
+  resolver can now answer that; the handler has not been wired to it.
+- **An erased sender's event that should be served pruned.** When the caller was
+  not joined at the time, Synapse returns a redacted copy; we drop the event.
+  The per-room-version prune exists, so this is a wiring job. Dropping withholds
+  content rather than publishing content that should have been stripped.
 
 One field is deliberately **not** emitted where Synapse sometimes emits it:
 `prev_content` on *state* events. Synapse's `events_worker` writes that field

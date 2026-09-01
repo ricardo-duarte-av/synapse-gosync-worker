@@ -18,24 +18,20 @@ Status is recorded here; what actually happened is in [log.md](log.md).
 | M8 | To-device and device lists | not started |
 | M9 | Soak, then possibly the promotion ladder | not started |
 
-## M1 — done
+## M1 and M2 — done, no gaps
 
-`/rooms/{roomId}/initialSync` matches Synapse on all 9 joined rooms at limits 1,
-5, 20 and 100, verified by `cmd/syncdiff`. See [log.md](log.md).
+Both endpoints match Synapse on both test accounts: 9/9 and 30/30 rooms, and
+`/initialSync` for each. The state-group resolver closed the two deliberate
+gaps that M1 shipped with.
 
-Two deliberate gaps, both answered 501 rather than approximated:
+One deviation remains, and it is smaller than it was: when an erased sender's
+event should be served **pruned**, we drop it. The per-room-version prune now
+exists (`clientevent.Redact`), so this is a wiring job rather than a missing
+capability.
 
-- **Rooms the user has left.** `_room_initial_sync_parted` resolves the room
-  state at the leave event, which needs state groups.
-- **Rooms needing per-event state.** History visibility other than `shared` or
-  `world_readable`, visibility that has changed over the room's life, an erased
-  sender, or a retention policy.
-
-Both are lifted by the same piece of work — a state-group resolver — which is
-also what M3's `compute_state_delta` needs. It is the largest single unbuilt
-thing in the project, and measuring a second account promoted it from
-nice-to-have to blocking: 6 of that account's 30 rooms need it, and because
-`/initialSync` is all-or-nothing, one such room makes the whole snapshot 501.
+`archived=true` and rooms the user has *left* are still unimplemented: they need
+the state at the leave event, which the resolver can now answer — also a wiring
+job.
 
 ## M2 — done
 

@@ -3,19 +3,13 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 
 	"github.com/tidwall/sjson"
 
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/clientevent"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/store"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/streamtoken"
-	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/visibility"
 )
-
-// errNeedsState is returned when a room cannot be rendered without per-event
-// state resolution. Callers turn it into a 501 rather than guessing.
-var errNeedsState = fmt.Errorf("room needs per-event state resolution")
 
 // roomSnapshot is the messages/state pair both initialSync endpoints build.
 type roomSnapshot struct {
@@ -44,24 +38,14 @@ func buildRoomSnapshot(ctx context.Context, d Deps, room store.RoomForUser,
 	}
 	snap.Start = start
 
-	if len(messages) > 0 {
-		senders := distinctSenders(messages)
-		vis, err := d.Store.VisibilityContext(ctx, room.RoomID, userID, senders)
-		if err != nil {
-			return snap, err
-		}
-		// is_peeking is false: callers only reach here for a room the user is
-		// a member of.
-		if err := vis.Check(false); err != nil {
-			return snap, fmt.Errorf("%w: %v", errNeedsState, err)
-		}
-		kept := messages[:0]
-		for _, ev := range messages {
-			if vis.Visible(visibility.Event{Type: ev.Type, Sender: ev.Sender, IsState: ev.IsState}) {
-				kept = append(kept, ev)
-			}
-		}
-		messages = kept
+	// Visibility before serialisation: nothing that fails this check should be
+	// rendered at all, let alone written to a response buffer.
+	//
+	// is_peeking is false: callers only reach here for a room the user is a
+	// member of.
+	messages, memberships, err := filterVisible(ctx, d, room.RoomID, userID, messages, false, timeNow)
+	if err != nil {
+		return snap, err
 	}
 
 	// Timeline only: see the note in RoomInitialSync on Synapse's shared event
@@ -74,19 +58,34 @@ func buildRoomSnapshot(ctx context.Context, d Deps, room store.RoomForUser,
 		return snap, err
 	}
 
-	memberships, err := d.Store.UserMembershipTimeline(ctx, room.RoomID, userID)
+	cfg := clientevent.Config{Format: clientevent.FormatV1, Requester: requester,
+		MSC4354Enabled: d.MSC4354Enabled}
+
+	// Redaction is applied on read: a redacted event keeps its original body in
+	// storage until a background job censors it, so serving stored JSON
+	// unchanged publishes what the redaction removed.
+	//
+	// State events too, not just the timeline. Synapse redacts in the storage
+	// layer, so every event it hands out is already pruned -- a redacted
+	// m.room.topic in the current state is just as redacted as a message.
+	ids := timelineEventIDs(messages)
+	for _, ev := range state {
+		ids = append(ids, ev.EventID)
+	}
+	redactions, err := d.Store.Redactions(ctx, ids)
 	if err != nil {
 		return snap, err
 	}
-
-	cfg := clientevent.Config{Format: clientevent.FormatV1, Requester: requester,
-		MSC4354Enabled: d.MSC4354Enabled}
 
 	snap.State = make([]json.RawMessage, 0, len(state))
 	for _, ev := range state {
 		// Synapse wraps state with FilteredEvent.state(), whose membership is
 		// None, so the state block carries no unsigned.membership.
-		body, err := clientevent.Serialize(ev.Stored, timeNow, cfg)
+		stored := ev.Stored
+		if err := attachRedaction(&stored, redactions, timeNow, cfg); err != nil {
+			return snap, err
+		}
+		body, err := clientevent.Serialize(stored, timeNow, cfg)
 		if err != nil {
 			return snap, err
 		}
@@ -94,9 +93,12 @@ func buildRoomSnapshot(ctx context.Context, d Deps, room store.RoomForUser,
 	}
 
 	snap.Chunk = make([]json.RawMessage, 0, len(messages))
-	for _, ev := range messages {
+	for i, ev := range messages {
 		stored := ev.Stored
-		stored.Membership = store.MembershipAt(memberships, ev.TopologicalOrder, ev.StreamOrdering)
+		stored.Membership = memberships[i]
+		if err := attachRedaction(&stored, redactions, timeNow, cfg); err != nil {
+			return snap, err
+		}
 		body, err := clientevent.Serialize(stored, timeNow, cfg)
 		if err != nil {
 			return snap, err
@@ -106,16 +108,37 @@ func buildRoomSnapshot(ctx context.Context, d Deps, room store.RoomForUser,
 	return snap, nil
 }
 
-func distinctSenders(messages []store.TimelineEvent) []string {
-	seen := map[string]bool{}
-	out := make([]string, 0, len(messages))
-	for _, ev := range messages {
-		if !seen[ev.Sender] {
-			seen[ev.Sender] = true
-			out = append(out, ev.Sender)
-		}
+func timelineEventIDs(messages []store.TimelineEvent) []string {
+	out := make([]string, len(messages))
+	for i, ev := range messages {
+		out[i] = ev.EventID
 	}
 	return out
+}
+
+// attachRedaction marks an event as redacted and renders the redaction event
+// that explains it.
+//
+// `redacted_because` is a fully serialised client event, not an id, so it goes
+// through the same serialiser -- which is why this cannot live in the store.
+func attachRedaction(stored *clientevent.Stored, redactions map[string]store.Redaction,
+	timeNow int64, cfg clientevent.Config) error {
+
+	r, ok := redactions[stored.EventID]
+	if !ok {
+		return nil
+	}
+	eventID, roomID, eventType, body, meta := r.RedactionEvent()
+	because, err := clientevent.Serialize(clientevent.Stored{
+		EventID: eventID, RoomID: roomID, Type: eventType,
+		JSON: body, InternalMetadata: meta, RoomVersion: stored.RoomVersion,
+	}, timeNow, cfg)
+	if err != nil {
+		return err
+	}
+	stored.RedactedBy = eventID
+	stored.RedactedBecause = because
+	return nil
 }
 
 // accountDataEvents renders account data entries as client events.

@@ -12,7 +12,6 @@ import (
 
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/clientevent"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/streamtoken"
-	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/visibility"
 )
 
 // ErrNotFound is returned when a room or event does not exist.
@@ -130,6 +129,9 @@ type TimelineEvent struct {
 	StreamOrdering   int64
 	TopologicalOrder int64
 	InstanceName     string
+	// StateKey is empty for a non-state event; IsState distinguishes a state
+	// event with an empty state key from one with none.
+	StateKey string
 	// IsState is true when the event has a state_key. Retention and the ignore
 	// list treat state events differently from messages.
 	IsState bool
@@ -168,7 +170,7 @@ func (s *Store) RecentEvents(ctx context.Context, roomID, roomVersion string, li
 		sql = `
 			SELECT e.event_id, e.type, e.sender, e.stream_ordering,
 			       e.topological_ordering, COALESCE(e.instance_name, ''),
-			       e.state_key IS NOT NULL, ej.json, ej.internal_metadata
+			       COALESCE(e.state_key, ''), e.state_key IS NOT NULL, ej.json, ej.internal_metadata
 			  FROM events e JOIN event_json ej USING (event_id)
 			 WHERE e.outlier = FALSE AND e.room_id = $1
 			   AND (e.topological_ordering < $2
@@ -180,7 +182,7 @@ func (s *Store) RecentEvents(ctx context.Context, roomID, roomVersion string, li
 		sql = `
 			SELECT e.event_id, e.type, e.sender, e.stream_ordering,
 			       e.topological_ordering, COALESCE(e.instance_name, ''),
-			       e.state_key IS NOT NULL, ej.json, ej.internal_metadata
+			       COALESCE(e.state_key, ''), e.state_key IS NOT NULL, ej.json, ej.internal_metadata
 			  FROM events e JOIN event_json ej USING (event_id)
 			 WHERE e.outlier = FALSE AND e.room_id = $1
 			   AND e.stream_ordering <= $2
@@ -200,7 +202,7 @@ func (s *Store) RecentEvents(ctx context.Context, roomID, roomVersion string, li
 	for rows.Next() {
 		var ev TimelineEvent
 		if err := rows.Scan(&ev.EventID, &ev.Type, &ev.Sender, &ev.StreamOrdering,
-			&ev.TopologicalOrder, &ev.InstanceName, &ev.IsState,
+			&ev.TopologicalOrder, &ev.InstanceName, &ev.StateKey, &ev.IsState,
 			&ev.JSON, &ev.InternalMetadata); err != nil {
 			return nil, end, fmt.Errorf("store: recent events: %w", err)
 		}
@@ -231,63 +233,65 @@ func (s *Store) RecentEvents(ctx context.Context, roomID, roomVersion string, li
 	return ascending, start, nil
 }
 
-// VisibilityContext gathers what internal/visibility needs to decide a window.
+// VisibilityExtras are the per-request facts a visibility decision needs
+// beyond the room state resolved at each event.
+type VisibilityExtras struct {
+	IgnoredSenders         map[string]bool
+	ErasedSenders          map[string]bool
+	RetentionMaxLifetimeMS int64
+}
+
+// VisibilityExtras loads the caller's ignore list, which of the given senders
+// have been erased, and the room's retention policy.
 //
-// senders are the distinct senders of the events in the window.
-func (s *Store) VisibilityContext(ctx context.Context, roomID, userID string,
-	senders []string) (visibility.Context, error) {
+// One query rather than three: none of them is large, and a visibility
+// decision needs all three before it can judge a single event.
+func (s *Store) VisibilityExtras(ctx context.Context, roomID, userID string,
+	senders []string) (VisibilityExtras, error) {
 
 	const q = `
 		SELECT
-			-- Current effective history visibility, "" when the room has none.
-			COALESCE((
-				SELECT ej.json::jsonb -> 'content' ->> 'history_visibility'
-				  FROM current_state_events cse JOIN event_json ej USING (event_id)
-				 WHERE cse.room_id = $1 AND cse.type = 'm.room.history_visibility'
-				   AND cse.state_key = ''), ''),
-			-- How many times it has ever been set. More than once means the
-			-- current value does not describe the whole window.
-			(SELECT COUNT(*) FROM events
-			  WHERE room_id = $1 AND type = 'm.room.history_visibility'),
-			-- Has any sender in the window been erased?
-			(SELECT COUNT(*) FROM erased_users WHERE user_id = ANY($2)),
-			-- Does the room have a retention policy?
-			(SELECT COUNT(*) FROM room_retention WHERE room_id = $1),
-			-- The caller's ignore list, or NULL.
 			(SELECT content FROM account_data
-			  WHERE user_id = $3 AND account_data_type = 'm.ignored_user_list')`
+			  WHERE user_id = $1 AND account_data_type = 'm.ignored_user_list'),
+			ARRAY(SELECT user_id FROM erased_users WHERE user_id = ANY($2)),
+			(SELECT max_lifetime FROM room_retention
+			  WHERE room_id = $3 ORDER BY event_id DESC LIMIT 1)`
 
 	var (
-		vis                         string
-		visCount, erased, retention int64
-		ignoredRaw                  *string
+		ignoredRaw  *string
+		erased      []string
+		maxLifetime *int64
 	)
-	if err := s.pool.QueryRow(ctx, q, roomID, senders, userID).Scan(
-		&vis, &visCount, &erased, &retention, &ignoredRaw); err != nil {
-		return visibility.Context{}, fmt.Errorf("store: visibility context: %w", err)
+	if err := s.pool.QueryRow(ctx, q, userID, senders, roomID).Scan(
+		&ignoredRaw, &erased, &maxLifetime); err != nil {
+		return VisibilityExtras{}, fmt.Errorf("store: visibility extras: %w", err)
 	}
 
-	vc := visibility.Context{
-		Visibility:           vis,
-		VisibilityEventCount: int(visCount),
-		HasErasedSender:      erased > 0,
-		HasRetentionPolicy:   retention > 0,
-	}
+	out := VisibilityExtras{}
 	if ignoredRaw != nil {
 		var parsed struct {
 			IgnoredUsers map[string]json.RawMessage `json:"ignored_users"`
 		}
 		if err := json.Unmarshal([]byte(*ignoredRaw), &parsed); err != nil {
-			return visibility.Context{}, fmt.Errorf("store: parsing ignore list: %w", err)
+			return VisibilityExtras{}, fmt.Errorf("store: parsing ignore list: %w", err)
 		}
 		if len(parsed.IgnoredUsers) > 0 {
-			vc.IgnoredSenders = make(map[string]bool, len(parsed.IgnoredUsers))
+			out.IgnoredSenders = make(map[string]bool, len(parsed.IgnoredUsers))
 			for user := range parsed.IgnoredUsers {
-				vc.IgnoredSenders[user] = true
+				out.IgnoredSenders[user] = true
 			}
 		}
 	}
-	return vc, nil
+	if len(erased) > 0 {
+		out.ErasedSenders = make(map[string]bool, len(erased))
+		for _, user := range erased {
+			out.ErasedSenders[user] = true
+		}
+	}
+	if maxLifetime != nil {
+		out.RetentionMaxLifetimeMS = *maxLifetime
+	}
+	return out, nil
 }
 
 // AttachPrevContent fills in `unsigned.prev_content` and `unsigned.prev_sender`
@@ -300,10 +304,9 @@ func (s *Store) VisibilityContext(ctx context.Context, roomID, userID string,
 // copy keys. Doing it after serialisation would produce `unsigned.prev_content`
 // with no top-level twin, and differ from Synapse on every membership change.
 //
-// The events to look up come from `unsigned.replaces_state`. They are fetched
-// in one query rather than one per event: a room's state block can contain
-// hundreds of membership events, and Synapse's own per-event `get_event` calls
-// are served from a cache this worker does not have.
+// The replaced events are fetched in one query rather than one per event: a
+// room's timeline can carry many membership changes, and Synapse's own
+// per-event get_event calls are served from a cache this worker does not have.
 func (s *Store) AttachPrevContent(ctx context.Context, events []*clientevent.Stored) error {
 	type target struct {
 		event    *clientevent.Stored
@@ -378,75 +381,4 @@ func (s *Store) AttachPrevContent(ctx context.Context, events []*clientevent.Sto
 		t.event.JSON = body
 	}
 	return nil
-}
-
-// MembershipChange is one of a user's membership events in a room.
-type MembershipChange struct {
-	// Topological and Stream together give the event's position in the room's
-	// own history. Both are needed: see UserMembershipTimeline.
-	Topological int64
-	Stream      int64
-	Membership  string
-}
-
-// UserMembershipTimeline returns the user's membership events in a room, in
-// the room's own history order.
-//
-// This answers MSC4115's `unsigned.membership`: the requesting user's
-// membership *at each event*. Synapse gets it from the state resolved at every
-// event, but for a single user the answer is far cheaper -- their membership at
-// an event is the most recent m.room.member event for them at or before it.
-// State-group resolution buys nothing, because there is only ever one state key
-// in play.
-//
-// Ordered by (topological_ordering, stream_ordering), NOT by stream alone.
-// stream_ordering is a server-local insertion counter, and **backfilled events
-// get negative values**: a room joined after it already had history stores its
-// create and early state at around -23,964,688 while the user's own invite sits
-// at +9,100,251. Ordering by stream therefore puts the whole of the room's
-// earlier history *after* events that actually follow it, and every event
-// backfilled later is reported with the membership the user had before they
-// were ever invited.
-func (s *Store) UserMembershipTimeline(ctx context.Context, roomID, userID string) ([]MembershipChange, error) {
-	const q = `
-		SELECT e.topological_ordering, e.stream_ordering, COALESCE(m.membership, '')
-		  FROM events e LEFT JOIN room_memberships m USING (event_id)
-		 WHERE e.room_id = $1 AND e.type = 'm.room.member' AND e.state_key = $2
-		 ORDER BY e.topological_ordering, e.stream_ordering`
-	rows, err := s.pool.Query(ctx, q, roomID, userID)
-	if err != nil {
-		return nil, fmt.Errorf("store: membership timeline: %w", err)
-	}
-	defer rows.Close()
-
-	var out []MembershipChange
-	for rows.Next() {
-		var c MembershipChange
-		if err := rows.Scan(&c.Topological, &c.Stream, &c.Membership); err != nil {
-			return nil, fmt.Errorf("store: membership timeline: %w", err)
-		}
-		out = append(out, c)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("store: membership timeline: %w", err)
-	}
-	return out, nil
-}
-
-// MembershipAt reports the user's membership at a position in room history.
-//
-// Synapse defaults an absent membership to "leave": a user who was never in the
-// room is, for visibility purposes, indistinguishable from one who left.
-func MembershipAt(timeline []MembershipChange, topological, stream int64) string {
-	membership := "leave"
-	for _, c := range timeline {
-		if c.Topological > topological ||
-			(c.Topological == topological && c.Stream > stream) {
-			break
-		}
-		if c.Membership != "" {
-			membership = c.Membership
-		}
-	}
-	return membership
 }

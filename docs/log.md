@@ -2,6 +2,47 @@
 
 Newest first. Numbers are measurements, not estimates.
 
+## 2026-09-01 — state-group resolver: every gap closed
+
+**Both accounts, both endpoints, fully at parity.** `@test` now matches on all
+**30 of 30** rooms (was 24) and on `/initialSync` (was a 501); `@goworker`
+still matches 9/9 and `/initialSync`.
+
+Built `internal/store/state.go` — the recursive walk over `state_group_edges`
+with `DISTINCT ON (type, state_key)`, ported from
+`_get_state_groups_from_groups_txn`, plus `SET LOCAL enable_seqscan = off`
+because `state_groups_state` is the largest table in the database and the
+planner will sequential-scan it otherwise. The walk is **filtered to the two
+keys a visibility decision needs**; resolving the whole map to answer "what is
+the history visibility" would mean reading every state event in the room.
+
+`internal/visibility` is now a close port of `filter_events_for_client` rather
+than a fast path with a refusal attached: per-event history visibility and
+membership, the membership-transition rule for the caller's own events, the
+boundary rule for history-visibility events themselves, outliers, erased
+senders, retention, ignored users and soft-failed events.
+
+Three things the resolver uncovered, all in
+[synapse-notes.md](synapse-notes.md):
+
+- **Redaction is applied on read, and we were not doing it.** A redacted event
+  keeps its original body in storage until a background job censors it, so we
+  were serving content that had been redacted, in some cases years ago. Synapse
+  prunes in the storage layer, so state events need it as much as the timeline.
+  The allowlist is per room version and the differences are real.
+- **MSC3391**: account data with empty content is deleted and must be omitted.
+  Sixteen entries were being served that Synapse drops.
+- **`/initialSync` presence cannot be pinned at all** — Synapse reads it with no
+  stream bound, so the timestamps move between the two requests. Reported
+  separately from clock skew, and only the timestamp is exempt: which users
+  appear and their state are still compared.
+
+**Deliberate deviation, newly introduced:** when an erased sender's event should
+be served *pruned* (the caller was not joined at the time), we drop it instead.
+Redaction-on-erasure needs the same per-room-version prune, which now exists, so
+this can be closed; until then dropping withholds content rather than
+publishing content that should have been stripped.
+
 ## 2026-09-01 — a second account found five more defects
 
 Ran both comparators as `@test:aguiarvieira.pt`: **30 joined rooms, versions 1,

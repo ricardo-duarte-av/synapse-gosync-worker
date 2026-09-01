@@ -228,6 +228,74 @@ remote server cannot claim a future timestamp to stick for longer than the cap.
 Since `homeserver.yaml` is never mounted, this is configured in our own
 `experimental:` block using Synapse's field name.
 
+## The state-group resolver, and what it uncovered (2026-09-01)
+
+With per-event state resolved, every deliberate 501 gap closed: **all 30 of the
+second account's rooms now match**, including `invited` history visibility,
+rooms whose visibility changed 2 and 3 times, encrypted rooms, room version 1
+and backfilled history.
+
+Resolving state exposed the next layer of the onion.
+
+### Redaction is applied on READ, and we were not doing it
+
+A redacted event **keeps its original body in `event_json`** until a background
+job censors it, and Synapse censors in place only after
+`redaction_retention_period`. Serving stored JSON unchanged therefore publishes
+exactly what the redaction was meant to remove — on this server, for events
+redacted years ago.
+
+Synapse prunes in the storage layer (`_maybe_redact_event_row`), so **every**
+event it hands out is already redacted: state events as much as timeline ones.
+Getting the timeline right and forgetting the state block leaves a redacted
+`m.room.topic` sitting in current state with its content intact.
+
+The allowlist is per room version, and the differences are not cosmetic:
+`m.room.aliases` keeps its aliases in versions 1–5 and loses them afterwards; a
+create event keeps its *whole* content from version 11 (MSC2176); versions
+before 11 keep three extra top-level fields. Redaction does not clear
+`unsigned`, it rebuilds it, keeping only `age_ts` and `replaces_state`.
+
+Which redactions count is also a rule, not a lookup:
+
+- redactions of `m.room.create` are ignored outright;
+- a rejected redaction does not count;
+- a redaction only redacts within its own room;
+- from room version 3, a redaction that arrived before its target is rechecked
+  on read and counts only if its sender shares a domain with the target's.
+
+### MSC3391: account data with empty content is deleted
+
+`get_global_account_data_for_user` appends `AND content != '{}'` when
+`msc3391_enabled` — on here, off by default in Synapse. Sixteen deleted entries
+were being served, mostly per-device notification settings.
+
+Note the comparison is against the literal text `{}`, not parsed JSON, so an
+entry stored as `{ }` survives. Reproduced exactly rather than "improved": the
+point is to return what Synapse returns.
+
+### `/initialSync` presence cannot be pinned at all
+
+Synapse reads it with `get_new_events(from_key=None)` — the *current* presence
+of everyone the caller shares a room with, **not presence as of a token**. On a
+server with active bots those timestamps move every second, so `last_active_ago`
+differs by however long elapsed between the two requests: up to nine minutes in
+one observed case where a user became active in between.
+
+This is a different category from the per-room clock skew. That is bounded and
+tolerated within 1000ms; this is unbounded and genuinely untestable. syncdiff
+reports the two separately, and still compares *which* users appear, their
+presence state and their `currently_active` — so a missing user or a wrong state
+is still a mismatch.
+
+### Room version flags are cumulative, and flattening them is where they get lost
+
+`rust/src/room_versions.rs` defines each version with struct-update syntax
+inheriting from the previous one, so v9's `restricted_join_rule_fix` does not
+replace v8's `restricted_join_rule` — it joins it. A first attempt to extract the
+table by regex silently dropped every inherited flag. The Go table is flattened
+by hand for that reason, with the inheritance spelled out in a comment.
+
 ### Reading Synapse's source
 
 | What | Where |

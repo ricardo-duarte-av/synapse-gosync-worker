@@ -110,6 +110,7 @@ reference:
 # event is actually sticky, and then every response containing one differs.
 experimental:
   msc4354_enabled: true
+  msc3391_enabled: true
 
 testing:
   # Enables ?_gosync_now=<token>, which forces the now_token this worker

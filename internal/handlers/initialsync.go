@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"encoding/json"
-	"errors"
 	"net/http"
 
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/auth"
@@ -93,7 +92,7 @@ func initialSync(r *http.Request, d Deps, verdict auth.Verdict) ([]byte, int, *m
 		requester.TokenID = tokenID
 	}
 
-	accountDataByRoom, err := d.Store.AllRoomAccountData(ctx, verdict.UserID)
+	accountDataByRoom, err := d.Store.AllRoomAccountData(ctx, verdict.UserID, d.MSC3391Enabled)
 	if err != nil {
 		return nil, http.StatusInternalServerError, internalError(d, "room account data", err)
 	}
@@ -145,13 +144,6 @@ func initialSync(r *http.Request, d Deps, verdict auth.Verdict) ([]byte, int, *m
 		snap, err := buildRoomSnapshot(ctx, d, room, verdict.UserID, now.Room, limit, timeNow,
 			clientevent.Requester{})
 		if err != nil {
-			if errors.Is(err, errNeedsState) {
-				d.Log.Warn().Err(err).Str("room_id", room.RoomID).
-					Msg("refusing to serve a room that needs per-event state resolution")
-				return nil, http.StatusNotImplemented, &matrixerr.Error{
-					ErrCode: matrixerr.CodeUnknown,
-					Error:   "A room in this snapshot needs per-event state resolution, which is not implemented yet"}
-			}
 			return nil, http.StatusInternalServerError, internalError(d, "room snapshot", err)
 		}
 
@@ -180,7 +172,7 @@ func initialSync(r *http.Request, d Deps, verdict auth.Verdict) ([]byte, int, *m
 		return nil, http.StatusInternalServerError, internalError(d, "presence", err)
 	}
 
-	globalAD, err := d.Store.GlobalAccountData(ctx, verdict.UserID)
+	globalAD, err := d.Store.GlobalAccountData(ctx, verdict.UserID, d.MSC3391Enabled)
 	if err != nil {
 		return nil, http.StatusInternalServerError, internalError(d, "global account data", err)
 	}

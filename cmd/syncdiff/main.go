@@ -121,6 +121,10 @@ func report(matched, mismatched, skipped int) {
 	if tolerated > 0 {
 		fmt.Printf("\n  %d tolerated cache-dependent fields (prev_content on state, receipt thread_id)", tolerated)
 	}
+	if liveDataSkew > 0 {
+		fmt.Printf("\n  %d unpinnable live-data fields (presence timestamps: /initialSync reads presence with no stream bound)",
+			liveDataSkew)
+	}
 	if clockSkewCount > 0 {
 		fmt.Printf("\n  %d age-like fields within clock skew (max %dms; Synapse re-reads its clock per room)",
 			clockSkewCount, clockSkewMaxMS)
@@ -251,14 +255,42 @@ var (
 const clockSkewToleranceMS = 1000
 
 // isClockDerived reports whether a field is computed from the serialiser's
-// wall clock.
+// wall clock, and so is bounded by clock skew alone.
 func isClockDerived(path string) bool {
-	for _, suffix := range []string{".age", ".unsigned.age", ".last_active_ago"} {
+	for _, suffix := range []string{
+		".age", ".unsigned.age",
+		// MSC4354's sticky TTL is "time left", so it is computed from the
+		// clock exactly like age is.
+		".unsigned.msc4354_sticky_duration_ttl_ms",
+	} {
 		if strings.HasSuffix(path, suffix) {
 			return true
 		}
 	}
-	return false
+	// A per-room presence block is read at the same instant as the room, so
+	// its last_active_ago is bounded like an age. /initialSync's is not; see
+	// isLiveData.
+	return strings.HasSuffix(path, ".last_active_ago") && !strings.HasPrefix(path, ".presence[")
+}
+
+// liveDataSkew counts fields that cannot be pinned at all.
+var liveDataSkew int
+
+// isLiveData reports whether a field is read from a table with no stream bound,
+// and so genuinely differs between two calls however they are pinned.
+//
+// /initialSync's presence block is the case. Synapse reads it with
+// `get_new_events(from_key=None)` -- the *current* presence of everyone the
+// caller shares a room with, not presence as of a token. On a server with
+// active bots those timestamps move every second, so `last_active_ago` differs
+// by however long elapsed between the two requests, which was up to nine
+// minutes in one observed case where a user became active in between.
+//
+// Only the timestamp is untestable. Which users appear, their presence state,
+// and their currently_active flag are all still compared, so a missing user or
+// a wrong state is still a mismatch.
+func isLiveData(path string) bool {
+	return strings.HasPrefix(path, ".presence[") && strings.HasSuffix(path, ".last_active_ago")
 }
 
 // withinClockSkew records and accepts a small difference in an age-like field.
@@ -527,6 +559,10 @@ func diff(path string, got, want any, out *[]string) {
 			return
 		}
 		if withinClockSkew(path, got, want) {
+			return
+		}
+		if isLiveData(path) {
+			liveDataSkew++
 			return
 		}
 		*out = append(*out, fmt.Sprintf("%s: ours=%s synapse=%s", path, brief(got), brief(want)))

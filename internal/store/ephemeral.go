@@ -68,7 +68,7 @@ type AccountDataEntry struct {
 // Synapse emits the tags first, as a synthetic `m.tag` event, then the stored
 // room account data. Tags live in their own table rather than in
 // room_account_data, so they would be missed entirely by the obvious query.
-func (s *Store) RoomAccountData(ctx context.Context, userID, roomID string) ([]AccountDataEntry, error) {
+func (s *Store) RoomAccountData(ctx context.Context, userID, roomID string, msc3391 bool) ([]AccountDataEntry, error) {
 	var out []AccountDataEntry
 
 	tags, err := s.roomTags(ctx, userID, roomID)
@@ -79,11 +79,14 @@ func (s *Store) RoomAccountData(ctx context.Context, userID, roomID string) ([]A
 		out = append(out, AccountDataEntry{Type: "m.tag", Content: tags})
 	}
 
-	const q = `
+	q := `
 		SELECT account_data_type, content
 		  FROM room_account_data
-		 WHERE user_id = $1 AND room_id = $2
-		 ORDER BY account_data_type`
+		 WHERE user_id = $1 AND room_id = $2`
+	if msc3391 {
+		q += ` AND content != '{}'`
+	}
+	q += ` ORDER BY account_data_type`
 	rows, err := s.pool.Query(ctx, q, userID, roomID)
 	if err != nil {
 		return nil, fmt.Errorf("store: room account data: %w", err)

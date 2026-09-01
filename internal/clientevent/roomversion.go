@@ -16,36 +16,72 @@ package clientevent
 // implement.
 type RoomVersion struct {
 	// UpdatedRedactionRules is MSC3820, from room version 11. It moves a
-	// redaction's target from `content.redacts` to a top-level `redacts`.
+	// redaction's target into `content.redacts`, and changes which fields
+	// survive redaction.
 	UpdatedRedactionRules bool
 	// RoomIDsAsHashes is MSC4291, from room version 12. The room ID is derived
 	// from the hash of the create event, so **the create event carries no
 	// `room_id`** while every other event in the room does. Serialisation has
 	// to put it back for clients.
 	RoomIDsAsHashes bool
+	// SpecialCaseAliasesAuth keeps `content.aliases` through a redaction.
+	// Room versions 1 to 5 only.
+	SpecialCaseAliasesAuth bool
+	// ImplicitRoomCreator drops `content.creator` from a redacted create
+	// event, from room version 11.
+	ImplicitRoomCreator bool
+	// RestrictedJoinRule keeps `content.allow` on join rules, from v8.
+	RestrictedJoinRule bool
+	// RestrictedJoinRuleFix keeps `join_authorised_via_users_server` on
+	// membership, from v9.
+	RestrictedJoinRuleFix bool
+	// MSC4242StateDags replaces `auth_events` with `prev_state_events`.
+	MSC4242StateDags bool
+	// MSC3389RelationRedactions keeps a trimmed `m.relates_to` through a
+	// redaction.
+	MSC3389RelationRedactions bool
 }
 
 // roomVersions mirrors rust/src/room_versions.rs for the two flags above.
 // Unknown versions get the conservative pre-v11 behaviour.
+// roomVersions mirrors rust/src/room_versions.rs. Each version there inherits
+// from the previous with struct-update syntax, so the flags are cumulative:
+// v9's restricted_join_rule_fix does not replace v8's restricted_join_rule, it
+// joins it. Flattened here, because a Go map has no inheritance and an
+// inherited flag silently dropped is exactly the kind of difference that only
+// shows up on one room, years later.
 var roomVersions = map[string]RoomVersion{
-	"1":                     {},
-	"2":                     {},
-	"3":                     {},
-	"4":                     {},
-	"5":                     {},
-	"6":                     {},
-	"7":                     {},
-	"8":                     {},
-	"9":                     {},
-	"10":                    {},
-	"org.matrix.msc3389.10": {},
-	"org.matrix.msc1767.10": {},
-	"org.matrix.msc3757.10": {},
-	"11":                    {UpdatedRedactionRules: true},
-	"org.matrix.msc3757.11": {UpdatedRedactionRules: true},
-	"org.matrix.hydra.11":   {UpdatedRedactionRules: true, RoomIDsAsHashes: true},
-	"12":                    {UpdatedRedactionRules: true, RoomIDsAsHashes: true},
-	"org.matrix.msc4242.12": {UpdatedRedactionRules: true, RoomIDsAsHashes: true},
+	// 1-5: aliases are special-cased in auth, and survive redaction.
+	"1": {SpecialCaseAliasesAuth: true},
+	"2": {SpecialCaseAliasesAuth: true},
+	"3": {SpecialCaseAliasesAuth: true},
+	"4": {SpecialCaseAliasesAuth: true},
+	"5": {SpecialCaseAliasesAuth: true},
+	// 6-7: the aliases special case is gone.
+	"6": {},
+	"7": {},
+	// 8: restricted join rules (MSC3083).
+	"8": {RestrictedJoinRule: true},
+	// 9-10: the restricted join rule fix (MSC3375).
+	"9":                     {RestrictedJoinRule: true, RestrictedJoinRuleFix: true},
+	"10":                    {RestrictedJoinRule: true, RestrictedJoinRuleFix: true},
+	"org.matrix.msc1767.10": {RestrictedJoinRule: true, RestrictedJoinRuleFix: true},
+	"org.matrix.msc3757.10": {RestrictedJoinRule: true, RestrictedJoinRuleFix: true},
+	"org.matrix.msc3389.10": {RestrictedJoinRule: true, RestrictedJoinRuleFix: true,
+		MSC3389RelationRedactions: true},
+	// 11: updated redaction rules and an implicit creator (MSC3820).
+	"11": {RestrictedJoinRule: true, RestrictedJoinRuleFix: true,
+		UpdatedRedactionRules: true, ImplicitRoomCreator: true},
+	"org.matrix.msc3757.11": {RestrictedJoinRule: true, RestrictedJoinRuleFix: true,
+		UpdatedRedactionRules: true, ImplicitRoomCreator: true},
+	"org.matrix.hydra.11": {RestrictedJoinRule: true, RestrictedJoinRuleFix: true,
+		UpdatedRedactionRules: true, ImplicitRoomCreator: true, RoomIDsAsHashes: true},
+	// 12: room IDs as hashes (MSC4291).
+	"12": {RestrictedJoinRule: true, RestrictedJoinRuleFix: true,
+		UpdatedRedactionRules: true, ImplicitRoomCreator: true, RoomIDsAsHashes: true},
+	"org.matrix.msc4242.12": {RestrictedJoinRule: true, RestrictedJoinRuleFix: true,
+		UpdatedRedactionRules: true, ImplicitRoomCreator: true, RoomIDsAsHashes: true,
+		MSC4242StateDags: true},
 }
 
 // LookupRoomVersion returns the flags for a room version identifier.

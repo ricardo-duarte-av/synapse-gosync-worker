@@ -59,12 +59,20 @@ func (s *Store) RoomsForUser(ctx context.Context, userID string, memberships []s
 }
 
 // GlobalAccountData loads a user's account data that is not tied to a room.
-func (s *Store) GlobalAccountData(ctx context.Context, userID string) ([]AccountDataEntry, error) {
-	const q = `
+//
+// msc3391 treats an entry with empty content as deleted and omits it. Synapse
+// compares the stored text against the literal `{}` rather than parsing it, so
+// an entry stored as `{ }` survives; the comparison is reproduced exactly
+// rather than "improved", because the point is to return what Synapse returns.
+func (s *Store) GlobalAccountData(ctx context.Context, userID string, msc3391 bool) ([]AccountDataEntry, error) {
+	q := `
 		SELECT account_data_type, content
 		  FROM account_data
-		 WHERE user_id = $1
-		 ORDER BY account_data_type`
+		 WHERE user_id = $1`
+	if msc3391 {
+		q += ` AND content != '{}'`
+	}
+	q += ` ORDER BY account_data_type`
 	rows, err := s.pool.Query(ctx, q, userID)
 	if err != nil {
 		return nil, fmt.Errorf("store: global account data: %w", err)
@@ -92,7 +100,7 @@ func (s *Store) GlobalAccountData(ctx context.Context, userID string) ([]Account
 //
 // One query each rather than one per room: /initialSync touches every room the
 // user is in, and this account is in nine while a real one is in hundreds.
-func (s *Store) AllRoomAccountData(ctx context.Context, userID string) (map[string][]AccountDataEntry, error) {
+func (s *Store) AllRoomAccountData(ctx context.Context, userID string, msc3391 bool) (map[string][]AccountDataEntry, error) {
 	byRoom := map[string][]AccountDataEntry{}
 
 	// Tags first: Synapse emits the synthetic m.tag event ahead of stored room
@@ -126,11 +134,15 @@ func (s *Store) AllRoomAccountData(ctx context.Context, userID string) (map[stri
 		byRoom[roomID] = append(byRoom[roomID], AccountDataEntry{Type: "m.tag", Content: body})
 	}
 
-	rows, err := s.pool.Query(ctx, `
+	roomQ := `
 		SELECT room_id, account_data_type, content
 		  FROM room_account_data
-		 WHERE user_id = $1
-		 ORDER BY room_id, account_data_type`, userID)
+		 WHERE user_id = $1`
+	if msc3391 {
+		roomQ += ` AND content != '{}'`
+	}
+	roomQ += ` ORDER BY room_id, account_data_type`
+	rows, err := s.pool.Query(ctx, roomQ, userID)
 	if err != nil {
 		return nil, fmt.Errorf("store: all room account data: %w", err)
 	}

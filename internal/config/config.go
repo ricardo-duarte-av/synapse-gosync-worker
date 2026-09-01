@@ -133,6 +133,9 @@ type Experimental struct {
 	// MSC4354Enabled adds `unsigned.msc4354_sticky_duration_ttl_ms` to sticky
 	// events. Synapse defaults this to false; this deployment sets it true.
 	MSC4354Enabled bool `yaml:"msc4354_enabled"`
+	// MSC3391Enabled treats account data with empty content as deleted, and
+	// omits it. Synapse defaults this to false; this deployment sets it true.
+	MSC3391Enabled bool `yaml:"msc3391_enabled"`
 }
 
 // Testing gates behaviour that exists only to make the comparator possible.

@@ -118,7 +118,7 @@ func inRange(to streamtoken.MultiWriter, instanceName string, pos int64) bool {
 
 // roomAccountData renders the account data events for a room.
 func roomAccountData(ctx context.Context, d Deps, userID, roomID string) ([]json.RawMessage, error) {
-	entries, err := d.Store.RoomAccountData(ctx, userID, roomID)
+	entries, err := d.Store.RoomAccountData(ctx, userID, roomID, d.MSC3391Enabled)
 	if err != nil {
 		return nil, err
 	}

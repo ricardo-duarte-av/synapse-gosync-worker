@@ -134,6 +134,7 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 		Log:            log,
 		AllowPinNow:    cfg.Testing.AllowPinNow,
 		MSC4354Enabled: cfg.Experimental.MSC4354Enabled,
+		MSC3391Enabled: cfg.Experimental.MSC3391Enabled,
 	}
 	mux := server.NewMux(server.Routes{
 		RoomInitialSync: handlers.RoomInitialSync(deps),
