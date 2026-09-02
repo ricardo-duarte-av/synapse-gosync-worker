@@ -87,10 +87,11 @@ func (s *Store) RoomTimelineSince(ctx context.Context, roomIDs []string, roomVer
 			       e.topological_ordering, COALESCE(e.instance_name, ''),
 			       COALESCE(e.state_key, ''), e.state_key IS NOT NULL,
 			       ej.json, ej.internal_metadata,
+			       e.rejection_reason IS NULL,
 			       ROW_NUMBER() OVER (PARTITION BY e.room_id
 			                          ORDER BY e.stream_ordering DESC) AS rn
 			  FROM events e JOIN event_json ej USING (event_id)
-			 WHERE e.outlier = FALSE AND e.rejection_reason IS NULL AND e.room_id = ANY($1)
+			 WHERE e.outlier = FALSE AND e.room_id = ANY($1)
 			   AND e.stream_ordering > $2 AND e.stream_ordering <= $3
 		) x WHERE rn <= $4`
 	rows, err := s.pool.Query(ctx, q, roomIDs, since, now, limit)
@@ -101,12 +102,21 @@ func (s *Store) RoomTimelineSince(ctx context.Context, roomIDs []string, roomVer
 
 	out := map[string][]TimelineEvent{}
 	for rows.Next() {
-		var ev TimelineEvent
-		var rn int64
+		var (
+			ev TimelineEvent
+			ok bool
+			rn int64
+		)
 		if err := rows.Scan(&ev.RoomID, &ev.EventID, &ev.Type, &ev.Sender, &ev.StreamOrdering,
 			&ev.TopologicalOrder, &ev.InstanceName, &ev.StateKey, &ev.IsState,
-			&ev.JSON, &ev.InternalMetadata, &rn); err != nil {
+			&ev.JSON, &ev.InternalMetadata, &ok, &rn); err != nil {
 			return nil, fmt.Errorf("store: room timeline since: %w", err)
+		}
+		// A rejected event took a row number, so it counted towards the limit
+		// -- as it does in Synapse, which pages without a rejection predicate
+		// and drops them afterwards -- and is dropped here rather than in SQL.
+		if !ok {
+			continue
 		}
 		ev.RoomVersion = roomVersions[ev.RoomID]
 		out[ev.RoomID] = append(out[ev.RoomID], ev)

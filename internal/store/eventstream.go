@@ -30,10 +30,11 @@ func (s *Store) RoomEventsForward(ctx context.Context, roomIDs []string,
 			       e.topological_ordering, COALESCE(e.instance_name, ''),
 			       COALESCE(e.state_key, ''), e.state_key IS NOT NULL,
 			       ej.json, ej.internal_metadata,
+			       e.rejection_reason IS NULL,
 			       ROW_NUMBER() OVER (PARTITION BY e.room_id
 			                          ORDER BY e.stream_ordering ASC) AS rn
 			  FROM events e JOIN event_json ej USING (event_id)
-			 WHERE e.outlier = FALSE AND e.rejection_reason IS NULL AND e.room_id = ANY($1)
+			 WHERE e.outlier = FALSE AND e.room_id = ANY($1)
 			   AND e.stream_ordering > $2 AND e.stream_ordering <= $3
 		) x WHERE rn <= $4
 		ORDER BY stream_ordering ASC`
@@ -48,12 +49,17 @@ func (s *Store) RoomEventsForward(ctx context.Context, roomIDs []string,
 	for rows.Next() {
 		var (
 			ev TimelineEvent
+			ok bool
 			rn int64
 		)
 		if err := rows.Scan(&ev.RoomID, &ev.EventID, &ev.Type, &ev.Sender, &ev.StreamOrdering,
 			&ev.TopologicalOrder, &ev.InstanceName, &ev.StateKey, &ev.IsState,
-			&ev.JSON, &ev.InternalMetadata, &rn); err != nil {
+			&ev.JSON, &ev.InternalMetadata, &ok, &rn); err != nil {
 			return nil, fmt.Errorf("store: room events forward: %w", err)
+		}
+		// Rejected events consume a row number and are dropped after it.
+		if !ok {
+			continue
 		}
 		ev.RoomVersion = roomVersions[ev.RoomID]
 		out = append(out, ev)
@@ -86,7 +92,7 @@ func (s *Store) MembershipEventsForUser(ctx context.Context, userID string,
 		  JOIN event_json ej USING (event_id)
 		  LEFT JOIN rooms r ON r.room_id = e.room_id
 		 WHERE e.type = 'm.room.member' AND e.state_key = $1
-		   AND e.outlier = FALSE AND e.rejection_reason IS NULL
+		   AND e.outlier = FALSE
 		   AND e.stream_ordering > $2 AND e.stream_ordering <= $3
 		 ORDER BY e.stream_ordering ASC`
 

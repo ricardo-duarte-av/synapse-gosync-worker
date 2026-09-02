@@ -1034,3 +1034,45 @@ rooms are built, so how many run concurrently decides which members a later room
 considers already sent -- another reason the two implementations can disagree
 about lazy loading, and another reason to match the constant rather than pick
 one.
+
+## Rejected events consume the limit (2026-09-02)
+
+The correction to the note above, found by comparing a 654-room account.
+
+Synapse pages the events table with **no rejection predicate** and drops
+rejected events afterwards, in `get_events_as_list` (`allow_rejected=False`).
+The order matters: a rejected event occupies a slot in the `LIMIT`, and then is
+not returned. The page therefore reaches exactly as far back as it would have
+with the rejected events included, and a room whose recent history is entirely
+`auth_error` returns an EMPTY timeline rather than older messages.
+
+Filtering `rejection_reason IS NULL` in the WHERE clause is not equivalent and
+is much worse than it looks: the page reaches further back, and one bridged
+matrix.org room here returned a message 63,000 stream positions old that Synapse
+never sends -- taking its `prev_batch` and its whole state block with it.
+
+The same applies to the token: `next_key` comes from the oldest row PAGED,
+rejected or not.
+
+Anchor queries are the exception and do filter in SQL --
+`get_last_event_pos_in_room_before_stream_ordering` has `LEFT JOIN rejections
+... AND rejections.event_id IS NULL` -- because there is no limit to consume.
+
+## An open question: extra members in Synapse's lazy state block
+
+On 5 of 654 rooms, Synapse's lazy-loaded `state` carries a member event for
+somebody who is neither a timeline sender nor the caller, and we do not. It is
+deterministic across repeated requests, so it is not the shared-cache artefact
+that `prev_content` is.
+
+Nothing in `_compute_state_delta_for_full_sync` explains it: `members_to_fetch`
+is the senders of `batch.events` plus the caller, the same `state_filter` is
+used for both ends of the timeline, and `compute_summary` returns before
+computing heroes when a room has a name -- which every affected room does.
+
+The likeliest explanation, unproven: `_get_state_for_groups` returns a superset
+of what a filter asks for when a state group's delta is small enough to be
+returned whole. The extra member's event does live in a delta row of a nearby
+state group. If that is right, matching it would mean reproducing the storage
+layout rather than the algorithm, and returning exactly what was asked for is
+the better answer -- but it is recorded as unexplained rather than dismissed.

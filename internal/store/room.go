@@ -199,9 +199,10 @@ func (s *Store) RecentEvents(ctx context.Context, roomID, roomVersion string, li
 		sql = `
 			SELECT e.event_id, e.type, e.sender, e.stream_ordering,
 			       e.topological_ordering, COALESCE(e.instance_name, ''),
-			       COALESCE(e.state_key, ''), e.state_key IS NOT NULL, ej.json, ej.internal_metadata
+			       COALESCE(e.state_key, ''), e.state_key IS NOT NULL, ej.json, ej.internal_metadata,
+			       e.rejection_reason IS NULL
 			  FROM events e JOIN event_json ej USING (event_id)
-			 WHERE e.outlier = FALSE AND e.rejection_reason IS NULL AND e.room_id = $1
+			 WHERE e.outlier = FALSE AND e.room_id = $1
 			   AND (e.topological_ordering < $2
 			        OR (e.topological_ordering = $2 AND e.stream_ordering <= $3))
 			 ORDER BY e.topological_ordering DESC, e.stream_ordering DESC
@@ -211,9 +212,10 @@ func (s *Store) RecentEvents(ctx context.Context, roomID, roomVersion string, li
 		sql = `
 			SELECT e.event_id, e.type, e.sender, e.stream_ordering,
 			       e.topological_ordering, COALESCE(e.instance_name, ''),
-			       COALESCE(e.state_key, ''), e.state_key IS NOT NULL, ej.json, ej.internal_metadata
+			       COALESCE(e.state_key, ''), e.state_key IS NOT NULL, ej.json, ej.internal_metadata,
+			       e.rejection_reason IS NULL
 			  FROM events e JOIN event_json ej USING (event_id)
-			 WHERE e.outlier = FALSE AND e.rejection_reason IS NULL AND e.room_id = $1
+			 WHERE e.outlier = FALSE AND e.room_id = $1
 			   AND e.stream_ordering <= $2
 			 ORDER BY e.topological_ordering DESC, e.stream_ordering DESC
 			 LIMIT $3`
@@ -227,17 +229,24 @@ func (s *Store) RecentEvents(ctx context.Context, roomID, roomVersion string, li
 	defer rows.Close()
 
 	// Descending: newest first.
-	var descending []TimelineEvent
+	var (
+		descending []TimelineEvent
+		accepted   []bool
+	)
 	for rows.Next() {
-		var ev TimelineEvent
+		var (
+			ev TimelineEvent
+			ok bool
+		)
 		if err := rows.Scan(&ev.EventID, &ev.Type, &ev.Sender, &ev.StreamOrdering,
 			&ev.TopologicalOrder, &ev.InstanceName, &ev.StateKey, &ev.IsState,
-			&ev.JSON, &ev.InternalMetadata); err != nil {
+			&ev.JSON, &ev.InternalMetadata, &ok); err != nil {
 			return nil, end, fmt.Errorf("store: recent events: %w", err)
 		}
 		ev.RoomID = roomID
 		ev.RoomVersion = roomVersion
 		descending = append(descending, ev)
+		accepted = append(accepted, ok)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, end, fmt.Errorf("store: recent events: %w", err)
@@ -245,19 +254,23 @@ func (s *Store) RecentEvents(ctx context.Context, roomID, roomVersion string, li
 
 	if len(descending) > limit {
 		descending = descending[:limit]
+		accepted = accepted[:limit]
 	}
 	if len(descending) == 0 {
 		return nil, end, nil
 	}
 
 	// A token names a position *between* events, so the start of this chunk is
-	// one before the oldest event in it.
+	// one before the oldest event PAGED -- rejected events took their slot in
+	// the limit before being dropped, exactly as they do upstream.
 	oldest := descending[len(descending)-1]
 	start := streamtoken.Historical(oldest.TopologicalOrder, oldest.StreamOrdering-1)
 
-	ascending := make([]TimelineEvent, len(descending))
-	for i, ev := range descending {
-		ascending[len(descending)-1-i] = ev
+	ascending := make([]TimelineEvent, 0, len(descending))
+	for i := len(descending) - 1; i >= 0; i-- {
+		if accepted[i] {
+			ascending = append(ascending, descending[i])
+		}
 	}
 	return ascending, start, nil
 }

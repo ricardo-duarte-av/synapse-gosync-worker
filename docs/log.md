@@ -930,3 +930,33 @@ changes which members a later room thinks it has already sent. That is a reason
 to match Synapse's number exactly rather than pick a bigger one -- and the race
 detector is clean, because the cache and the LRUs were mutex-guarded from the
 start.
+
+## The main account, and what it found (2026-09-02)
+
+654 joined rooms, 308 left, 4 invites. The comparison had to block presence to
+be readable at all -- an initial sync reads presence with no stream bound, and
+on an account with thousands of co-occupants it churns faster than two requests
+can be made -- but with `{"presence":{"not_types":["*"]}}` the noise cleared and
+left a real defect.
+
+**Rejected events must consume the limit.** Synapse pages the events table with
+no rejection predicate and drops rejected events afterwards, so a rejected event
+takes a slot in the LIMIT and is not returned. This morning's fix filtered them
+in SQL instead, which is not the same thing: the page then reaches further back.
+One bridged matrix.org room, whose recent history is entirely `auth_error`
+events, returned a message 63,000 stream positions old that Synapse never sends,
+with `prev_batch` and the state block dragged along with it. Now the rows are
+paged as Synapse pages them and dropped in Go afterwards, and that room returns
+the empty timeline Synapse returns.
+
+That is two corrections to the same rule in one day. "Do not serve rejected
+events" was right; "filter them in the query" was not.
+
+**What remains** is small: 5 rooms of 654 where Synapse's lazy state block
+carries one extra member event, deterministically, that nothing in
+_compute_state_delta_for_full_sync accounts for. Recorded in synapse-notes.md as
+an open question with the evidence, including the three-run check that shows
+Synapse is self-consistent about it.
+
+Everything else that showed up was live data: presence, receipts, typing, and
+unread counts drifting between the two requests on an account this busy.

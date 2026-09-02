@@ -559,14 +559,23 @@ func (s *Store) PaginateBackwards(ctx context.Context, roomID, roomVersion strin
 		sql  string
 		args []any
 	)
+	// rejection_reason is SELECTED and not filtered in SQL, which is the whole
+	// subtlety. Synapse pages the events table without a rejection predicate
+	// and drops rejected events afterwards, in get_events_as_list -- so a
+	// rejected event CONSUMES a slot in the limit and is then not returned.
+	//
+	// Filtering it in the WHERE clause instead looks equivalent and is not: the
+	// page then reaches further back, and a room whose recent history is all
+	// auth_error events returns old messages that Synapse never sends. One
+	// matrix.org room here did exactly that, and its state block moved with it.
 	const cols = `e.event_id, e.type, e.sender, e.stream_ordering,
 	       e.topological_ordering, COALESCE(e.instance_name, ''),
 	       COALESCE(e.state_key, ''), e.state_key IS NOT NULL,
-	       ej.json, ej.internal_metadata`
+	       ej.json, ej.internal_metadata, e.rejection_reason IS NULL`
 	if from.IsHistorical() {
 		sql = `SELECT ` + cols + `
 		  FROM events e JOIN event_json ej USING (event_id)
-		 WHERE e.outlier = FALSE AND e.rejection_reason IS NULL AND e.room_id = $1
+		 WHERE e.outlier = FALSE AND e.room_id = $1
 		   AND (e.topological_ordering < $2
 		        OR (e.topological_ordering = $2 AND e.stream_ordering <= $3))
 		 ORDER BY e.topological_ordering DESC, e.stream_ordering DESC
@@ -575,7 +584,7 @@ func (s *Store) PaginateBackwards(ctx context.Context, roomID, roomVersion strin
 	} else {
 		sql = `SELECT ` + cols + `
 		  FROM events e JOIN event_json ej USING (event_id)
-		 WHERE e.outlier = FALSE AND e.rejection_reason IS NULL AND e.room_id = $1
+		 WHERE e.outlier = FALSE AND e.room_id = $1
 		   AND e.stream_ordering <= $2
 		 ORDER BY e.topological_ordering DESC, e.stream_ordering DESC
 		 LIMIT $3`
@@ -588,17 +597,24 @@ func (s *Store) PaginateBackwards(ctx context.Context, roomID, roomVersion strin
 	}
 	defer rows.Close()
 
-	var descending []TimelineEvent
+	var (
+		descending []TimelineEvent
+		accepted   []bool
+	)
 	for rows.Next() {
-		var ev TimelineEvent
+		var (
+			ev TimelineEvent
+			ok bool
+		)
 		if err := rows.Scan(&ev.EventID, &ev.Type, &ev.Sender, &ev.StreamOrdering,
 			&ev.TopologicalOrder, &ev.InstanceName, &ev.StateKey, &ev.IsState,
-			&ev.JSON, &ev.InternalMetadata); err != nil {
+			&ev.JSON, &ev.InternalMetadata, &ok); err != nil {
 			return nil, from, false, fmt.Errorf("store: paginate backwards: %w", err)
 		}
 		ev.RoomID = roomID
 		ev.RoomVersion = roomVersion
 		descending = append(descending, ev)
+		accepted = append(accepted, ok)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, from, false, fmt.Errorf("store: paginate backwards: %w", err)
@@ -608,20 +624,24 @@ func (s *Store) PaginateBackwards(ctx context.Context, roomID, roomVersion strin
 	if len(descending) > limit {
 		limited = true
 		descending = descending[:limit]
+		accepted = accepted[:limit]
 	}
 	if len(descending) == 0 {
 		return nil, from, limited, nil
 	}
 
 	// A token names a position between events, so the page starts one before
-	// its oldest event. Historical form, because that is what the topological
-	// walk produced.
+	// its oldest event -- the oldest row PAGED, rejected or not, because that
+	// is how far the page reached. Historical form, because that is what the
+	// topological walk produced.
 	oldest := descending[len(descending)-1]
 	next := streamtoken.Historical(oldest.TopologicalOrder, oldest.StreamOrdering-1)
 
-	ascending := make([]TimelineEvent, len(descending))
-	for i, ev := range descending {
-		ascending[len(descending)-1-i] = ev
+	ascending := make([]TimelineEvent, 0, len(descending))
+	for i := len(descending) - 1; i >= 0; i-- {
+		if accepted[i] {
+			ascending = append(ascending, descending[i])
+		}
 	}
 	return ascending, next, limited, nil
 }
@@ -662,9 +682,9 @@ func (s *Store) PaginateBackwardsStream(ctx context.Context, roomID, roomVersion
 		SELECT e.event_id, e.type, e.sender, e.stream_ordering,
 		       e.topological_ordering, COALESCE(e.instance_name, ''),
 		       COALESCE(e.state_key, ''), e.state_key IS NOT NULL,
-		       ej.json, ej.internal_metadata
+		       ej.json, ej.internal_metadata, e.rejection_reason IS NULL
 		  FROM events e JOIN event_json ej USING (event_id)
-		 WHERE e.outlier = FALSE AND e.rejection_reason IS NULL AND e.room_id = $1
+		 WHERE e.outlier = FALSE AND e.room_id = $1
 		   AND e.stream_ordering <= $2 AND e.stream_ordering > $3
 		 ORDER BY e.stream_ordering DESC
 		 LIMIT $4`
@@ -675,17 +695,24 @@ func (s *Store) PaginateBackwardsStream(ctx context.Context, roomID, roomVersion
 	}
 	defer rows.Close()
 
-	var descending []TimelineEvent
+	var (
+		descending []TimelineEvent
+		accepted   []bool
+	)
 	for rows.Next() {
-		var ev TimelineEvent
+		var (
+			ev TimelineEvent
+			ok bool
+		)
 		if err := rows.Scan(&ev.EventID, &ev.Type, &ev.Sender, &ev.StreamOrdering,
 			&ev.TopologicalOrder, &ev.InstanceName, &ev.StateKey, &ev.IsState,
-			&ev.JSON, &ev.InternalMetadata); err != nil {
+			&ev.JSON, &ev.InternalMetadata, &ok); err != nil {
 			return nil, from, false, fmt.Errorf("store: paginate backwards by stream: %w", err)
 		}
 		ev.RoomID = roomID
 		ev.RoomVersion = roomVersion
 		descending = append(descending, ev)
+		accepted = append(accepted, ok)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, from, false, fmt.Errorf("store: paginate backwards by stream: %w", err)
@@ -695,6 +722,7 @@ func (s *Store) PaginateBackwardsStream(ctx context.Context, roomID, roomVersion
 	if len(descending) > limit {
 		limited = true
 		descending = descending[:limit]
+		accepted = accepted[:limit]
 	}
 	if len(descending) == 0 {
 		// No rows means the bound was reached, and the bound is what the
@@ -708,9 +736,11 @@ func (s *Store) PaginateBackwardsStream(ctx context.Context, roomID, roomVersion
 	oldest := descending[len(descending)-1]
 	next := streamtoken.Live(oldest.StreamOrdering - 1)
 
-	ascending := make([]TimelineEvent, len(descending))
-	for i, ev := range descending {
-		ascending[len(descending)-1-i] = ev
+	ascending := make([]TimelineEvent, 0, len(descending))
+	for i := len(descending) - 1; i >= 0; i-- {
+		if accepted[i] {
+			ascending = append(ascending, descending[i])
+		}
 	}
 	return ascending, next, limited, nil
 }
