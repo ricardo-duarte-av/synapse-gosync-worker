@@ -868,3 +868,29 @@ and then that room alone.
 **The timeout is a DEFAULT, not a cap** — 30 seconds when the client says
 nothing, which is the opposite of /sync, where a missing timeout means "answer
 now". A non-zero timeout is floored at 500ms and jittered by ±10%.
+
+## CORS, and why a web client could not use this worker (2026-09-02)
+
+**The CORS headers on `/_matrix` come from Synapse, not from the reverse proxy.**
+Verified against the live server rather than assumed: nginx adds
+`Access-Control-Allow-Origin` on some static locations, but for `/_matrix`
+every header a browser sees is set by `synapse/http/server.py set_cors_headers`.
+A worker serving those paths that omits them is one a web client cannot use at
+all -- the browser makes the request, receives the answer, and then refuses to
+hand it to the page.
+
+```
+access-control-allow-origin: *
+access-control-allow-methods: GET, HEAD, POST, PUT, DELETE, OPTIONS
+access-control-allow-headers: X-Requested-With, Content-Type, Authorization, Date
+access-control-expose-headers: Synapse-Trace-Id, Server
+```
+
+**OPTIONS is answered for every path, before routing.** `OptionsResource`
+overrides `getChildWithDefault` to select itself whenever the method is
+OPTIONS, so a preflight for a path Synapse does not implement still gets **204
+with no body**, not 404. That is not a nicety: a browser that gets 404 for the
+preflight will not send the real request, even to an endpoint that would have
+worked.
+
+`Synapse-Trace-Id` is exposed whether or not anything emits it.

@@ -744,3 +744,28 @@ neither reproducible: one sticky section and one device_lists.changed. The
 second was checked against a build from before this work and behaves the same
 there, so it is live data rather than a regression -- that account is in
 federated rooms busy enough that membership moves between two requests.
+
+## CORS: the thing that made a browser client impossible (2026-09-02)
+
+Found by pointing Element Web at the worker for the first time. The log filled
+with `endpoint=unknown method=OPTIONS status=404`: the router registered only
+`GET` for each endpoint, so every preflight fell through to the catch-all, and
+a browser that gets 404 for a preflight never sends the real request.
+
+Two halves, and doing only the first would have looked fixed while staying
+broken. OPTIONS is now answered for ANY path with 204 and no body -- Synapse's
+OptionsResource selects itself before routing, so even an unimplemented path
+gets a preflight answer -- and the CORS headers are set on EVERY response,
+including errors. A preflight that passes is useless if the response to the
+real request has no `Access-Control-Allow-Origin`, because the browser discards
+it.
+
+The header values were taken from the live server, not from the source, and
+match byte for byte -- including `Access-Control-Expose-Headers:
+Synapse-Trace-Id, Server`, a header we never emit. Exposing it costs nothing
+and diverging would be observable.
+
+Worth recording why this went unnoticed for eight milestones: every test until
+now has been curl or syncdiff, and neither sends a preflight or enforces CORS.
+The comparator compares bodies. Nothing in it looks at a header, so nothing in
+it could have caught this.

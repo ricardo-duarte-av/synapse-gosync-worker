@@ -217,7 +217,10 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 		Events:          handlers.Events(deps),
 		Sync:            handlers.Sync(deps),
 	})
-	handler := server.WithRequestLog(log, mux)
+	// CORS inside the request log, so a preflight is still logged -- it is the
+	// first thing a browser client sends, and an unlogged 204 is invisible
+	// when working out whether a client reached us at all.
+	handler := server.WithRequestLog(log, server.WithCORS(mux))
 
 	listener, err := server.Listen(spec)
 	if err != nil {
