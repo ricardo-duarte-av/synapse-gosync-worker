@@ -33,3 +33,7 @@ go.work.sum
 
 # Deployment specifics and test credentials. Points at things that are secret.
 .claude/
+
+# A stray build of cmd/syncdiff was committed by accident in M3.
+/syncdiff
+/gosync-worker
