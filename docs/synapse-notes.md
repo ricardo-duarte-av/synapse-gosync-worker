@@ -937,3 +937,23 @@ decided was not allowed to happen.
 They are common enough to matter. One federated room here holds 13 rejected and
 12 soft-failed events out of 727, and two rejected `m.room.member` events inside
 a single 100-event window were enough to shift the whole timeline by two.
+
+## Typing is bounded by the token, like everything else (2026-09-02)
+
+`ephemeral_by_room` passes `since_token.typing_key` to the typing source, which
+returns events only for rooms whose serial is above it, and then rewrites the
+now token's typing field to what it returned. A room carries `m.typing` when
+its typists have CHANGED since the client last looked -- not when somebody
+happens to be typing.
+
+That distinction is the difference between a working long poll and a hot loop.
+A sync returns as soon as it has anything to say; if "anything to say" includes
+the current typist list, then a room with somebody typing makes every sync
+return immediately, the client stores next_batch and asks again, and the pair
+spin for as long as the typing lasts. Measured at 35 requests a second against
+an otherwise idle account.
+
+It is invisible to a pinned comparator: one request in isolation carries the
+same typing event either way, and `m.typing` differences are a tolerated known
+gap precisely because typing lives only in memory. Only a client that syncs in
+a loop can see it.

@@ -28,6 +28,17 @@ Prometheus needs to reach the container by name on the compose network:
       - targets: ["av-gosync-worker-1:9201"]
 ```
 
+## If every panel is empty
+
+The data is almost certainly fine -- check Prometheus first
+(`gosync_build_info` should return one series), and if it does, the problem is
+the dashboard's variables, not the worker.
+
+Pick the **Datasource** at the top of the dashboard. On import Grafana asks
+which Prometheus to use, and if that is skipped every expression resolves
+against nothing. The `Job` and `Endpoint` variables both default to `All` and
+fall back to `.*`, so they work even before they have populated.
+
 ## Reading it
 
 **Long polls parked** is the panel that tells you whether anything is actually

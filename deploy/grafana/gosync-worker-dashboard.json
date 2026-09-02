@@ -24,7 +24,11 @@
         "label": "Datasource",
         "type": "datasource",
         "query": "prometheus",
-        "current": {},
+        "current": {
+          "selected": false,
+          "text": "Prometheus",
+          "value": "Prometheus"
+        },
         "hide": 0,
         "refresh": 1
       },
@@ -37,16 +41,23 @@
           "uid": "${datasource}"
         },
         "definition": "label_values(gosync_build_info, job)",
-        "query": {
-          "query": "label_values(gosync_build_info, job)",
-          "refId": "job"
-        },
+        "query": "label_values(gosync_build_info, job)",
         "refresh": 1,
         "includeAll": true,
         "multi": true,
-        "current": {},
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
         "sort": 1,
-        "description": "Populated from the data, so any scrape job name works."
+        "description": "Populated from the data, so any scrape job name works.",
+        "allValue": ".*",
+        "options": []
       },
       {
         "name": "endpoint",
@@ -57,16 +68,23 @@
           "uid": "${datasource}"
         },
         "definition": "label_values(gosync_requests_total, endpoint)",
-        "query": {
-          "query": "label_values(gosync_requests_total, endpoint)",
-          "refId": "endpoint"
-        },
+        "query": "label_values(gosync_requests_total, endpoint)",
         "refresh": 2,
         "includeAll": true,
         "multi": true,
-        "current": {},
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
         "sort": 1,
-        "description": "sync, events, initial_sync, room_initial_sync -- plus `unknown` for anything that reached the router without being annotated."
+        "description": "sync, events, initial_sync, room_initial_sync -- plus `unknown` for anything that reached the router without being annotated.",
+        "allValue": ".*",
+        "options": []
       },
       {
         "name": "bucket",

@@ -121,6 +121,22 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 		}
 	}
 
+	// Typing is bounded by the client's token, exactly as every other stream
+	// is -- `ephemeral_by_room` asks the typing source for rooms whose serial
+	// is above since_token.typing_key and no others.
+	//
+	// Reporting the CURRENT typists on every sync instead looks harmless and
+	// is not: a room with somebody typing then makes every incremental sync
+	// return immediately with the same event, the client stores next_batch and
+	// asks again, and the pair spin at whatever rate the network allows for as
+	// long as the typing lasts. gomuks did 35 requests a second for minutes.
+	typingRooms := map[string]bool{}
+	if d.Replication != nil {
+		for _, id := range d.Replication.TypingChangedSince(since.Typing) {
+			typingRooms[id] = true
+		}
+	}
+
 	// Before any room entry is built: this moves the now token, and every
 	// prev_batch in the response carries it.
 	sticky, err := stickyByRoom(ctx, d, joinedIDs, since.StickyEvents, &now, timeNow)
@@ -190,7 +206,8 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 		entry, err := incrementalRoomEntry(ctx, d, room, verdict.UserID, since, now,
 			timeNow, cfg, timelines[room.RoomID],
 			accountDataByRoom[room.RoomID], receiptsByRoom[room.RoomID],
-			useStateAfter, f, verdict.DeviceID, sticky[room.RoomID])
+			useStateAfter, f, verdict.DeviceID, sticky[room.RoomID],
+			typingRooms[room.RoomID])
 		if err != nil {
 			return nil, http.StatusInternalServerError, internalError(d, "room entry", err)
 		}
@@ -478,7 +495,8 @@ func incrementalRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, u
 	since, now streamtoken.Token, timeNow int64, cfg clientevent.Config,
 	raw []store.TimelineEvent, accountData []store.AccountDataEntry,
 	receipts []store.ReceiptRow, useStateAfter bool,
-	f *filter.Collection, deviceID string, stickyIDs []string) (map[string]any, error) {
+	f *filter.Collection, deviceID string, stickyIDs []string,
+	typingChanged bool) (map[string]any, error) {
 
 	// Where the loaded chunk begins, which is Synapse's per-room `upto_token`
 	// and the prev_batch of an untrimmed timeline. For a room whose events all
@@ -514,10 +532,14 @@ func incrementalRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, u
 			}
 		}
 
-		if ev, err := typingEvent(d, room.RoomID); err != nil {
-			return nil, err
-		} else if ev != nil {
-			ephemeral = append(ephemeral, ev)
+		// Only when this room's typists have actually changed since the
+		// client last looked. See the note where typingRooms is built.
+		if typingChanged {
+			if ev, err := typingEvent(d, room.RoomID); err != nil {
+				return nil, err
+			} else if ev != nil {
+				ephemeral = append(ephemeral, ev)
+			}
 		}
 		ephemeral = stripRoomIDs(filterEphemeral(f, room.RoomID, ephemeral))
 	}

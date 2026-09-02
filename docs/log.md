@@ -824,3 +824,31 @@ interesting in other ways.
 Ten minutes of a real client beat a day of a comparator. Both are now covered:
 the filter case by unit tests carrying gomuks's document verbatim, and the
 rejected-event case by the `filter=3` comparison, which reproduces it.
+
+## The typing firehose (2026-09-02)
+
+gomuks, against an idle account, at 35 requests a second: 655-byte responses,
+27ms apart, the same `since` over and over.
+
+An incremental sync reported the CURRENT typists of every room, with no token
+bound at all, while Synapse reports a room's typing only when its serial has
+moved past `since_token.typing_key`. So a single person typing anywhere made
+every sync return instantly with the same event, and the client -- correctly --
+asked again the moment it got an answer. The loop lasts as long as the typing
+does.
+
+Fixed by asking the replication subscriber which rooms' typists have changed
+since the client's token, which is exactly the machinery `/events` needed a few
+hours ago and already had.
+
+Worth noting what could and could not have caught this. The comparator sees one
+request at a time, and a single response carries the same typing event under
+both behaviours; `m.typing` differences are a tolerated known gap because typing
+exists only in memory. Nothing in a pinned comparison can see a loop -- it takes
+a client that syncs, stores the token, and syncs again.
+
+Also fixed: the Grafana dashboard's variables. The query variables used the
+object form of `query`, which older Grafana ignores, leaving `$job` empty and
+every panel with it. They now use the plain-string form, default to All, and
+carry `allValue: ".*"` so the expressions match even if the variable never
+populates.

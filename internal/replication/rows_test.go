@@ -165,3 +165,49 @@ func TestBatchTokenIsAccepted(t *testing.T) {
 		t.Errorf("a batch row moved the position to %d", got)
 	}
 }
+
+// TestTypingSerialsBoundWhatASyncReports is a regression test with a real cost
+// behind it.
+//
+// An incremental sync must report a room's typists only when they have changed
+// since the client last looked, which is what Synapse's ephemeral_by_room does
+// by asking the typing source for rooms above since_token.typing_key. Reporting
+// the CURRENT typists on every sync instead looks harmless and is not: a room
+// with somebody typing makes every sync return immediately with the same event,
+// the client stores next_batch and asks again, and the two spin as fast as the
+// network allows for as long as the typing lasts. gomuks managed 35 requests a
+// second against an otherwise idle account.
+func TestTypingSerialsBoundWhatASyncReports(t *testing.T) {
+	s := newTestSub()
+	s.setLive(true)
+
+	if rooms := s.TypingChangedSince(0); len(rooms) != 0 {
+		t.Fatalf("a subscriber that has seen nothing reported %v", rooms)
+	}
+
+	s.updateTyping(`["!r:e",["@a:e"]]`, 5)
+
+	if rooms := s.TypingChangedSince(4); len(rooms) != 1 || rooms[0] != "!r:e" {
+		t.Errorf("TypingChangedSince(4) = %v, want the room", rooms)
+	}
+	// The client has now been told. Telling it again is the loop.
+	if rooms := s.TypingChangedSince(5); len(rooms) != 0 {
+		t.Errorf("TypingChangedSince(5) = %v, want nothing", rooms)
+	}
+
+	// Someone stops typing: that is a change too, and must be reported once.
+	s.updateTyping(`["!r:e",[]]`, 9)
+	if rooms := s.TypingChangedSince(5); len(rooms) != 1 {
+		t.Errorf("TypingChangedSince(5) after a stop = %v, want the room", rooms)
+	}
+	if rooms := s.TypingChangedSince(9); len(rooms) != 0 {
+		t.Errorf("TypingChangedSince(9) = %v, want nothing", rooms)
+	}
+
+	// Nothing is reported at all while the subscription is unhealthy, because
+	// the typist list is not trustworthy then either.
+	s.setLive(false)
+	if rooms := s.TypingChangedSince(0); rooms != nil {
+		t.Errorf("TypingChangedSince while not live = %v, want nothing", rooms)
+	}
+}
