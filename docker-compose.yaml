@@ -1,0 +1,92 @@
+# Synapse gosync-worker.
+#
+# A standalone compose file for running the worker alongside an existing
+# Synapse deployment, which is how the M9 soak runs it. To fold it into an
+# existing stack instead, copy the av-gosync-worker-1 service block into that
+# file: it is written to match the conventions of the Synapse worker services
+# (unix sockets under /var/sockets, the npm-nw networks, restart:
+# unless-stopped).
+#
+# Before first start:
+#
+#   cp deploy/gosync-worker.example.yaml ./gosync-worker.yaml
+#   $EDITOR ./gosync-worker.yaml
+#   # Match the uid the other workers run as, so the listening socket this
+#   # creates in /var/sockets is owned consistently:
+#   chown 991:991 ./gosync-worker.yaml
+#
+# NOTHING SHOULD BE ROUTED HERE. The worker listens on
+# /var/sockets/gosync-worker.sock, deliberately outside /var/sockets/nginx/
+# where every socket is an upstream by convention. The soak drives it through
+# cmd/syncdiff and a test account, not through nginx.
+#
+# That is not a preference, it is a requirement of how the comparison works: a
+# soak needs `testing.allow_pin_now: true` so syncdiff can pin both sides to
+# one window, and a pinned request will answer questions about a window that
+# has not happened yet. A worker running with that enabled must not be
+# reachable by a real client.
+#
+# The image is built and published by .github/workflows/docker.yml.
+#
+# No `version:` key: compose v2 treats it as obsolete and warns about it. The
+# sibling workers' files still carry one only because they predate that.
+
+services:
+  av-gosync-worker-1:
+    image: ghcr.io/ricardo-duarte-av/synapse-gosync-worker:latest
+    container_name: av-gosync-worker-1
+    restart: unless-stopped
+
+    # The same uid as the Synapse workers. It matters twice: the socket this
+    # worker creates in the shared /var/sockets must be owned like the others,
+    # and PostgreSQL peer authentication over a unix socket is decided by the
+    # connecting uid.
+    user: "991:991"
+
+    command: ["-config", "/data/gosync-worker.yaml"]
+
+    # Two mounts, and only two. Everything this worker talks to is a unix
+    # socket in one directory: PostgreSQL (.s.PGSQL.5432), KeyDB (keydb), the
+    # client-API worker it validates tokens against and the reference sync
+    # worker it is compared with (both under nginx/), and its own listener.
+    volumes:
+      # Read-only: the worker never writes its own config, and a soak that can
+      # rewrite its configuration is a soak that cannot be reproduced.
+      - ./gosync-worker.yaml:/data/gosync-worker.yaml:ro
+      # NOT read-only: the listening socket is created here.
+      - /var/sockets:/var/sockets
+
+    networks:
+      - npm-nw6
+      - npm-nw
+
+    # The runtime image is distroless, so there is no curl to probe with as the
+    # Synapse services do. The binary probes its own listener instead, over
+    # whichever transport it was configured to serve.
+    healthcheck:
+      test: ["CMD", "/gosync-worker", "-healthcheck", "-config", "/data/gosync-worker.yaml"]
+      start_period: "5s"
+      interval: "10s"
+      timeout: "5s"
+      retries: 3
+
+    # Prometheus scrapes metrics.addr over the compose network by container
+    # name (av-gosync-worker-1:9201), matching how the Synapse workers are
+    # scraped. Uncomment only to reach it from the host.
+    #ports:
+    #  - "9201:9201"
+
+    # A soak runs for weeks and every request is logged, so the cap matters
+    # more here than on a worker serving nothing.
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+networks:
+  npm-nw6:
+    external: true
+  npm-nw:
+    external: true
+    enable_ipv6: false

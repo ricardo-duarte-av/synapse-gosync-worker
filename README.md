@@ -129,6 +129,18 @@ docker build -t gosync-worker .
 docker run --rm gosync-worker -version
 ```
 
+`docker-compose.yaml` runs it alongside an existing Synapse deployment, which
+is how the soak runs it. It mounts exactly two things: the config file, read
+only, and `/var/sockets`. Everything this worker talks to is a unix socket in
+that one directory — PostgreSQL, KeyDB, the client-API worker it validates
+tokens against, the reference sync worker it is compared with, and its own
+listener, which is why the mount is not read only.
+
+It runs as uid 991, matching the Synapse workers. That matters twice: the
+socket it creates in the shared directory must be owned like the others, and
+PostgreSQL peer authentication over a unix socket is decided by the connecting
+uid.
+
 ## Configuration
 
 See `deploy/gosync-worker.example.yaml`, which documents every field and why it
