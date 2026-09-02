@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -33,18 +34,28 @@ import (
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/store"
 )
 
-// version is stamped at build time with -ldflags "-X main.version=...".
-var version = "dev"
+// Build information, stamped by the Docker build via -ldflags, in the same
+// three variables gopro-worker and media-worker use so that one CI workflow
+// shape serves all three. The defaults apply to a plain "go build".
+//
+// They are passed in rather than derived because .dockerignore strips .git:
+// the build cannot see the repository it came from.
+var (
+	tag       = "dev"
+	commit    = "unknown"
+	buildTime = "unknown"
+)
 
 func main() {
 	configPath := flag.String("config", "gosync-worker.yaml", "path to the configuration file")
 	check := flag.Bool("check", false, "validate the config and database access, then exit")
-	showVersion := flag.Bool("version", false, "print the version and exit")
+	showVersion := flag.Bool("version", false, "print build information and exit")
 	healthcheck := flag.Bool("healthcheck", false, "probe this worker's own /health over its configured transport, then exit")
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Println(version)
+		fmt.Printf("gosync-worker %s (commit %s, built %s, %s)\n",
+			tag, commit, buildTime, runtime.Version())
 		return
 	}
 
@@ -65,7 +76,7 @@ func main() {
 	}
 
 	log := newLogger(cfg.Log)
-	metrics.BuildInfo.WithLabelValues(version).Set(1)
+	metrics.BuildInfo.WithLabelValues(tag).Set(1)
 
 	if err := run(cfg, log, *check); err != nil {
 		log.Error().Err(err).Msg("fatal")
@@ -225,7 +236,7 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 	go func() {
 		log.Info().
 			Str("listen", server.Describe(spec)).
-			Str("version", version).
+			Str("version", tag).
 			Msg("serving")
 		if err := httpServer.Serve(listener); err != nil && err != http.ErrServerClosed {
 			errs <- err

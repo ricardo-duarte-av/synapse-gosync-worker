@@ -91,6 +91,13 @@ go build ./... && go test -race ./...
 go run ./cmd/gosync-worker -config gosync-worker.yaml -check
 ```
 
+CI (`.github/workflows/docker.yml`) runs `go vet`, `go test -race` and a
+`gofmt` check, then builds and publishes the container image. It gates the
+image on the tests, so anything that fails locally fails the push. Build info
+reaches the binary through `-ldflags` on `main.tag`, `main.commit` and
+`main.buildTime`; keep those three names if the Dockerfile is touched, because
+all three workers in this family share the workflow's shape.
+
 Live tests gate on env vars and `t.Skip()` otherwise — they never fail CI and
 run only against the real deployment. See `.claude/deployment-notes.md`.
 

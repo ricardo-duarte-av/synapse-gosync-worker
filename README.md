@@ -105,6 +105,30 @@ GOSYNC_TEST_TODEVICE_DSN="host=/var/sockets user=gosync_inbox dbname=synapse-db"
   go test ./... -run Live -v
 ```
 
+### The container image
+
+`.github/workflows/docker.yml` builds and publishes
+`ghcr.io/ricardo-duarte-av/synapse-gosync-worker` on every push, matching
+gopro-worker and media-worker: the tests, `go vet` and a `gofmt` check gate the
+build, so an image is never published for a commit that does not pass them.
+`:latest` follows the default branch only; every branch, PR, tag and short SHA
+gets its own tag.
+
+The runtime image is `distroless/static`, which has no shell and no curl, so
+two things are done through the binary itself. CI smoke-tests the image by
+running `-version` and checking that a missing config exits non-zero rather than
+panicking, and a container healthcheck should call `-healthcheck`, which probes
+the worker's own listener over whichever transport it was configured to serve.
+
+Build information is passed in as build args rather than derived:
+`.dockerignore` strips `.git`, so the build cannot see the repository it came
+from.
+
+```sh
+docker build -t gosync-worker .
+docker run --rm gosync-worker -version
+```
+
 ## Configuration
 
 See `deploy/gosync-worker.example.yaml`, which documents every field and why it
