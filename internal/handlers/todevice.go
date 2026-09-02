@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/auth"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/metrics"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/store"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/streamtoken"
 )
@@ -68,6 +69,7 @@ func deleteAcknowledgedToDevice(ctx context.Context, d Deps, verdict auth.Verdic
 		return
 	}
 	if deleted > 0 {
+		metrics.ToDeviceDeleted.Add(float64(deleted))
 		d.Log.Debug().Str("user_id", verdict.UserID).Str("device_id", verdict.DeviceID).
 			Int("deleted", deleted).Int64("up_to", since.ToDevice).
 			Msg("deleted acknowledged to-device messages")

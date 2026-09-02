@@ -72,7 +72,11 @@ services:
 
     # Prometheus scrapes metrics.addr over the compose network by container
     # name (av-gosync-worker-1:9201), matching how the Synapse workers are
-    # scraped. Uncomment only to reach it from the host.
+    # scraped. It is a SECOND listener: the client API is a unix socket, which
+    # Prometheus cannot scrape. See deploy/grafana/README.md.
+    #
+    # /metrics is unauthenticated, so publishing the port to the host is for
+    # debugging only, and it must never be reachable through the proxy.
     #ports:
     #  - "9201:9201"
 

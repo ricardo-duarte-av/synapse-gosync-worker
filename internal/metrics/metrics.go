@@ -70,10 +70,24 @@ var (
 		Help: "1 while the replication subscription is healthy.",
 	})
 
-	// SyncWaiters reports how many long polls are currently blocked.
+	// SyncWaiters reports how many long polls are currently parked.
+	//
+	// On a worker serving real clients this is the workload: an idle /sync is
+	// a goroutine and a database-free wait, and the count of them is what
+	// says whether clients are connected at all.
 	SyncWaiters = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "gosync_sync_waiters",
-		Help: "Long-polling syncs currently waiting.",
+		Help: "Long-polling requests currently waiting.",
+	})
+
+	// ToDeviceDeleted counts to-device messages this worker has deleted.
+	//
+	// The only write it makes, so it is the only metric that can go wrong
+	// destructively. A rate far above the rate at which messages arrive for
+	// the device would mean something is acknowledging on a client's behalf.
+	ToDeviceDeleted = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "gosync_to_device_deleted_total",
+		Help: "Acknowledged to-device messages deleted.",
 	})
 
 	// BuildInfo carries the version as a label on a constant 1.

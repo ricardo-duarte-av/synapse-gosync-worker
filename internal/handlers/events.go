@@ -13,6 +13,7 @@ import (
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/auth"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/clientevent"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/matrixerr"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/metrics"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/server"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/store"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/streamtoken"
@@ -252,6 +253,9 @@ func waitForEvents(r *http.Request, d Deps, req eventStreamRequest, from streamt
 	ctx := r.Context()
 	deadline := time.Now().Add(timeout)
 	started := time.Now()
+
+	metrics.SyncWaiters.Inc()
+	defer metrics.SyncWaiters.Dec()
 	defer func() {
 		if ann != nil {
 			ann.Waited = time.Since(started)

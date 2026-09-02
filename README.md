@@ -152,6 +152,32 @@ socket it creates in the shared directory must be owned like the others, and
 PostgreSQL peer authentication over a unix socket is decided by the connecting
 uid.
 
+## Metrics
+
+The client API is served on a unix socket, which Prometheus cannot scrape, so
+the worker opens a second listener for metrics alone. `/metrics` is
+unauthenticated: keep it on an internal network and never route it through the
+reverse proxy.
+
+```yaml
+metrics:
+  addr: ":9201"
+```
+
+```yaml
+  # prometheus.yml
+  - job_name: gosync-worker
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["av-gosync-worker-1:9201"]
+```
+
+`deploy/grafana/gosync-worker-dashboard.json` is a dashboard for these, with no
+hard-coded datasource or job name. See `deploy/grafana/README.md` for what the
+panels mean — in particular why a `/sync` taking thirty seconds is a success,
+and why `gosync_replication_connected` is the gauge to alert on rather than
+`/health`.
+
 ## Configuration
 
 See `deploy/gosync-worker.example.yaml`, which documents every field and why it

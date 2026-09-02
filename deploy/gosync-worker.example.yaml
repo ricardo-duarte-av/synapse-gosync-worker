@@ -202,6 +202,17 @@ testing:
   # production.
   allow_pin_now: false
 
+# A SECOND listener, for metrics alone.
+#
+# The client API above is a unix socket and Prometheus cannot scrape one, so
+# without this there is nothing to scrape and every dashboard panel is empty --
+# which is worse than no dashboard, because it looks like an idle worker.
+#
+# /metrics is unauthenticated. Keep this port on an internal network and never
+# route it through the reverse proxy: only /_matrix paths should be public. The
+# same listener also answers /health.
+#
+# Leave it empty to serve no metrics at all.
 metrics:
   addr: ":9201"
 

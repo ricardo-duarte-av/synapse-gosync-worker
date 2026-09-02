@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
 
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/auth"
@@ -244,6 +245,37 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 		}
 	}()
 
+	// A SECOND listener, for metrics only.
+	//
+	// The client API is served on a unix socket, and Prometheus cannot scrape
+	// one. Without this, `metrics.addr` would be configuration that does
+	// nothing and every dashboard panel would be empty -- which is worse than
+	// having no dashboard, because it looks like the worker is idle.
+	//
+	// /metrics is unauthenticated, so this belongs on an internal network and
+	// must never be reachable through the reverse proxy. Only /_matrix paths
+	// should be public.
+	var metricsServer *http.Server
+	if cfg.Metrics.Addr != "" {
+		metricsMux := http.NewServeMux()
+		metricsMux.Handle("GET /metrics", promhttp.Handler())
+		metricsMux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		})
+		metricsServer = &http.Server{
+			Addr:              cfg.Metrics.Addr,
+			Handler:           metricsMux,
+			ReadHeaderTimeout: 15 * time.Second,
+		}
+		go func() {
+			log.Info().Str("addr", cfg.Metrics.Addr).Msg("serving metrics")
+			if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				errs <- err
+			}
+		}()
+	}
+
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 
@@ -256,6 +288,9 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
+	if metricsServer != nil {
+		_ = metricsServer.Shutdown(shutdownCtx)
+	}
 	return httpServer.Shutdown(shutdownCtx)
 }
 

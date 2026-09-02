@@ -14,6 +14,7 @@ import (
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/clientevent"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/filter"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/matrixerr"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/metrics"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/pushrules"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/server"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/store"
@@ -723,6 +724,11 @@ func longPoll(r *http.Request, d Deps, verdict auth.Verdict, since string,
 	ctx := r.Context()
 	deadline := time.Now().Add(timeout)
 	started := time.Now()
+
+	// Counted for as long as the client is parked here, which on a worker
+	// serving real clients is almost all of the time.
+	metrics.SyncWaiters.Inc()
+	defer metrics.SyncWaiters.Dec()
 
 	// The rooms this caller is in, so a wakeup elsewhere on the server does not
 	// wake them. Recomputed on each pass, because joining a room mid-poll

@@ -1,0 +1,73 @@
+# Grafana dashboard
+
+`gosync-worker-dashboard.json` — import it, or drop it into a provisioned
+dashboards directory. It has no hard-coded datasource or job name: both are
+template variables populated from the data, so it works wherever it lands.
+
+## Wiring it up
+
+The client API is served on a **unix socket, which Prometheus cannot scrape**,
+so the worker opens a second listener for metrics alone:
+
+```yaml
+metrics:
+  addr: ":9201"
+```
+
+`/metrics` is unauthenticated. Keep that port on an internal network and never
+route it through the reverse proxy — only `/_matrix/...` paths should be
+publicly reachable. The same listener also answers `/health`, which is the
+easier way to probe a worker whose real socket is a unix socket.
+
+Prometheus needs to reach the container by name on the compose network:
+
+```yaml
+  - job_name: gosync-worker
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["av-gosync-worker-1:9201"]
+```
+
+## Reading it
+
+**Long polls parked** is the panel that tells you whether anything is actually
+using the worker. A `/sync` client spends nearly all of its life waiting, so on
+a healthy deployment this sits at roughly the number of connected clients and
+returns to that level after every wakeup. Zero, with a client open, means the
+client is not reaching us — check the reverse proxy before anything else.
+
+**Duration percentiles** will look alarming and should not. A `/sync` that waits
+the client's full timeout and returns nothing is a SUCCESS, and it lands at 30
+seconds. The high percentiles are the normal shape of a long-polling endpoint;
+what matters is the low end, where an initial sync or a sync carrying news
+should be well under a second. The duration heatmap makes this clearer: expect
+two clusters, one fast and one at the client's timeout, and worry about the
+middle filling in.
+
+**Replication** is the gauge to alert on. While it is 0 the worker cannot report
+typing at all and its stream positions are only as fresh as the last database
+seed — and `/health` will still say `ok`, because it does not check this.
+
+**Outcomes** separates `served`, `refused` and `client_gone`. A client hanging
+up mid-long-poll is ordinary — Element does it on every navigation — and is
+deliberately not counted as an error. A rising `refused` is worth reading with
+the auth panels: `whoami unavailable` means Synapse could not be asked, and the
+worker answers 502 rather than 401 on purpose, because refusing a valid token
+would log real clients out.
+
+**To-device** is the only write this worker makes. With an encrypted client
+connected and `to_device.enabled: true`, deletions should track how fast
+messages arrive for that device. Zero means the section is disabled — and that
+client will never receive its room keys.
+
+## What this dashboard cannot tell you
+
+Two blind spots, both known and neither instrumented yet:
+
+- **Replication lag.** `gosync_replication_connected` says the subscription is
+  alive, not that it is keeping up. A worker that is connected but minutes
+  behind serves stale answers and looks perfectly healthy here.
+- **Parity.** Nothing on this dashboard says whether the answers are *right*.
+  That is `cmd/syncdiff`'s job, and it currently prints to a terminal rather
+  than exporting anything. Agreement with Synapse is measured by running the
+  comparator, not by watching graphs.
