@@ -277,3 +277,68 @@ longer expected to differ, and `m.typing` is now recognised in BOTH directions.
 It is the one field neither side reads from the database, so whoever is asked
 while someone is mid-keystroke reports it and the other does not — which had
 been reported as an unexplained extra entry.
+
+## /events — done
+
+The last endpoint in this worker's scope, and the one with the weakest case for
+existing: **zero requests in 21 hours**, against 558,398 for `/sync`. It was
+scoped into M5 and quietly not built. It is built now because "M1 to M8 are
+done" was not true while a target endpoint was missing, and because it is the
+only thing here that exercises the notifier without the whole sync machinery in
+front of it.
+
+It is a much smaller endpoint than /sync: one flat chunk of events and EDUs
+between two tokens, assembled from five sources in a fixed order (room,
+presence, typing, receipts, account data) and then the presence of anyone who
+just joined. Most of the parts already existed. What was new:
+
+- **`RoomEventsForward`**, because /events cuts the OTHER END of the window. A
+  sync returns the newest events and calls the timeline limited; /events streams
+  forward from where the client stopped, so a capped page is the OLDEST events
+  and the next request resumes after them.
+- **`MembershipEventsForUser`**, which is not redundant with it: an invite or a
+  leave lands in a room the caller is not joined to, so a query over the joined
+  set cannot see it. Without it /events can never tell a client it has been
+  invited anywhere.
+- **`UpdatedTags`**, since the tag stream records only THAT a room's tags
+  changed. The answer is always the room's whole current tag set, including an
+  empty one — which is how a client learns the last tag was removed.
+- **Per-room typing serials in the replication subscriber.** Typing is the one
+  source with no table to ask "what changed since?", so the only record of when
+  a room's typists last moved is the one now kept as the rows arrive. Rooms
+  quiet since startup have no entry, which is the same limitation typing has
+  everywhere here.
+
+### The pin hides this endpoint's answer, twice
+
+/events' `end` token is derived from what was returned: its room field is the
+position of the LAST EVENT SENT, not the current one. Pin us to Synapse's `end`
+and both the limit and the token are handed to us. Two deliberate defects — one
+cutting the newest events instead of the oldest, one jumping the end token to
+the current position — **both passed** a comparison pinned that way.
+
+The comparator now pins to Synapse's `end` with its ROOM KEY REPLACED by the
+live one from the probe. Every other field of `end` is that source's live
+position, so pinning to it reproduces Synapse's window exactly; only the room
+field is derived, and leaving it live puts the limit and the end token back in
+our hands. Both defects are named after that change. The cost is a race in the
+milliseconds between probe and request, which shows only when the window holds
+fewer events than the limit — so compare with a rewind large enough that the
+limit is what does the cutting.
+
+This is the third instance of the same shape, after the to-device wind-back and
+`prev_batch`: **anything derived from a token we supplied cannot be tested by
+supplying it.**
+
+### Verified
+
+Both accounts, 24 combinations of rewind (30k / 200k / 500k / 1M) and limit
+(3 / 10 / 50), plus an explicit `room_id`, `raw=1`, and no `from` at all. The
+long poll was driven end to end: a request with a 20s timeout returned the
+instant a message was sent, carrying exactly that event.
+
+One defect found by the first comparison and worth recording: presence for
+people who just joined is emitted **once per join event, not once per user**.
+Synapse loops over the events and extends the chunk each time, so three joins by
+the same person produce that person's presence three times. Our first version
+only handled the caller's own join and produced none of them.

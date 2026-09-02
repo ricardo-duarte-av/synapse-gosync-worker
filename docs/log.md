@@ -689,3 +689,58 @@ is the one field neither side reads from the database, so whoever is asked while
 someone is mid-keystroke reports it and the other does not — which had been
 showing up as an unexplained extra entry, and cost a few minutes of staring
 before the asymmetry in the tolerance became obvious.
+
+## /events (2026-09-02)
+
+The last endpoint in scope, and the one with the weakest case for existing:
+zero requests in 21 hours against 558,398 for /sync. It was scoped into M5 and
+quietly not built, and "the milestones are done" was not true while it was
+missing.
+
+Most of the machinery already existed. Three queries were new — forward
+pagination (the limit cuts the OLDEST events here, not the newest), the caller's
+own membership events (which land in rooms the joined-set query cannot see, and
+are what carry an invite), and updated tags (the stream records only that a
+room's tags changed, so the answer is the whole current set, including an empty
+one). Typing needed per-room serials in the replication subscriber, because it
+is the one source with no table to ask "what changed since?".
+
+### The pin handed us the answer, twice
+
+/events' `end` token is derived from what was returned: its room field is the
+position of the last event sent, not the current one. Two deliberate defects --
+cutting the newest events instead of the oldest, and jumping the end token to
+the current position -- **both passed** a comparison pinned to Synapse's `end`.
+
+The comparator now pins to Synapse's `end` with the room key replaced by the
+live one from the probe. Every other field of `end` is a live position, so
+pinning to it reproduces Synapse's window; only the room field is derived, and
+leaving it live puts the limit and the end token back in our hands. Both defects
+are named after that change.
+
+That is the third instance of the same shape, after the to-device wind-back and
+prev_batch. It is worth stating as a rule: anything derived from a token we
+supplied cannot be tested by supplying it.
+
+### Two things the first comparison caught
+
+Presence for joins is emitted once per JOIN EVENT, not once per user -- three
+joins by the same person produce that person's presence three times -- and it
+covers other people's joins, not just the caller's. Our first version handled
+only the caller's own join and produced none of them.
+
+And an empty chunk is `[]`, not `null`. Go marshals a nil slice as null, and for
+this endpoint the empty chunk is the single most common response there is.
+
+### Verified
+
+Both accounts, 24 combinations of rewind and limit, plus an explicit room_id,
+raw=1, and no `from` at all. The long poll was driven end to end: a 20-second
+request returned the instant a message was sent, carrying exactly that event.
+The rest of the regression is unchanged and green.
+
+Two transient mismatches during the sweep, both on the second account and
+neither reproducible: one sticky section and one device_lists.changed. The
+second was checked against a build from before this work and behaves the same
+there, so it is live data rather than a regression -- that account is in
+federated rooms busy enough that membership moves between two requests.

@@ -44,7 +44,7 @@ func main() {
 		tokenFile  = flag.String("token-file", "", "file holding the test account's access token")
 		rooms      = flag.String("rooms", "", "comma-separated room IDs; default is every joined room")
 		limit      = flag.Int("limit", 10, "pagination limit to request")
-		endpoint   = flag.String("endpoint", "room_initial_sync", "room_initial_sync | initial_sync | sync | incremental_sync | to_device")
+		endpoint   = flag.String("endpoint", "room_initial_sync", "room_initial_sync | initial_sync | sync | incremental_sync | to_device | events")
 		stateAfter = flag.Bool("state-after", false, "request MSC4222 org.matrix.msc4222.state_after")
 		rewind     = flag.Int("rewind", 2000, "for incremental_sync: how far to rewind the room key to build a `since`")
 		verbose    = flag.Bool("v", false, "print each compared response")
@@ -77,6 +77,17 @@ func main() {
 		}
 		res := compareToDevice(ctx, ours, ref, token, *homeserver, *toDevice, *verbose)
 		printOne("/sync (to_device)", res)
+		report(boolToInt(res.kind == resultMatch), boolToInt(res.kind == resultMismatch),
+			boolToInt(res.kind == resultSkip))
+		if res.kind == resultMismatch {
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *endpoint == "events" {
+		res := compareEvents(ctx, ours, ref, token, *rewind, *limit, *verbose)
+		printOne("/events", res)
 		report(boolToInt(res.kind == resultMatch), boolToInt(res.kind == resultMismatch),
 			boolToInt(res.kind == resultSkip))
 		if res.kind == resultMismatch {
@@ -242,6 +253,131 @@ func compareInitialSync(ctx context.Context, ours, ref *http.Client, token strin
 		return result{resultMatch, ""}
 	}
 	return result{resultMismatch, strings.Join(diffs, "\n")}
+}
+
+// compareEvents compares /events, the pre-sync event stream.
+//
+// The `from` token is a rewound sync token, for the same reason the incremental
+// comparison rewinds one: /events with no `from` starts at the current position
+// and returns nothing, which would compare two empty chunks and prove nothing.
+//
+// One caveat this comparison cannot avoid. /events has no set_presence
+// parameter -- EventStreamHandler marks the caller online unconditionally,
+// unless they are a guest -- so asking Synapse for it MUTATES the test
+// account's presence. Every other comparison here sends set_presence=offline
+// to keep the harness invisible; this one cannot.
+func compareEvents(ctx context.Context, ours, ref *http.Client, token string,
+	rewind, limit int, verbose bool) result {
+
+	syncPath := "/_matrix/client/v3/sync"
+	probe := url.Values{"timeout": {"0"}, "set_presence": {"offline"}}
+	probeBody, status, err := get(ctx, ref, syncPath+"?"+probe.Encode(), token)
+	if err != nil || status != http.StatusOK {
+		return result{resultSkip, fmt.Sprintf("probe failed: %v (status %d)", err, status)}
+	}
+	var probeResp map[string]any
+	if err := json.Unmarshal(probeBody, &probeResp); err != nil {
+		return result{resultSkip, fmt.Sprintf("probe body is not JSON: %v", err)}
+	}
+	current, ok := probeResp["next_batch"].(string)
+	if !ok {
+		return result{resultSkip, "probe returned no next_batch"}
+	}
+	from, err := rewindRoomKey(current, rewind)
+	if err != nil {
+		return result{resultSkip, err.Error()}
+	}
+
+	path := "/_matrix/client/r0/events"
+	q := url.Values{"from": {from}, "timeout": {"0"}, "limit": {fmt.Sprint(limit)}}
+
+	refResp, res := syncOnce(ctx, ref, path+"?"+q.Encode(), token, "Synapse")
+	if res != nil {
+		return *res
+	}
+	end, ok := refResp["end"].(string)
+	if !ok {
+		return result{resultSkip, "reference response has no end token"}
+	}
+
+	// The pin is Synapse's `end` with its ROOM KEY REPLACED by the live one
+	// from the probe, and the substitution is the whole point.
+	//
+	// Every other stream's field in `end` is that source's live position, so
+	// pinning to it reproduces Synapse's window exactly. The room field is
+	// not: it is the position of the LAST EVENT RETURNED, which is derived
+	// from the limit. Pin us to that and we are handed the answer -- a worker
+	// that cuts the newest events instead of the oldest, or that jumps its end
+	// token to the current position, computes the identical response. Both
+	// defects were built and both passed a comparison pinned to `end`.
+	//
+	// Pinning the room key to the live position instead leaves the limit and
+	// the end token for us to work out. The cost is a race in the milliseconds
+	// between the probe and the request: an event persisted in that gap is in
+	// Synapse's window and not ours. It only shows when the window holds fewer
+	// events than the limit, so compare with a rewind large enough that the
+	// limit is what does the cutting.
+	pin, err := replaceRoomKey(end, current)
+	if err != nil {
+		return result{resultSkip, err.Error()}
+	}
+	q.Set("_gosync_now", pin)
+	if timeNow, ok := recoverTimeNowFromChunk(refResp); ok {
+		q.Set("_gosync_time_now", fmt.Sprint(timeNow))
+	}
+	ourResp, res := syncOnce(ctx, ours, path+"?"+q.Encode(), token, "we")
+	if res != nil {
+		return *res
+	}
+	if verbose {
+		fmt.Printf("--- /events from=%s ---\n", from)
+	}
+
+	var diffs []string
+	diff("", ourResp, refResp, &diffs)
+	if len(diffs) == 0 {
+		return result{resultMatch, ""}
+	}
+	return result{resultMismatch, strings.Join(diffs, "\n")}
+}
+
+// replaceRoomKey returns `tok` with its room key taken from `src`.
+func replaceRoomKey(tok, src string) (string, error) {
+	_, rest, ok := strings.Cut(tok, "_")
+	if !ok {
+		return "", fmt.Errorf("cannot re-key %q: not a stream token", tok)
+	}
+	room, _, ok := strings.Cut(src, "_")
+	if !ok {
+		return "", fmt.Errorf("cannot re-key from %q: not a stream token", src)
+	}
+	return room + "_" + rest, nil
+}
+
+// recoverTimeNowFromChunk reads the reference's clock off any event in the
+// chunk, from origin_server_ts + unsigned.age.
+func recoverTimeNowFromChunk(resp map[string]any) (int64, bool) {
+	chunk, ok := resp["chunk"].([]any)
+	if !ok {
+		return 0, false
+	}
+	for _, item := range chunk {
+		ev, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		ts, tsOK := ev["origin_server_ts"].(float64)
+		unsigned, unsignedOK := ev["unsigned"].(map[string]any)
+		if !tsOK || !unsignedOK {
+			continue
+		}
+		age, ageOK := unsigned["age"].(float64)
+		if !ageOK {
+			continue
+		}
+		return int64(ts) + int64(age), true
+	}
+	return 0, false
 }
 
 func recoverTimeNowFromRooms(resp map[string]any) (int64, bool) {

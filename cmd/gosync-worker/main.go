@@ -213,6 +213,7 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 	mux := server.NewMux(server.Routes{
 		RoomInitialSync: handlers.RoomInitialSync(deps),
 		InitialSync:     handlers.InitialSync(deps),
+		Events:          handlers.Events(deps),
 		Sync:            handlers.Sync(deps),
 	})
 	handler := server.WithRequestLog(log, mux)

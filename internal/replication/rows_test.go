@@ -86,15 +86,15 @@ func TestTypingRowReplacesRatherThanMerges(t *testing.T) {
 	s := newTestSub()
 	s.setLive(true)
 
-	s.updateTyping(`["!r:e",["@a:e","@b:e"]]`)
+	s.updateTyping(`["!r:e",["@a:e","@b:e"]]`, 1)
 	if got := s.TypingIn("!r:e"); len(got) != 2 {
 		t.Fatalf("typing = %v, want two users", got)
 	}
-	s.updateTyping(`["!r:e",["@a:e"]]`)
+	s.updateTyping(`["!r:e",["@a:e"]]`, 1)
 	if got := s.TypingIn("!r:e"); len(got) != 1 || got[0] != "@a:e" {
 		t.Errorf("typing = %v, want only @a:e", got)
 	}
-	s.updateTyping(`["!r:e",[]]`)
+	s.updateTyping(`["!r:e",[]]`, 1)
 	if got := s.TypingIn("!r:e"); got != nil {
 		t.Errorf("typing = %v, want nobody", got)
 	}
@@ -105,7 +105,7 @@ func TestTypingRowReplacesRatherThanMerges(t *testing.T) {
 func TestTypingIsClearedWhenNotLive(t *testing.T) {
 	s := newTestSub()
 	s.setLive(true)
-	s.updateTyping(`["!r:e",["@a:e"]]`)
+	s.updateTyping(`["!r:e",["@a:e"]]`, 1)
 	s.setLive(false)
 	if got := s.TypingIn("!r:e"); got != nil {
 		t.Errorf("typing survived a disconnect: %v", got)

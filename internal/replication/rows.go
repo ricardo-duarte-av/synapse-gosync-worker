@@ -2,6 +2,7 @@ package replication
 
 import (
 	"encoding/json"
+	"sort"
 
 	"github.com/tidwall/gjson"
 )
@@ -62,7 +63,44 @@ func rowSubjects(stream, row string) (roomIDs, userIDs []string) {
 // The row carries the WHOLE current set for that room, not a delta, so a user
 // who stopped typing simply is not in it. Merging instead of replacing would
 // leave people typing forever.
-func (s *Subscriber) updateTyping(row string) {
+// TypingChangedSince returns the rooms whose typists changed after a typing
+// stream position, oldest change first.
+//
+// Only rooms this process has SEEN change since it started: the serials are
+// built from the replication stream, and a room that has been quiet since
+// startup has no entry at all. That is the same limitation typing has
+// everywhere here -- there is nothing in the database to fall back on -- and it
+// resolves itself as soon as anyone types.
+func (s *Subscriber) TypingChangedSince(pos int64) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.live {
+		return nil
+	}
+	type change struct {
+		roomID string
+		serial int64
+	}
+	var changed []change
+	for roomID, serial := range s.typingSerial {
+		if serial > pos {
+			changed = append(changed, change{roomID, serial})
+		}
+	}
+	sort.Slice(changed, func(i, j int) bool {
+		if changed[i].serial != changed[j].serial {
+			return changed[i].serial < changed[j].serial
+		}
+		return changed[i].roomID < changed[j].roomID
+	})
+	out := make([]string, 0, len(changed))
+	for _, c := range changed {
+		out = append(out, c.roomID)
+	}
+	return out
+}
+
+func (s *Subscriber) updateTyping(row string, pos int64) {
 	var parsed []json.RawMessage
 	if err := json.Unmarshal([]byte(row), &parsed); err != nil || len(parsed) < 2 {
 		return
@@ -77,6 +115,18 @@ func (s *Subscriber) updateTyping(row string) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// A batched row carries the literal token "batch" rather than a position,
+	// so pos is 0 for all but the last of a batch. The stream position already
+	// held is the best available answer, and it never goes backwards.
+	serial := pos
+	if serial <= 0 {
+		serial = s.positions[StreamTyping]
+	}
+	if serial > s.typingSerial[roomID] {
+		s.typingSerial[roomID] = serial
+	}
+
 	if len(users) == 0 {
 		delete(s.typing, roomID)
 		return

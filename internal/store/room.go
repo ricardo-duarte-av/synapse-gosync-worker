@@ -44,6 +44,35 @@ func (s *Store) RoomInfo(ctx context.Context, roomID string) (RoomInfo, error) {
 	return info, nil
 }
 
+// HistoryVisibility reads a room's current m.room.history_visibility setting,
+// or "" when it has none.
+//
+// Read on its own rather than through the full state map, because the one
+// caller -- deciding whether a non-member may peek at a room over /events --
+// needs this single key and nothing else.
+//
+// The JSON is parsed in Go rather than cast to jsonb in SQL. Events on this
+// server contain escaped NUL characters that PostgreSQL cannot cast, and while
+// a history_visibility event is an unlikely place to find one, a query that
+// fails on some rooms and not others is a worse failure than a slightly longer
+// one that never does.
+func (s *Store) HistoryVisibility(ctx context.Context, roomID string) (string, error) {
+	const q = `
+		SELECT ej.json
+		  FROM current_state_events cse JOIN event_json ej USING (event_id)
+		 WHERE cse.room_id = $1 AND cse.type = 'm.room.history_visibility'
+		   AND cse.state_key = ''`
+	var body []byte
+	err := s.pool.QueryRow(ctx, q, roomID).Scan(&body)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("store: history visibility: %w", err)
+	}
+	return gjson.GetBytes(body, "content.history_visibility").String(), nil
+}
+
 // Membership is a user's current membership in a room.
 type Membership struct {
 	// Membership is join, leave, invite, knock or ban. Empty if the user has

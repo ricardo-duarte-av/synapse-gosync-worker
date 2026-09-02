@@ -22,7 +22,7 @@ real client's `/sync` request actually looks like.
 | `/_matrix/client/*/rooms/{roomId}/initialSync` | **served**, at parity on all 39 rooms of two test accounts |
 | `/_matrix/client/*/initialSync` | **served**, at parity for both test accounts (except `archived=true`) |
 | `/_matrix/client/*/sync` | **initial and incremental served**, at parity for both test accounts, with or without MSC4222 `state_after`, and with or without a filter. `to_device` is served only when configured; see below |
-| `/_matrix/client/*/events` | not implemented |
+| `/_matrix/client/*/events` | **served**, at parity for both test accounts |
 
 ### Deliberate deviations
 
@@ -50,6 +50,17 @@ as a role granted `SELECT, DELETE` on `device_inbox` and nothing else
 that narrow — refusing to run if it can delete from `events` or insert into
 `device_inbox` — and keeps the main pool on the read-only role. Every query in
 `internal/store` is still a `SELECT`.
+
+**`/events` does not randomise its timeout.** Synapse jitters a client's
+requested timeout by ±10% to spread reconnections after a restart. It is a
+load-spreading measure with no effect on what a response contains, and a worker
+under comparison is better off deterministic, so the timeout is used as given
+(with Synapse's 500ms floor). Nothing is routed here, so there is no herd.
+
+**`/events/{eventId}` is not served.** It shares a file with the event stream in
+Synapse but nothing else: it is a single-event lookup with no notifier, no
+tokens and no streaming, and it belongs to whichever worker serves the room
+endpoints rather than to a sync worker.
 
 **One upstream bug is deliberately not reproduced.** Synapse's
 `_get_unread_counts_by_pos_txn` adds a room's post-rotation main-timeline counts

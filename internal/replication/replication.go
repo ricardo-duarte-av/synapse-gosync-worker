@@ -76,6 +76,11 @@ type Subscriber struct {
 	// Positions and typing are only trustworthy while it is true.
 	live      bool
 	positions map[string]int64
+	// typingSerial maps a room to the typing stream position at which it last
+	// changed. /events needs it: unlike every other source, typing has no
+	// table to ask "what changed since?", so the only record of when a room's
+	// typists last moved is the one kept here as the rows arrive.
+	typingSerial map[string]int64
 	// typing maps a room to the users currently typing in it. Held only in
 	// memory because that is the only place it exists anywhere: Synapse keeps
 	// it in a counter on the typing worker and never writes it down.
@@ -85,11 +90,12 @@ type Subscriber struct {
 // New builds a Subscriber.
 func New(cfg Config, log zerolog.Logger, listener Listener) *Subscriber {
 	return &Subscriber{
-		cfg:       cfg,
-		log:       log,
-		listener:  listener,
-		positions: map[string]int64{},
-		typing:    map[string][]string{},
+		cfg:          cfg,
+		log:          log,
+		listener:     listener,
+		positions:    map[string]int64{},
+		typing:       map[string][]string{},
+		typingSerial: map[string]int64{},
 	}
 }
 
@@ -209,6 +215,7 @@ func (s *Subscriber) setLive(live bool) {
 		// know who is typing. Claiming otherwise would leave a room showing a
 		// typist forever.
 		s.typing = map[string][]string{}
+		s.typingSerial = map[string]int64{}
 	}
 	s.live = live
 }
@@ -250,7 +257,7 @@ func (s *Subscriber) handleRDATA(payload string) {
 
 	roomIDs, userIDs := rowSubjects(stream, row)
 	if stream == StreamTyping {
-		s.updateTyping(row)
+		s.updateTyping(row, pos)
 	}
 	if pos > 0 {
 		s.advance(stream, pos)

@@ -48,6 +48,9 @@ serving and live-test gating are reused from `synapse-gopro-worker` and
 | `org.matrix.simplified_msc3575/sync` | 11,844 (out of scope) |
 | `/events`, `/initialSync`, `/rooms/{id}/initialSync` | **0** |
 
+All three legacy endpoints are nonetheless served and at parity: they were in
+scope, and a scope with a hole in it is not a finished scope.
+
 Roughly seven times the entire federation read volume gopro-worker was built
 for. Two consequences drive everything:
 

@@ -818,3 +818,53 @@ not the same as skipping it: the pass is also what stamps `unsigned.membership`
 The query filters on `expires_at` and on soft-failed events, so the answer
 depends on the wall clock as well as the stream position — and the cap is 100
 events per sync across all rooms, because anyone may send one.
+
+## /events, the pre-sync stream (2026-09-02)
+
+**Five sources, in a fixed order, and the order is part of the answer.**
+`_EventSourcesInner.get_sources()` returns room, presence, typing, receipt,
+account_data, and `check_for_updates` appends each source's output in that
+order. The chunk is a JSON list, so this is not an implementation detail.
+
+**The end token starts as the CLIENT's token, not the current one.** Only
+sources that actually produced something advance their field
+(`end_token.copy_and_replace(keyname, new_key)`), so a quiet stream stays where
+the client left it and nothing is skipped. And a source is consulted at all only
+if its field differs between the before and after tokens.
+
+**The room source ignores the `to` it was given.** `RoomEventSource.get_new_events`
+calls `self.get_current_key()` for its upper bound rather than using
+`after_token`, and its returned key is the stream position of the LAST EVENT IT
+RETURNED — which the limit may have cut short. So the end token of a limited
+/events response is derived from the response, and pinning a comparison to it
+hands the implementation its own answer.
+
+**The limit applies to room events only.** EDUs are appended afterwards and are
+not counted, so a response with `limit=10` can legitimately carry thirteen
+entries.
+
+**Membership changes are fetched separately, and are not filtered by room.**
+`get_membership_changes_for_user` runs alongside the per-room query, which is
+what lets an invite in a room the caller has not joined reach them.
+
+**Presence for joins is emitted once per EVENT, not once per user.** The handler
+loops over the returned events and extends `to_add` for each join, so three
+joins by the same person yield that person's presence three times. For the
+caller's own join it sends presence for every member of the room; for anyone
+else's, just the joiner.
+
+**/events cannot be asked not to disturb presence.** `EventStreamHandler.get_stream`
+calls `presence_handler.user_syncing(..., affect_presence=not is_guest,
+presence_state=ONLINE)` unconditionally: there is no `set_presence` parameter.
+Every other comparison here sends `set_presence=offline` to keep the harness
+invisible; a /events comparison marks the test account online whether it likes
+it or not.
+
+**A guest must name a room.** Without `room_id` there is no way to decide what a
+guest may see, so the servlet rejects it with a 400 before anything else. A
+named room the caller has not joined is allowed only if it is world-readable,
+and then that room alone.
+
+**The timeout is a DEFAULT, not a cap** — 30 seconds when the client says
+nothing, which is the opposite of /sync, where a missing timeout means "answer
+now". A non-zero timeout is floored at 500ms and jittered by ±10%.
