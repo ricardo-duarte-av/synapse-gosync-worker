@@ -508,3 +508,153 @@ Two things bit while implementing it:
 | Client event serialisation | `synapse/events/utils.py:224` (`serialize_event`) |
 
 ---
+
+## Filters and lazy loading (2026-09-02, M6)
+
+### `prev_batch` is the token you were given, unless the timeline was trimmed
+
+`_load_filtered_recents` keeps two variables that look interchangeable and are
+not:
+
+```python
+room_key = upto_token.room_key
+end_key = room_key
+while limited and len(filtered_recents) < timeline_limit and max_repeat:
+    events, end_key, limited = await pagination_method(from_key=end_key, ...)
+...
+if len(filtered_recents) > timeline_limit:
+    filtered_recents = filtered_recents[-timeline_limit:]
+    room_key = RoomStreamToken(stream=filtered_recents[0]...stream_ordering - 1)
+prev_batch_token = upto_token.copy_and_replace(StreamKeyType.ROOM, room_key)
+```
+
+The pagination cursor lands in `end_key`. `room_key` — the one that becomes
+`prev_batch` — is only ever reassigned by the **trim**. So a timeline that came
+back shorter than the limit reports a `prev_batch` equal to the sync point
+itself, even though pagination walked well past it.
+
+Reporting where the walk stopped is the obvious reading and is wrong. It stayed
+hidden through M3–M5 because with the default filter every room in the corpus
+had more than ten events and always trimmed. The first `types` filter exposed
+it in nine rooms at once.
+
+### The timeline is re-paginated up to five times
+
+A page is thinned twice after it is loaded — once by the client's filter, once
+by history visibility — so Synapse loops, `max_repeat = 5`, while the timeline
+is still under the limit. `load_limit = max(timeline_limit * 2, 10)` per pass.
+
+With the default filter one pass is nearly always enough, which is why the loop
+can be left out and not noticed. With a selective filter it is the difference
+between a full timeline and a nearly empty one that also claims `limited`.
+
+### `set_timeline_upper_limit` applies to inline filters only
+
+`rest/client/sync.py` calls it on the `filter_id.startswith("{")` branch and
+not on the stored-filter branch. A client that uploads a filter with
+`"limit": 5000` and passes its ID is not capped; the same filter inline is. The
+asymmetry is upstream's, and it means `filter_timeline_limit` is not a bound on
+anything. This deployment sets it to **1000**, not the default 100.
+
+### The lazy-loaded members cache is smaller than it says
+
+`LruCache(max_size=LAZY_LOADED_MEMBERS_CACHE_MAX_SIZE)` asks for 100, then
+multiplies by `caches.global_factor`, whose default is **0.5** — so the real
+size on a default deployment is 50. `av-sync-worker-2` sets `global_factor:
+1.0`, so the reference worker's is 100 and ours is configured to match.
+
+The outer `ExpiringCache` is built without `reset_expiry_on_get`, so a device's
+cache expires 30 minutes after it was **created**, not after it was last used.
+A continuously syncing client loses its lazy-loading state on a fixed schedule
+and is re-sent every member it already has.
+
+### `members_to_fetch` differs under MSC4222
+
+Under the classic `state` block a sender whose membership is already in the
+timeline is skipped — the client will get it from the timeline. Under
+`state_after` the block describes where the room *ended up*, so a membership in
+the timeline says nothing about it and the sender is fetched regardless.
+
+### Lazy loading changes `_calculate_state`, and only one of its subtractions
+
+With `lazy_load_members` set, the member events present in `timeline_start` are
+removed from `previous_timeline_end_ids` before the subtraction. The events
+carried by the timeline itself are still subtracted as normal. Merging the two
+exclusion sets — the obvious simplification — sends members twice.
+
+### A gappy incremental sync turns lazy loading off, partly
+
+`if batch.limited: state_filter = StateFilter.all()` applies to the two
+whole-state fetches (`previous` and `end`) but **not** to `timeline_start`,
+which was fetched earlier and stays restricted. The comment upstream calls this
+"counterintuitively" and it is: the restricted start is what lets
+`_calculate_state`'s lazy-load rule pull the timeline senders' memberships back
+in while the unrestricted ends supply everything else.
+
+### `summary` is three different values
+
+`result["summary"] = room.summary` is unconditional, and `room.summary` is:
+
+- `{}` when no summary was computed — not lazy loading, or nothing changed;
+- `null` when `compute_summary` ran and found no events in the room at all;
+- the object otherwise.
+
+So an empty object and a null mean different things and neither is a missing
+key.
+
+### `compute_summary` can add to the state block
+
+A hero whose membership the client has not been sent is useless — a user ID
+with no profile to render. So `compute_summary` writes the missing member
+events into `state` after `compute_state_delta` has finished with it. It runs
+*after* `compute_state_delta`, which matters on an initial sync: the cache has
+already been cleared and repopulated by then, so the hero check sees exactly
+the members that were just selected.
+
+### `timeline_gaps` makes a timeline `limited` with nothing trimmed
+
+`_load_filtered_recents` consults `get_timeline_gaps` before anything else. A
+gap is recorded when Synapse persists an event whose predecessors it did not
+have — a federated room going quiet and coming back. The events either side are
+adjacent in stream ordering and not in the room's history.
+
+Two effects:
+
+- the room's timeline is `limited` even when nothing was trimmed, so the client
+  paginates across the hole rather than treating the events as contiguous;
+- on an incremental sync the loaded window is **discarded** and re-paginated
+  from the sync point back to the gap, so events before the gap are not sent.
+
+This deployment has **99,053 gap rows across 1,392 rooms**. It is invisible
+whenever the timeline was long enough to be trimmed — which with the default
+filter is nearly always — which is why it survived M3 to M5 unnoticed.
+
+`persisted_after` is per writer: `token.get_stream_pos_for_instance(instance) <
+row.stream`. With a sharded event persister a plain stream comparison is only an
+approximation and both bounds have to be re-checked against the writer that
+recorded the gap.
+
+### The state block cannot keep a room in the response
+
+`_generate_room_entry` decides whether to emit a room at all:
+
+```python
+if not (always_include or batch or account_data_events or ephemeral
+        or full_state or sticky_event_ids):
+    return
+```
+
+`state` is not in that list, and this runs **before** `compute_state_delta`. So
+a room whose only news is a state change outside the timeline is dropped
+entirely — the state delta is never even computed.
+
+Checking afterwards and counting `state` emits rooms Synapse omits. As with the
+gap above, it only becomes visible once something can empty the timeline while
+leaving a state delta behind, which is exactly what a `types` filter does.
+
+### `unread_thread_notifications` changes the main counts too
+
+Without the filter flag, every thread's notification and highlight counts are
+folded into the room's `notification_count` and `highlight_count`. With it, the
+threads are reported separately under `unread_thread_notifications` and the main
+counts carry only the main timeline. It is not an additive field.

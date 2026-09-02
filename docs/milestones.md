@@ -13,7 +13,7 @@ Status is recorded here; what actually happened is in [log.md](log.md).
 | M3 | Initial `/sync` (no `since`) | **done** — both accounts, all endpoints |
 | M4 | Stream tokens and incremental `/sync` | **done** — 10 windows, two accounts; one deep-history caveat |
 | M5 | Long-polling and Redis replication | **done** |
-| M6 | Filters and lazy-loading | not started |
+| M6 | Filters and lazy-loading | **done** |
 | — | MSC4222 `state_after` | **done** |
 | M7 | Ephemeral: receipts, typing, presence | not started |
 | M8 | To-device and device lists | not started |
@@ -76,6 +76,56 @@ first.
 The worker follows the replication stream, so it can answer without being told
 what time it is. Typing works, 11 of 14 token fields match exactly, and a
 long poll woke in 3.15s for a message sent at 3s.
+
+## M6 — done
+
+Filters are honoured: the timeline limit, `types` / `not_types`, `senders`,
+`rooms`, `contains_url`, labels, `related_by_*`, `include_leave`,
+`event_fields`, `event_format`, and the whole `blocks_all_*` family of
+short-circuits. Lazy loading works, summary and heroes included.
+
+Verified against both accounts, initial and incremental, with filters for
+timeline limit, type allow and deny lists, `event_fields`, `event_format:
+federation`, blocked presence, blocked rooms, state type lists,
+`lazy_load_members`, `include_redundant_members` and `include_leave`.
+
+Five things came out of it that were not filter bugs:
+
+**`prev_batch` on an untrimmed timeline was wrong, and had been all along.**
+Synapse's `_load_filtered_recents` keeps `room_key` at the token it was given
+and only moves it when the timeline is trimmed to the limit — the pagination
+cursor is assigned to `end_key`, a different variable. So a timeline shorter
+than the limit reports a `prev_batch` equal to the sync point. We were
+reporting where the topological walk stopped. It never showed up before
+because with the default filter every room in the corpus had more than ten
+events and always trimmed. A `types` filter is the first thing that produces a
+short timeline in a busy room.
+
+**The timeline re-pagination loop was missing.** Synapse re-paginates up to five
+times while the timeline is under the limit, because both the client's filter
+and history visibility thin the page after it is loaded. One pass is enough for
+the default filter and visibly not enough for a selective one.
+
+**`timeline_gaps` was never consulted.** A hole in a room's history makes the
+timeline `limited` with nothing trimmed, and on an incremental sync makes
+Synapse discard the window and re-paginate back to the gap. 99,053 gap rows
+across 1,392 rooms here, and invisible until a filter produced a timeline short
+enough not to be trimmed.
+
+**The state block was keeping rooms in the response.** Synapse decides whether
+to emit a room *before* computing its state delta, and `state` is not one of
+the things that keeps it alive. We were checking afterwards and counting state,
+so we emitted rooms Synapse omits.
+
+**A state-key collision that Synapse decides at random.** See
+[comparability.md](comparability.md); it is now a named tolerance bucket. It
+predates M6 — the pre-M6 worker reproduces it — and it is not fixable.
+
+Two deliberate gaps, both recorded in README.md and named by the comparator:
+`unread_thread_notifications`, and the `msc4354_sticky` room section. The
+second was found the same way: a sticky event still in the timeline is removed
+from that section by Synapse, so the section appears only once the event ages
+out — or the moment a filter excludes it from the timeline.
 
 ## M8 has an unresolved blocker
 

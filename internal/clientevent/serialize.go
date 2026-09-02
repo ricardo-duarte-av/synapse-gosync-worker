@@ -18,6 +18,12 @@ const (
 	// FormatV2NoRoomID is what `/sync` emits: v2 with `room_id` stripped, since
 	// the room is already the key in the response.
 	FormatV2NoRoomID
+	// FormatRaw is the PDU as stored, with no client transform at all. It is
+	// what a filter's `event_format: "federation"` asks for, and it keeps the
+	// fields every other format drops -- prev_events, auth_events, hashes,
+	// signatures, depth. Synapse reaches it by setting `as_client_event` to
+	// false, which skips the format step rather than selecting a variant of it.
+	FormatRaw
 )
 
 // v2DropKeys are the federation-only fields no client format carries.
@@ -64,6 +70,14 @@ type Config struct {
 	// MSC4354Enabled mirrors Synapse's experimental.msc4354_enabled. When set,
 	// a sticky event carries the time it has left to live.
 	MSC4354Enabled bool
+	// EventFields is a filter's `event_fields`: an allowlist of (possibly
+	// dotted) paths, applied last of all. Nil or empty means no pruning.
+	//
+	// It runs after every other transform and before bundled aggregations,
+	// which is why it can prune `unsigned.membership` but never an
+	// `m.relations` bundle: Synapse returns aggregations regardless of what
+	// the client asked for.
+	EventFields []string
 }
 
 // stickyMaxDurationMS caps how long an event may claim to be sticky.
@@ -277,11 +291,22 @@ func Serialize(ev Stored, nowMS int64, cfg Config) ([]byte, error) {
 		}
 	}
 
+	if len(cfg.EventFields) > 0 {
+		if out, err = OnlyFields(out, cfg.EventFields); err != nil {
+			return nil, err
+		}
+	}
+
 	return out, nil
 }
 
 func applyFormat(out []byte, format Format) ([]byte, error) {
 	var err error
+	// The federation format is not a transform that keeps more fields -- it is
+	// no transform at all, so it must return before the shared drop list.
+	if format == FormatRaw {
+		return out, nil
+	}
 	for _, key := range v2DropKeys {
 		if out, err = sjson.DeleteBytes(out, key); err != nil {
 			return nil, err

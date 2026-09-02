@@ -9,7 +9,7 @@ diff the bytes. `/sync` is not that. **Sending the same request twice — even t
 the same Synapse worker — legitimately yields different answers.** A naive A/B
 diff would drown in false positives and teach us nothing.
 
-Six independent sources of divergence:
+Eight independent sources of divergence:
 
 1. **`now_token` differs.** Each side snapshots
    `event_sources.get_current_token()` at its own start
@@ -51,6 +51,47 @@ Six independent sources of divergence:
    which a background job rolls up asynchronously. Recorded as
    `tolerated{reason=…}` rather than counted as either a match or a mismatch —
    the same treatment gopro gives `walk_truncated`.
+
+7. **A state key whose value Synapse picks at random.** `_calculate_state` can
+   end up holding two different events for the same `(type, state_key)`: one
+   from the state at the start of the timeline, one from the state at its end,
+   with neither carried by the timeline itself to subtract. Synapse then builds
+   `{event_id_to_state_key[e]: e for e in state_ids}` from a Python **set** of
+   event IDs, so which of the two survives depends on string hash order — and
+   Python randomises that per process.
+
+   Measured, not inferred. For the `m.room.server_acl` pair this first appeared
+   on, `PYTHONHASHSEED` 0, 1, 4, 6 and 7 select the newer event and 2, 3 and 5
+   the older:
+
+   ```sh
+   for seed in 0 1 2 3 4 5 6 7; do PYTHONHASHSEED=$seed python3 -c '...'; done
+   ```
+
+   So Synapse's answer here changes when the worker restarts. There is no value
+   to match, only a coin to call.
+
+   → Counted by name. The bucket is deliberately narrow: **both** sides must
+   carry an entry for the same `(type, state_key)` and the two event IDs must
+   differ. A state key only one side emits is still a mismatch.
+
+8. **The lazy-loaded members cache has no representation in the database.**
+   Which member events a lazy-loading sync sends depends on which ones that
+   *process* has already sent to that device, held in an in-memory LRU keyed by
+   `(user, device)`. Two implementations cannot agree from the same inputs.
+
+   Three things keep it bounded. An initial sync **clears** the cache before
+   using it, so that case is fully deterministic. `include_redundant_members`
+   skips the deduplication entirely. And the whole per-device cache expires 30
+   minutes after it was *created* — not after it was last used, since Synapse
+   builds it without `reset_expiry_on_get` — so both sides periodically forget
+   everything and re-send.
+
+   In practice the comparator's own traffic is what warms both caches, in the
+   same order, so they agree. That is a property of the harness and not of the
+   implementation: do not read a passing incremental lazy-load comparison as
+   proof that two *independently driven* caches would agree. They would not,
+   and nothing requires them to — a given client is served by one worker.
 
 **Consequence.** The proxy/shadow/canary ladder is *not* built first: it depends
 on comparing two answers to the same live request, which sources 1–4 make

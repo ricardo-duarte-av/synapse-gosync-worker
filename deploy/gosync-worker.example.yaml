@@ -129,6 +129,38 @@ experimental:
   # MSC4222: lets a client ask for `state_after` instead of `state`. Opt-in per
   # request, so enabling it changes nothing until a client asks.
   msc4222_enabled: true
+  # MSC3773 makes `org.matrix.msc3773.unread_thread_notifications` an alias for
+  # the stable filter field. It changes only how a filter is READ -- we do not
+  # yet emit per-thread counts either way; see README.md.
+  msc3773_enabled: true
+  # MSC3874 enables a filter's `rel_types` fields. They filter /messages rather
+  # than /sync, so this is here only so a filter carrying them is read the same
+  # way by both implementations.
+  msc3874_enabled: false
+
+# Caps `room.timeline.limit` in an INLINE filter -- and only an inline one.
+#
+# Synapse applies set_timeline_upper_limit on the branch that parses a filter
+# from the query string and not on the branch that looks one up by ID, so a
+# client can exceed this by uploading the filter first. It is therefore not a
+# bound on anything; match the reference server's value rather than choosing a
+# safe-looking one. Synapse's default is 100; -1 disables the cap.
+filter_timeline_limit: 1000
+
+caches:
+  # How many member events one device's lazy-loading cache remembers, which
+  # decides how often a lazy-loading client is re-sent members it already has.
+  #
+  # Synapse asks for 100 and then multiplies by `caches.global_factor`, whose
+  # default is 0.5 -- so the effective size on a default deployment is 50, not
+  # 100. Read the factor off the REFERENCE WORKER's config, not the
+  # homeserver's: a worker may override it, and av-sync-worker-2 does.
+  lazy_load_members_cache_size: 100
+  # How long a device's cache lives, measured from creation rather than last
+  # use. Synapse builds it without reset_expiry_on_get, so a continuously
+  # syncing client still loses its lazy-loading state every 30 minutes and is
+  # re-sent every member it already has.
+  lazy_load_members_cache_ttl: 30m
 
 testing:
   # Enables ?_gosync_now=<token>, which forces the now_token this worker

@@ -12,6 +12,7 @@ import (
 
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/auth"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/clientevent"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/lazyload"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/matrixerr"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/notifier"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/pushrules"
@@ -36,12 +37,21 @@ type Deps struct {
 	PushRuleFeatures pushrules.Features
 	// MSC4222Enabled mirrors Synapse's experimental.msc4222_enabled.
 	MSC4222Enabled bool
+	// MSC3773Enabled and MSC3874Enabled change only how a filter is read.
+	MSC3773Enabled bool
+	MSC3874Enabled bool
+	// FilterTimelineLimit caps an inline filter's timeline limit. -1 disables
+	// the cap; Synapse's default is 100.
+	FilterTimelineLimit int
 	// Replication supplies live stream positions and typing. Nil when
 	// replication is disabled, in which case positions fall back to the
 	// database and typing is never reported.
 	Replication *replication.Subscriber
 	// Notifier wakes long-polling syncs.
 	Notifier *notifier.Notifier
+	// LazyLoad remembers which member events each device has been sent, so a
+	// lazy-loading sync does not repeat them.
+	LazyLoad *lazyload.Cache
 }
 
 // defaultPaginationLimit is Synapse's PaginationConfig default for the legacy

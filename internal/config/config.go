@@ -24,6 +24,16 @@ type Config struct {
 	// traffic is published on a channel named after the homeserver.
 	ServerName string `yaml:"server_name"`
 
+	// Caches mirrors the parts of Synapse's `caches` block that change what a
+	// response contains.
+	Caches Caches `yaml:"caches"`
+
+	// FilterTimelineLimit caps `room.timeline.limit` in an INLINE filter, and
+	// only an inline one: Synapse applies set_timeline_upper_limit when the
+	// filter arrives as JSON in the query string, and not when it is looked up
+	// by ID. Synapse's default is 100; -1 disables the cap.
+	FilterTimelineLimit *int `yaml:"filter_timeline_limit"`
+
 	Listen       Listen       `yaml:"listen"`
 	Database     Database     `yaml:"database"`
 	Replication  Replication  `yaml:"replication"`
@@ -151,6 +161,29 @@ type Experimental struct {
 	// MSC4222Enabled lets a client ask for `state_after` instead of `state`.
 	// Without it the query parameter is ignored, as Synapse ignores it.
 	MSC4222Enabled bool `yaml:"msc4222_enabled"`
+	// MSC3773Enabled makes a filter's
+	// `org.matrix.msc3773.unread_thread_notifications` an alias for the stable
+	// field. It changes only how a filter is read, not what is returned.
+	MSC3773Enabled bool `yaml:"msc3773_enabled"`
+	// MSC3874Enabled enables a filter's `rel_types` fields. They filter
+	// /messages rather than /sync, so this is here for completeness: a filter
+	// carrying them must be read the same way by both.
+	MSC3874Enabled bool `yaml:"msc3874_enabled"`
+}
+
+// Caches configures the one cache whose size is visible in responses.
+type Caches struct {
+	// LazyLoadMembersCacheSize is how many member events one device's
+	// lazy-loading cache remembers.
+	//
+	// Synapse asks for 100 and multiplies by `caches.global_factor`, whose
+	// default is 0.5 -- so a default deployment remembers 50. Set this to
+	// match the reference server, or lazy-loading syncs will differ in how
+	// many member events they repeat.
+	LazyLoadMembersCacheSize int `yaml:"lazy_load_members_cache_size"`
+	// LazyLoadMembersCacheTTL is how long a device's cache lives, measured
+	// from creation rather than last use, as Synapse's ExpiringCache does.
+	LazyLoadMembersCacheTTL time.Duration `yaml:"lazy_load_members_cache_ttl"`
 }
 
 // Testing gates behaviour that exists only to make the comparator possible.
@@ -210,6 +243,18 @@ func Parse(data []byte) (*Config, error) {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// TimelineLimitCap is the configured cap on an inline filter's timeline limit,
+// defaulting to Synapse's 100.
+//
+// A pointer in the struct, because 0 is a meaningful value here -- it means
+// "return no timeline events at all" -- and so is -1, which disables the cap.
+func (c *Config) TimelineLimitCap() int {
+	if c.FilterTimelineLimit == nil {
+		return 100
+	}
+	return *c.FilterTimelineLimit
 }
 
 func (c *Config) validate() error {

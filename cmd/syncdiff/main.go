@@ -47,6 +47,7 @@ func main() {
 		stateAfter = flag.Bool("state-after", false, "request MSC4222 org.matrix.msc4222.state_after")
 		rewind     = flag.Int("rewind", 2000, "for incremental_sync: how far to rewind the room key to build a `since`")
 		verbose    = flag.Bool("v", false, "print each compared response")
+		filterJSON = flag.String("filter", "", "inline sync filter JSON, sent as ?filter=")
 	)
 	flag.Parse()
 
@@ -67,7 +68,8 @@ func main() {
 	defer cancel()
 
 	if *endpoint == "incremental_sync" {
-		res := compareIncrementalSync(ctx, ours, ref, token, *rewind, *verbose, *stateAfter)
+		res := compareIncrementalSync(ctx, ours, ref, token, *rewind, *verbose, *stateAfter,
+			*filterJSON)
 		printOne("/sync (incremental)", res)
 		report(boolToInt(res.kind == resultMatch), boolToInt(res.kind == resultMismatch),
 			boolToInt(res.kind == resultSkip))
@@ -78,7 +80,7 @@ func main() {
 	}
 
 	if *endpoint == "sync" {
-		res := compareSync(ctx, ours, ref, token, *limit, *verbose, *stateAfter)
+		res := compareSync(ctx, ours, ref, token, *limit, *verbose, *stateAfter, *filterJSON)
 		printOne("/sync", res)
 		report(boolToInt(res.kind == resultMatch), boolToInt(res.kind == resultMismatch),
 			boolToInt(res.kind == resultSkip))
@@ -136,6 +138,9 @@ func main() {
 
 func report(matched, mismatched, skipped int) {
 	fmt.Printf("\n%d matched, %d mismatched, %d skipped", matched, mismatched, skipped)
+	if coinFlips > 0 {
+		fmt.Printf("\n  %d state entries where two events collide on one state key (Synapse picks by Python set order, which is randomised per process)", coinFlips/2)
+	}
 	if tolerated > 0 {
 		fmt.Printf("\n  %d tolerated cache-dependent fields (prev_content on state, receipt thread_id)", tolerated)
 	}
@@ -144,7 +149,7 @@ func report(matched, mismatched, skipped int) {
 			liveDataSkew)
 	}
 	if knownGaps > 0 {
-		fmt.Printf("\n  %d known gaps (m.typing: never persisted, needs the replication stream -- M5)", knownGaps)
+		fmt.Printf("\n  %d known gaps (m.typing before the replication view fills in; msc4354_sticky, not implemented)", knownGaps)
 	}
 	if tokenCarrySkew > 0 {
 		fmt.Printf("\n  %d prev_batch tokens right in the room key, differing in carried streams (Synapse mutates its own now_token mid-response)",
@@ -311,15 +316,26 @@ var knownGaps int
 
 // isKnownGap matches a difference that is expected until a milestone lands.
 //
-// m.typing is the only one so far. Typing is never persisted -- it lives in an
-// in-memory counter on the typing worker and reaches other workers over
-// replication -- so no query can produce it and no amount of care in this
-// worker will, until it subscribes to the replication stream (M5).
+// Two so far.
+//
+// m.typing is never persisted -- it lives in an in-memory counter on the typing
+// worker and reaches other workers over replication -- so no query can produce
+// it and no amount of care in this worker will, until it subscribes to the
+// replication stream (M5).
+//
+// msc4354_sticky is the room's sticky-events section, which we do not build at
+// all. It is hard to notice: a sticky event that is still recent enough to be
+// in the room's timeline is REMOVED from this section by Synapse, so the
+// section only appears once the event has aged out of the timeline -- or as
+// soon as a filter excludes it from the timeline, which is how it was found.
+// Note that implementing it will also move `next_batch`: Synapse rewrites the
+// sticky field of its own now_token to the last row it returned.
 //
 // Counted and named rather than silently ignored: a gap that leaves no trace in
 // the output is indistinguishable from a gap nobody remembered.
 func isKnownGap(path string) bool {
-	return strings.HasSuffix(path, ".ephemeral.events[m.typing]")
+	return strings.HasSuffix(path, ".ephemeral.events[m.typing]") ||
+		strings.HasSuffix(path, ".msc4354_sticky")
 }
 
 // prevBatchDiffersOnlyOutsideRoomKey accepts a prev_batch whose room key is
@@ -626,6 +642,10 @@ func diff(path string, got, want any, out *[]string) {
 					tolerated++
 					continue
 				}
+				if isKnownGap(path + "." + k) {
+					knownGaps++
+					continue
+				}
 				*out = append(*out, fmt.Sprintf("%s.%s: missing from our response (Synapse: %s)", path, k, brief(wv)))
 			case !inWant:
 				if isReceiptThreadID(path + "." + k) {
@@ -706,6 +726,7 @@ func compareAsSet(path, key string, got, want []any, out *[]string) {
 		return m
 	}
 	g, w := index(got), index(want)
+	collisions := stateKeyCollisions(g, w)
 	ids := map[string]bool{}
 	for k := range g {
 		ids[k] = true
@@ -722,13 +743,73 @@ func compareAsSet(path, key string, got, want []any, out *[]string) {
 				knownGaps++
 				continue
 			}
+			if collisions[id] {
+				coinFlips++
+				continue
+			}
 			*out = append(*out, fmt.Sprintf("%s: missing entry %s", path, id))
 		case !inWant:
+			if collisions[id] {
+				coinFlips++
+				continue
+			}
 			*out = append(*out, fmt.Sprintf("%s: extra entry %s", path, id))
 		default:
 			diff(fmt.Sprintf("%s[%s]", path, id), gv, wv, out)
 		}
 	}
+}
+
+// coinFlips counts differences Synapse itself decides at random.
+var coinFlips int
+
+// stateKeyCollisions finds state entries that disagree only in WHICH event was
+// chosen for a state key both sides carry.
+//
+// _calculate_state can legitimately end up with two different events for the
+// same (type, state_key): one from the state at the start of the timeline and
+// one from the state at its end, with neither in the timeline itself to
+// subtract. Synapse then builds `{event_id_to_state_key[e]: e for e in
+// state_ids}` from a Python SET of event IDs, so which one survives depends on
+// string hash order -- and Python randomises that per process.
+//
+// Measured, not assumed: for the two m.room.server_acl events this first
+// appeared on, PYTHONHASHSEED 0,1,4,6,7 select the newer event and 2,3,5 the
+// older. There is no answer to match here, only a coin to call, so the pair is
+// counted by name rather than reported as a mismatch.
+//
+// The condition is deliberately narrow: BOTH sides must carry an entry for the
+// same (type, state_key), and the two event IDs must differ. A state key only
+// we emit, or only Synapse emits, is still a mismatch.
+func stateKeyCollisions(g, w map[string]any) map[string]bool {
+	keyOf := func(item any) (string, bool) {
+		m := itemAsMap(item)
+		typ, ok1 := m["type"].(string)
+		sk, ok2 := m["state_key"].(string)
+		if !ok1 || !ok2 {
+			return "", false
+		}
+		return typ + "\x00" + sk, true
+	}
+	byKey := func(m map[string]any) map[string]string {
+		out := map[string]string{}
+		for id, item := range m {
+			if k, ok := keyOf(item); ok {
+				out[k] = id
+			}
+		}
+		return out
+	}
+	gk, wk := byKey(g), byKey(w)
+	out := map[string]bool{}
+	for k, gid := range gk {
+		wid, ok := wk[k]
+		if ok && gid != wid {
+			out[gid] = true
+			out[wid] = true
+		}
+	}
+	return out
 }
 
 func itemAsMap(v any) map[string]any {
@@ -877,12 +958,15 @@ func printOne(name string, res result) {
 // USER_SYNC over replication, and a comparator must not perturb the deployment
 // it is measuring.
 func compareSync(ctx context.Context, ours, ref *http.Client, token string,
-	limit int, verbose, useStateAfter bool) result {
+	limit int, verbose, useStateAfter bool, filterJSON string) result {
 
 	path := "/_matrix/client/v3/sync"
 	q := url.Values{"timeout": {"0"}, "set_presence": {"offline"}}
 	if useStateAfter {
 		q.Set("org.matrix.msc4222.use_state_after", "true")
+	}
+	if filterJSON != "" {
+		q.Set("filter", filterJSON)
 	}
 
 	refBody, status, err := get(ctx, ref, path+"?"+q.Encode(), token)
@@ -967,7 +1051,7 @@ func recoverTimeNowFromSync(resp map[string]any) (int64, bool) {
 // Everything else is pinned exactly as for an initial sync: the reference
 // answers first and its next_batch becomes our now.
 func compareIncrementalSync(ctx context.Context, ours, ref *http.Client, token string,
-	rewind int, verbose, useStateAfter bool) result {
+	rewind int, verbose, useStateAfter bool, filterJSON string) result {
 
 	path := "/_matrix/client/v3/sync"
 
@@ -993,6 +1077,9 @@ func compareIncrementalSync(ctx context.Context, ours, ref *http.Client, token s
 	q := url.Values{"timeout": {"0"}, "set_presence": {"offline"}, "since": {since}}
 	if useStateAfter {
 		q.Set("org.matrix.msc4222.use_state_after", "true")
+	}
+	if filterJSON != "" {
+		q.Set("filter", filterJSON)
 	}
 	refBody, status, err := get(ctx, ref, path+"?"+q.Encode(), token)
 	if err != nil {

@@ -32,6 +32,7 @@ const (
 	CodeInvalidParam   = "M_INVALID_PARAM"
 	CodeMissingParam   = "M_MISSING_PARAM"
 	CodeUnrecognized   = "M_UNRECOGNIZED"
+	CodeNotJSON        = "M_NOT_JSON"
 	CodeGuestForbidden = "M_GUEST_ACCESS_FORBIDDEN"
 )
 

@@ -12,6 +12,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -24,6 +25,11 @@ import (
 type Store struct {
 	pool   *pgxpool.Pool
 	caches *caches
+
+	// instance_map is append-only, so the name-to-id mapping a stream token
+	// needs is read once and kept for the process's life.
+	instanceMu  sync.Mutex
+	instanceIDs map[string]int
 }
 
 // caches hold immutable derived data. A state group's contents are fixed once

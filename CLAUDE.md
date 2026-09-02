@@ -14,7 +14,7 @@ Start with the ground rules below, then whichever of these the task touches.
 
 | Document | Read it when |
 |---|---|
-| [docs/comparability.md](docs/comparability.md) | Writing or interpreting any parity test. Explains why two `/sync` answers legitimately differ and what pinning fixes. **The most important document here.** |
+| [docs/comparability.md](docs/comparability.md) | Writing or interpreting any parity test. Explains why two `/sync` answers legitimately differ, what pinning fixes, and the two things pinning cannot fix. **The most important document here.** |
 | [docs/tokens.md](docs/tokens.md) | Touching stream tokens, or wondering why the `end` token is approximate before M5. |
 | [docs/synapse-notes.md](docs/synapse-notes.md) | Implementing anything new. Findings that contradict a plain reading of the source, plus a map of where things live in Synapse. |
 | [docs/auth.md](docs/auth.md) | Touching authentication. Why we ask Synapse rather than reading `access_tokens`. |
@@ -109,6 +109,12 @@ Add `-endpoint initial_sync` for the whole-account snapshot.
 With no `-rooms`, it compares every room the test account has joined. Do that:
 the two rooms it was already in, not the seven purpose-built ones, are what
 caught all four serialisation defects on 2026-09-01.
+
+`-filter '<json>'` sends an inline sync filter, which is what a real client
+does. Run at least `lazy_load_members` before believing a `/sync` change: the
+default filter exercises none of the state-restriction path, and a filter that
+shortens the timeline is the only thing that exercises `prev_batch` on an
+untrimmed one.
 
 **Check the comparator still bites** after changing it. Build the worker with
 one field deliberately wrong and confirm syncdiff names it and exits non-zero. A

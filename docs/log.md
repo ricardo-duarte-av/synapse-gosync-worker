@@ -455,3 +455,69 @@ and `cmd/gosync-worker` with `-check`, `-healthcheck` and `-version`.
 Verified live: `-check` reports `database_read_only=true`; the worker serves
 `/health` over its unix socket at mode 660, answers `M_UNRECOGNIZED` for
 unimplemented endpoints as Synapse does, and shuts down cleanly on SIGTERM.
+
+## M6 — filters and lazy-loading (2026-09-02)
+
+`internal/filter` is a port of `synapse/api/filtering.py`: a Collection of seven
+Filters, with the room-level `rooms`/`not_rooms` filter ANDed into each section.
+The `filter` query parameter resolves either as inline JSON or as an ID looked
+up in `user_filters`.
+
+Applied to the timeline (limit, types, senders, labels, `contains_url`,
+`related_by_*`), the state block, room and global account data, ephemeral,
+presence, `include_leave`, `event_fields` and `event_format`, plus the
+`blocks_all_*` short-circuits that skip a query entirely rather than running it
+and discarding the result.
+
+Lazy loading is `internal/lazyload` plus `internal/handlers/lazystate.go`: the
+timeline's senders become `members_to_fetch`, the state block is restricted to
+them, an in-memory per-`(user, device)` LRU drops members already sent, and the
+summary block — member counts and heroes — is computed and can add hero
+memberships back into the state block.
+
+### What the comparator found
+
+Four pre-existing bugs, none about filters:
+
+- **`prev_batch` was wrong on any timeline shorter than the limit.** Synapse
+  only moves that token when it trims; we were reporting where pagination
+  stopped. Nine rooms at once, the moment a `types` filter produced a short
+  timeline. See synapse-notes.md.
+- **The timeline re-pagination loop was missing.** One pass is enough for the
+  default filter and not for a selective one.
+- **`timeline_gaps` was never consulted.** 99,053 rows across 1,392 rooms. A gap
+  makes the timeline `limited` with nothing trimmed and, on an incremental sync,
+  makes Synapse discard the window and re-paginate back to the gap.
+- **The state block was keeping rooms in the response.** Synapse decides whether
+  to emit a room before it computes the state delta, and `state` is not one of
+  the things that keeps a room alive.
+
+Each of the four is masked by the default filter, and for the same reason: with
+a ten-event timeline in a busy room the timeline is always trimmed and never
+empty, so `limited` is true anyway and the room is never a candidate for being
+dropped. Filters are the first thing that produces a short or empty timeline.
+
+And one thing that is not a bug and cannot be fixed: when `_calculate_state`
+holds two events for the same state key, Synapse chooses between them by Python
+set iteration order, which is randomised per process. Demonstrated by running
+the same choice under eight `PYTHONHASHSEED` values: five pick one event, three
+the other. Confirmed pre-existing by rebuilding the M5 worker and reproducing it
+on the same account. Now a named comparator bucket.
+
+One further gap was found and deliberately not closed: the `msc4354_sticky`
+room section, which we do not build at all. It surfaced because a filter that
+excludes a sticky event from the timeline makes Synapse report it in that
+section instead. Named in the comparator and in README.md rather than
+half-implemented, because closing it also moves `next_batch`.
+
+### Verified
+
+Both accounts, initial and incremental, across ten filters: timeline limit,
+`types`, `not_types`, `event_fields`, `event_format: federation`, blocked
+presence, blocked rooms, state type lists, `lazy_load_members`,
+`include_redundant_members`, `include_leave`. Heroes exercised in two rooms.
+
+Non-vacuity checked twice, as CLAUDE.md requires. Disabling the lazy-load state
+restriction fails the lazy filter and still passes the default one. Disabling
+the lazy-load cache dedupe fails at two of three rewinds — which is what
+establishes that the incremental passes are not vacuous.

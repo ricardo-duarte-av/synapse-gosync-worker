@@ -100,6 +100,11 @@ type MemberSummary struct {
 type SummaryMember struct {
 	UserID     string
 	Membership string
+	// EventID is the member event itself, needed by the lazy-loading hero
+	// fixup: a hero whose membership the client has not been sent must have it
+	// added to the state block, or the client cannot render the name it was
+	// just told to use.
+	EventID string
 }
 
 // RoomSummary loads the member counts and the first few members of a room.
@@ -135,7 +140,7 @@ func (s *Store) RoomSummary(ctx context.Context, roomID string) (MemberSummary, 
 	// Six rather than five: one of them may be the calling user, who is never
 	// their own hero.
 	const memberQ = `
-		SELECT state_key, membership FROM current_state_events
+		SELECT state_key, membership, event_id FROM current_state_events
 		 WHERE type = 'm.room.member' AND room_id = $1 AND membership IS NOT NULL
 		 ORDER BY CASE membership
 		            WHEN 'join' THEN 1 WHEN 'invite' THEN 2 WHEN 'leave' THEN 3
@@ -149,7 +154,7 @@ func (s *Store) RoomSummary(ctx context.Context, roomID string) (MemberSummary, 
 	defer mrows.Close()
 	for mrows.Next() {
 		var m SummaryMember
-		if err := mrows.Scan(&m.UserID, &m.Membership); err != nil {
+		if err := mrows.Scan(&m.UserID, &m.Membership, &m.EventID); err != nil {
 			return out, fmt.Errorf("store: room summary members: %w", err)
 		}
 		out.Members = append(out.Members, m)

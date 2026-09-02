@@ -12,6 +12,7 @@ import (
 
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/auth"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/clientevent"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/filter"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/matrixerr"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/pushrules"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/server"
@@ -19,15 +20,12 @@ import (
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/streamtoken"
 )
 
-// defaultTimelineLimit is the default filter's timeline limit.
-const defaultTimelineLimit = 10
-
 // Sync serves /sync.
 //
-// Only an initial sync -- no `since` -- is implemented (M3). An incremental
-// sync needs the full stream-token machinery and is M4; a `since` is refused
-// rather than answered as though it were an initial sync, which would resend
-// the client's entire history.
+// The client's filter decides most of what follows -- the timeline limit, which
+// rooms and event types appear, and whether member events are lazy-loaded -- so
+// it is resolved once here and threaded through both the initial and the
+// incremental path.
 func Sync(d Deps) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ann := server.Annotate(r.Context())
@@ -43,20 +41,25 @@ func Sync(d Deps) http.Handler {
 		var (
 			body   []byte
 			status int
-			mxErr  *matrixerr.Error
 		)
 		// MSC4222 is opt-in per request, and only offered when enabled, exactly
 		// as Synapse gates it.
 		useStateAfter := d.MSC4222Enabled &&
 			r.URL.Query().Get("org.matrix.msc4222.use_state_after") == "true"
 
+		f, mxErr := resolveFilter(r.Context(), d, verdict.UserID, filterQueryParam(r))
+		if mxErr != nil {
+			refuse(w, ann, http.StatusBadRequest, *mxErr)
+			return
+		}
+
 		if since := r.URL.Query().Get("since"); since != "" {
 			if ann != nil {
 				ann.Since = since
 			}
-			body, status, mxErr = longPoll(r, d, verdict, since, useStateAfter, ann)
+			body, status, mxErr = longPoll(r, d, verdict, since, useStateAfter, f, ann)
 		} else {
-			body, status, mxErr = initialSyncV2(r, d, verdict, useStateAfter)
+			body, status, mxErr = initialSyncV2(r, d, verdict, useStateAfter, f)
 		}
 		if mxErr != nil {
 			refuse(w, ann, status, *mxErr)
@@ -67,7 +70,8 @@ func Sync(d Deps) http.Handler {
 	})
 }
 
-func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter bool) ([]byte, int, *matrixerr.Error) {
+func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter bool,
+	f *filter.Collection) ([]byte, int, *matrixerr.Error) {
 	ctx := r.Context()
 	ann := server.Annotate(ctx)
 
@@ -97,22 +101,36 @@ func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter 
 		requester.TokenID = tokenID
 	}
 	// /sync strips room_id: the room is already the key in the response.
-	cfg := clientevent.Config{Format: clientevent.FormatV2NoRoomID, Requester: requester,
-		MSC4354Enabled: d.MSC4354Enabled}
+	cfg := clientevent.Config{
+		Format:         eventFormat(f, clientevent.FormatV2NoRoomID),
+		Requester:      requester,
+		MSC4354Enabled: d.MSC4354Enabled,
+		EventFields:    f.EventFields,
+	}
 	// The invite section carries stripped room state, which every other
 	// section must not.
 	strippedCfg := cfg
 	strippedCfg.IncludeStrippedRoomState = true
 
-	accountDataByRoom, err := d.Store.AllRoomAccountData(ctx, verdict.UserID, d.MSC3391Enabled)
-	if err != nil {
-		return nil, http.StatusInternalServerError, internalError(d, "room account data", err)
+	// A filter that can match no room account data at all is answered without
+	// the query, as Synapse does: there is nothing for the query to return.
+	accountDataByRoom := map[string][]store.AccountDataEntry{}
+	if !f.BlocksAllRooms() && !f.BlocksAllRoomAccountData() {
+		accountDataByRoom, err = d.Store.AllRoomAccountData(ctx, verdict.UserID, d.MSC3391Enabled)
+		if err != nil {
+			return nil, http.StatusInternalServerError, internalError(d, "room account data", err)
+		}
 	}
 
 	joinedRooms := map[string]any{}
 	invitedRooms := map[string]any{}
 
 	for _, room := range rooms {
+		// A filter naming no rooms drops the whole section, which is cheaper
+		// than building it and discarding every entry.
+		if f.BlocksAllRooms() {
+			break
+		}
 		if room.Membership == "invite" {
 			invite, err := d.Store.InviteEvent(ctx, room.EventID, room.RoomID, room.RoomVersion)
 			if err != nil {
@@ -129,7 +147,7 @@ func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter 
 		}
 
 		entry, err := syncRoomEntry(ctx, d, room, verdict.UserID, now.Room, timeNow, cfg,
-			accountDataByRoom[room.RoomID], now, useStateAfter)
+			accountDataByRoom[room.RoomID], now, useStateAfter, f, verdict.DeviceID, true)
 		if err != nil {
 			return nil, http.StatusInternalServerError, internalError(d, "room entry", err)
 		}
@@ -138,41 +156,52 @@ func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter 
 
 	resp := map[string]any{"next_batch": now.String()}
 
-	globalAD, err := d.Store.GlobalAccountData(ctx, verdict.UserID, d.MSC3391Enabled)
-	if err != nil {
-		return nil, http.StatusInternalServerError, internalError(d, "global account data", err)
-	}
-	events, err := accountDataEvents(globalAD)
-	if err != nil {
-		return nil, http.StatusInternalServerError, internalError(d, "global account data", err)
+	if !f.BlocksAllGlobalAccountData() {
+		globalAD, err := d.Store.GlobalAccountData(ctx, verdict.UserID, d.MSC3391Enabled)
+		if err != nil {
+			return nil, http.StatusInternalServerError, internalError(d, "global account data", err)
+		}
+		events, err := accountDataEvents(globalAD)
+		if err != nil {
+			return nil, http.StatusInternalServerError, internalError(d, "global account data", err)
+		}
+
+		// m.push_rules is synthesised, not stored: Synapse keeps only a user's
+		// deviations from a built-in ruleset and rebuilds the whole thing on every
+		// read. It is prepended, as _generate_sync_entry_for_account_data does.
+		userRules, ruleEnabled, err := d.Store.PushRules(ctx, verdict.UserID)
+		if err != nil {
+			return nil, http.StatusInternalServerError, internalError(d, "push rules", err)
+		}
+		rulesContent, err := pushrules.Format(verdict.UserID, userRules, ruleEnabled, d.PushRuleFeatures)
+		if err != nil {
+			return nil, http.StatusInternalServerError, internalError(d, "push rules", err)
+		}
+		rulesEvent, err := json.Marshal(map[string]any{
+			"type": "m.push_rules", "content": rulesContent,
+		})
+		if err != nil {
+			return nil, http.StatusInternalServerError, internalError(d, "push rules", err)
+		}
+		events = append([]json.RawMessage{rulesEvent}, events...)
+
+		// The filter is applied to the whole section, m.push_rules included:
+		// Synapse builds the dict first and filters it afterwards, so a client
+		// asking only for `m.direct` does not get its push rules as well.
+		events = filterAccountDataEvents(f, "", events)
+
+		if len(events) > 0 {
+			resp["account_data"] = map[string]any{"events": events}
+		}
 	}
 
-	// m.push_rules is synthesised, not stored: Synapse keeps only a user's
-	// deviations from a built-in ruleset and rebuilds the whole thing on every
-	// read. It is prepended, as _generate_sync_entry_for_account_data does.
-	userRules, ruleEnabled, err := d.Store.PushRules(ctx, verdict.UserID)
-	if err != nil {
-		return nil, http.StatusInternalServerError, internalError(d, "push rules", err)
-	}
-	rulesContent, err := pushrules.Format(verdict.UserID, userRules, ruleEnabled, d.PushRuleFeatures)
-	if err != nil {
-		return nil, http.StatusInternalServerError, internalError(d, "push rules", err)
-	}
-	rulesEvent, err := json.Marshal(map[string]any{
-		"type": "m.push_rules", "content": rulesContent,
-	})
-	if err != nil {
-		return nil, http.StatusInternalServerError, internalError(d, "push rules", err)
-	}
-	events = append([]json.RawMessage{rulesEvent}, events...)
-
-	if len(events) > 0 {
-		resp["account_data"] = map[string]any{"events": events}
-	}
-
-	presenceStates, err := d.Store.SharedRoomPresence(ctx, verdict.UserID)
-	if err != nil {
-		return nil, http.StatusInternalServerError, internalError(d, "presence", err)
+	var presenceStates []store.PresenceState
+	if !f.BlocksAllPresence() {
+		presenceStates, err = d.Store.SharedRoomPresence(ctx, verdict.UserID)
+		if err != nil {
+			return nil, http.StatusInternalServerError, internalError(d, "presence", err)
+		}
+		presenceStates = filterPresence(f, presenceStates)
 	}
 	if len(presenceStates) > 0 {
 		events, err := syncPresenceEvents(presenceStates, timeNow)
@@ -239,45 +268,22 @@ func syncPresenceEvents(states []store.PresenceState, timeNow int64) ([]json.Raw
 func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID string,
 	endKey streamtoken.RoomKey, timeNow int64, cfg clientevent.Config,
 	accountData []store.AccountDataEntry, now streamtoken.Token,
-	useStateAfter bool) (map[string]any, error) {
+	useStateAfter bool, f *filter.Collection, deviceID string, initial bool) (map[string]any, error) {
 
-	// Load twice the timeline limit, because visibility filtering happens after
-	// and would otherwise leave the timeline short. Synapse's
-	// `load_limit = max(timeline_limit * 2, 10)`.
-	loadLimit := defaultTimelineLimit * 2
-	if loadLimit < 10 {
-		loadLimit = 10
-	}
-	messages, pageStart, limited, err := d.Store.PaginateBackwards(ctx, room.RoomID,
-		room.RoomVersion, loadLimit, endKey)
+	messages, memberships, start, limited, err := loadFilteredRecents(ctx, d, room, userID,
+		endKey, timeNow, f)
 	if err != nil {
 		return nil, err
 	}
 
-	// A state event that is still part of current state is shown regardless of
-	// history visibility: a client that can see the current state gains nothing
-	// from having the event that established it withheld.
-	alwaysInclude, err := stateEventIDsInCurrentState(ctx, d, messages)
-	if err != nil {
-		return nil, err
-	}
-
-	messages, memberships, err := filterVisibleAlways(ctx, d, room.RoomID, userID, messages,
-		false, timeNow, alwaysInclude)
-	if err != nil {
-		return nil, err
-	}
-
-	// Trim to the requested limit, keeping the NEWEST events. The token form
-	// changes with it: a trimmed page reports a live position just before the
-	// first event kept, an untrimmed one reports where the topological walk
-	// stopped.
-	start := pageStart
-	if len(messages) > defaultTimelineLimit {
-		limited = true
-		messages = messages[len(messages)-defaultTimelineLimit:]
-		memberships = memberships[len(memberships)-defaultTimelineLimit:]
-		start = streamtoken.Live(messages[0].StreamOrdering - 1)
+	// Lazy loading restricts the state block to the memberships this timeline
+	// actually needs. Our own membership is always included on a full-state
+	// sync: without it a client cannot tell whether it is still in the room,
+	// and Element got this wrong for exactly that reason (riot-web#7209).
+	var stateMembers map[string]bool
+	if f.LazyLoadMembers() {
+		stateMembers = timelineMembers(messages, useStateAfter)
+		stateMembers[userID] = true
 	}
 
 	// The `state` block is what the client needs to interpret the timeline that
@@ -293,11 +299,35 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 		if err != nil {
 			return nil, err
 		}
+		restrictToMembers(stateIDs, stateMembers)
 		dropAliases(stateIDs)
 	} else {
-		stateIDs, err = syncStateBlock(ctx, d, room, messages, endKey)
+		stateIDs, err = syncStateBlock(ctx, d, room, messages, endKey, stateMembers)
 		if err != nil {
 			return nil, err
+		}
+	}
+	dedupeLazyMembers(d, f, userID, deviceID, stateIDs, messages, initial)
+
+	// The summary is computed BEFORE the state block is loaded, because it can
+	// add to it: a hero whose membership the client has never been sent is
+	// added here, and would otherwise be named in the summary with no profile
+	// to render.
+	summary := map[string]any{}
+	var summaryValue any = summary
+	if wantSummary(f, messages, stateIDs, limited, initial) {
+		computed, err := roomSummary(ctx, d, room.RoomID, userID, deviceID, f, stateIDs,
+			messages, endKey)
+		if err != nil {
+			return nil, err
+		}
+		// A room with no events at all reports a null summary, not an empty
+		// one: Synapse assigns compute_summary's None straight into the
+		// response.
+		if computed == nil {
+			summaryValue = nil
+		} else {
+			summaryValue = computed
 		}
 	}
 
@@ -310,6 +340,7 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 	if err != nil {
 		return nil, err
 	}
+	stateEventIDs = filterStateBlock(f, room.RoomID, stateEventIDs, stateEvents)
 
 	ids := timelineEventIDs(messages)
 	ids = append(ids, stateEventIDs...)
@@ -394,30 +425,34 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 		stateJSON = append(stateJSON, body)
 	}
 
-	adEvents, err := accountDataEvents(accountData)
+	adEvents, err := accountDataEvents(filterAccountDataEntries(f, room.RoomID, accountData))
 	if err != nil {
 		return nil, err
 	}
 
-	receiptsByRoom, err := d.Store.MultiRoomReceipts(ctx, []string{room.RoomID}, now.Receipt.MaxStreamPos())
-	if err != nil {
-		return nil, err
-	}
-	receiptRows := receiptsByRoom[room.RoomID]
 	ephemeral := []json.RawMessage{}
-	// withThreads: /sync uses the multi-room receipt path, which selects
-	// thread_id and applies MSC4102 -- unlike /rooms/{id}/initialSync.
-	if ev, err := receiptEvent(room.RoomID, receiptRows, userID, true); err != nil {
-		return nil, err
-	} else if ev != nil {
-		// /sync's ephemeral receipts carry no room_id: the room is the key.
-		ephemeral = append(ephemeral, stripRoomID(ev))
-	}
+	if !f.BlocksAllRoomEphemeral() {
+		receiptsByRoom, err := d.Store.MultiRoomReceipts(ctx, []string{room.RoomID}, now.Receipt.MaxStreamPos())
+		if err != nil {
+			return nil, err
+		}
+		receiptRows := receiptsByRoom[room.RoomID]
+		// withThreads: /sync uses the multi-room receipt path, which selects
+		// thread_id and applies MSC4102 -- unlike /rooms/{id}/initialSync.
+		if ev, err := receiptEvent(room.RoomID, receiptRows, userID, true); err != nil {
+			return nil, err
+		} else if ev != nil {
+			ephemeral = append(ephemeral, ev)
+		}
 
-	if ev, err := typingEvent(d, room.RoomID); err != nil {
-		return nil, err
-	} else if ev != nil {
-		ephemeral = append(ephemeral, ev)
+		if ev, err := typingEvent(d, room.RoomID); err != nil {
+			return nil, err
+		} else if ev != nil {
+			ephemeral = append(ephemeral, ev)
+		}
+		// The filter sees the room_id, which is stripped only afterwards:
+		// Synapse filters the dict it built and removes the key on the way out.
+		ephemeral = stripRoomIDs(filterEphemeral(f, room.RoomID, ephemeral))
 	}
 
 	unread, err := d.Store.UnreadNotifications(ctx, room.RoomID, userID)
@@ -438,12 +473,11 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 			"notification_count": unread.NotifyCount,
 			"highlight_count":    unread.HighlightCount,
 		},
-		// Synapse computes a summary only when the filter enables lazy-loading
-		// of members (handlers/sync.py:3242), because that is when a client
-		// lacks the memberships to name the room itself. With the default
-		// filter it sends an empty object -- not a populated one, and not a
-		// missing key.
-		"summary": map[string]any{},
+		// A summary is computed only when the filter enables lazy-loading of
+		// members, because that is when a client lacks the memberships to name
+		// the room itself. Otherwise the key is present and empty -- not
+		// populated, and not missing.
+		"summary": summaryValue,
 		// MSC2654, enabled on this deployment.
 		"org.matrix.msc2654.unread_count": unread.UnreadCount,
 	}, nil
@@ -465,7 +499,8 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 // Events carried by the timeline itself are subtracted: sending them twice
 // would be redundant, and Synapse does not.
 func syncStateBlock(ctx context.Context, d Deps, room store.RoomForUser,
-	messages []store.TimelineEvent, endKey streamtoken.RoomKey) (map[store.StateKey]string, error) {
+	messages []store.TimelineEvent, endKey streamtoken.RoomKey,
+	members map[string]bool) (map[store.StateKey]string, error) {
 
 	// The state at the END of the timeline -- which is the now token, NOT the
 	// room's current state. They differ whenever the room changed between the
@@ -476,6 +511,7 @@ func syncStateBlock(ctx context.Context, d Deps, room store.RoomForUser,
 	if err != nil {
 		return nil, err
 	}
+	restrictToMembers(end, members)
 
 	start := end
 	if len(messages) > 0 {
@@ -490,6 +526,7 @@ func syncStateBlock(ctx context.Context, d Deps, room store.RoomForUser,
 			if err != nil {
 				return nil, err
 			}
+			restrictToMembers(start, members)
 		}
 	}
 
@@ -601,7 +638,7 @@ func dropAliases(state map[store.StateKey]string) {
 // wakes it. Registering afterwards loses everything that arrives in the gap,
 // and the client hangs for its full timeout on news that had already come.
 func longPoll(r *http.Request, d Deps, verdict auth.Verdict, since string,
-	useStateAfter bool, ann *server.Annotation) ([]byte, int, *matrixerr.Error) {
+	useStateAfter bool, f *filter.Collection, ann *server.Annotation) ([]byte, int, *matrixerr.Error) {
 
 	timeout := time.Duration(intParam(r, "timeout", 0)) * time.Millisecond
 	if ann != nil {
@@ -610,7 +647,7 @@ func longPoll(r *http.Request, d Deps, verdict auth.Verdict, since string,
 	// A pinned request is a comparison, not a client: waiting would only make
 	// the comparator slow, and the window is fixed anyway.
 	if timeout <= 0 || r.URL.Query().Get("_gosync_now") != "" || d.Notifier == nil {
-		return incrementalSync(r, d, verdict, since, useStateAfter)
+		return incrementalSync(r, d, verdict, since, useStateAfter, f)
 	}
 	if timeout > maxSyncTimeout {
 		timeout = maxSyncTimeout
@@ -635,7 +672,7 @@ func longPoll(r *http.Request, d Deps, verdict auth.Verdict, since string,
 
 		handle := d.Notifier.Register(roomIDs, []string{verdict.UserID})
 
-		body, status, mxErr := incrementalSync(r, d, verdict, since, useStateAfter)
+		body, status, mxErr := incrementalSync(r, d, verdict, since, useStateAfter, f)
 		if mxErr != nil || !isEmptySync(body) {
 			handle.Close()
 			if ann != nil {

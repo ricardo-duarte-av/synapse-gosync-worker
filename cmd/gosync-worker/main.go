@@ -23,6 +23,7 @@ import (
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/auth"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/config"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/handlers"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/lazyload"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/metrics"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/notifier"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/pushrules"
@@ -160,8 +161,14 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 		MSC4354Enabled: cfg.Experimental.MSC4354Enabled,
 		MSC3391Enabled: cfg.Experimental.MSC3391Enabled,
 		MSC4222Enabled: cfg.Experimental.MSC4222Enabled,
-		Replication:    sub,
-		Notifier:       notif,
+		MSC3773Enabled: cfg.Experimental.MSC3773Enabled,
+		MSC3874Enabled: cfg.Experimental.MSC3874Enabled,
+		// Synapse caps an inline filter's timeline limit at 100 by default.
+		FilterTimelineLimit: cfg.TimelineLimitCap(),
+		Replication:         sub,
+		Notifier:            notif,
+		LazyLoad: lazyload.New(cfg.Caches.LazyLoadMembersCacheSize,
+			cfg.Caches.LazyLoadMembersCacheTTL),
 		PushRuleFeatures: pushrules.Features{
 			MSC1767Enabled:             cfg.Experimental.MSC1767Enabled,
 			MSC3381PollsEnabled:        cfg.Experimental.MSC3381PollsEnabled,

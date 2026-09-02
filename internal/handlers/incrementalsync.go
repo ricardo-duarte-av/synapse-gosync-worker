@@ -9,6 +9,7 @@ import (
 
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/auth"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/clientevent"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/filter"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/matrixerr"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/server"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/store"
@@ -23,7 +24,7 @@ import (
 // (`_generate_room_entry`), and a response where nothing at all happened has no
 // `rooms` key whatsoever.
 func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw string,
-	useStateAfter bool) (
+	useStateAfter bool, f *filter.Collection) (
 	[]byte, int, *matrixerr.Error) {
 
 	ctx := r.Context()
@@ -69,38 +70,55 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 	if tokenID, err := d.Store.AccessTokenID(ctx, auth.ExtractToken(r)); err == nil {
 		requester.TokenID = tokenID
 	}
-	cfg := clientevent.Config{Format: clientevent.FormatV2NoRoomID, Requester: requester,
-		MSC4354Enabled: d.MSC4354Enabled}
+	cfg := clientevent.Config{
+		Format:         eventFormat(f, clientevent.FormatV2NoRoomID),
+		Requester:      requester,
+		MSC4354Enabled: d.MSC4354Enabled,
+		EventFields:    f.EventFields,
+	}
 	strippedCfg := cfg
 	strippedCfg.IncludeStrippedRoomState = true
 
+	timelineLimit := f.TimelineLimit()
 	// Load twice the limit, as Synapse does: visibility filtering happens after
 	// and would otherwise leave the timeline short, and a short timeline shifts
 	// both prev_batch and the state delta that hangs off its first event.
-	loadLimit := defaultTimelineLimit * 2
+	loadLimit := timelineLimit * 2
 	if loadLimit < 10 {
 		loadLimit = 10
 	}
-	timelines, err := d.Store.RoomTimelineSince(ctx, joinedIDs, roomVersions,
-		sincePos, nowPos, loadLimit)
-	if err != nil {
-		return nil, http.StatusInternalServerError, internalError(d, "room timelines", err)
+	timelines := map[string][]store.TimelineEvent{}
+	if !f.BlocksAllRooms() && !f.BlocksAllRoomTimeline() && timelineLimit > 0 {
+		timelines, err = d.Store.RoomTimelineSince(ctx, joinedIDs, roomVersions,
+			sincePos, nowPos, loadLimit)
+		if err != nil {
+			return nil, http.StatusInternalServerError, internalError(d, "room timelines", err)
+		}
 	}
 
-	accountDataByRoom, err := d.Store.RoomAccountDataSince(ctx, verdict.UserID,
-		since.AccountData, now.AccountData, d.MSC3391Enabled)
-	if err != nil {
-		return nil, http.StatusInternalServerError, internalError(d, "room account data", err)
+	accountDataByRoom := map[string][]store.AccountDataEntry{}
+	if !f.BlocksAllRooms() && !f.BlocksAllRoomAccountData() {
+		accountDataByRoom, err = d.Store.RoomAccountDataSince(ctx, verdict.UserID,
+			since.AccountData, now.AccountData, d.MSC3391Enabled)
+		if err != nil {
+			return nil, http.StatusInternalServerError, internalError(d, "room account data", err)
+		}
 	}
-	receiptsByRoom, err := d.Store.ReceiptsSince(ctx, joinedIDs,
-		since.Receipt.MaxStreamPos(), now.Receipt.MaxStreamPos())
-	if err != nil {
-		return nil, http.StatusInternalServerError, internalError(d, "receipts", err)
+	receiptsByRoom := map[string][]store.ReceiptRow{}
+	if !f.BlocksAllRooms() && !f.BlocksAllRoomEphemeral() {
+		receiptsByRoom, err = d.Store.ReceiptsSince(ctx, joinedIDs,
+			since.Receipt.MaxStreamPos(), now.Receipt.MaxStreamPos())
+		if err != nil {
+			return nil, http.StatusInternalServerError, internalError(d, "receipts", err)
+		}
 	}
 
 	joinedRooms := map[string]any{}
 	var newlyJoined []string
 	for _, room := range rooms {
+		if f.BlocksAllRooms() {
+			break
+		}
 		if room.Membership != "join" {
 			continue
 		}
@@ -117,7 +135,7 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 		if wasJoined != "join" {
 			newlyJoined = append(newlyJoined, room.RoomID)
 			entry, err := syncRoomEntry(ctx, d, room, verdict.UserID, now.Room, timeNow, cfg,
-				accountDataByRoom[room.RoomID], now, useStateAfter)
+				accountDataByRoom[room.RoomID], now, useStateAfter, f, verdict.DeviceID, false)
 			if err != nil {
 				return nil, http.StatusInternalServerError, internalError(d, "room entry", err)
 			}
@@ -131,9 +149,10 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 					return nil, http.StatusInternalServerError, internalError(d, "receipts", err)
 				}
 				if ev != nil {
-					ephemeral = append(ephemeral, stripRoomID(ev))
+					ephemeral = append(ephemeral, ev)
 				}
 			}
+			ephemeral = stripRoomIDs(filterEphemeral(f, room.RoomID, ephemeral))
 			entry["ephemeral"] = map[string]any{"events": ephemeral}
 			joinedRooms[room.RoomID] = entry
 			continue
@@ -141,7 +160,8 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 
 		entry, err := incrementalRoomEntry(ctx, d, room, verdict.UserID, since, now,
 			timeNow, cfg, timelines[room.RoomID],
-			accountDataByRoom[room.RoomID], receiptsByRoom[room.RoomID], loadLimit, useStateAfter)
+			accountDataByRoom[room.RoomID], receiptsByRoom[room.RoomID], loadLimit,
+			useStateAfter, f, verdict.DeviceID)
 		if err != nil {
 			return nil, http.StatusInternalServerError, internalError(d, "room entry", err)
 		}
@@ -193,6 +213,12 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 	for roomID, c := range lastChange {
 		switch c.Membership {
 		case "leave", "ban":
+			// A room the caller left of their own accord is omitted unless the
+			// filter asks for it; a kick or a ban is always reported, because
+			// the client would otherwise have no way to learn it happened.
+			if !f.IncludeLeave && c.Membership == "leave" && c.Sender == verdict.UserID {
+				continue
+			}
 			if _, stillJoined := timelines[roomID]; stillJoined {
 				continue
 			}
@@ -200,7 +226,7 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 				continue
 			}
 			entry, err := archivedRoomEntry(ctx, d, roomID, verdict.UserID, c,
-				since, now, timeNow, cfg, d.MSC3391Enabled, useStateAfter)
+				since, now, timeNow, cfg, d.MSC3391Enabled, useStateAfter, f)
 			if err != nil {
 				return nil, http.StatusInternalServerError, internalError(d, "archived room", err)
 			}
@@ -235,22 +261,30 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 
 	resp := map[string]any{"next_batch": now.String()}
 
-	globalAD, err := d.Store.GlobalAccountDataSince(ctx, verdict.UserID,
-		since.AccountData, now.AccountData, d.MSC3391Enabled)
-	if err != nil {
-		return nil, http.StatusInternalServerError, internalError(d, "global account data", err)
-	}
-	if len(globalAD) > 0 {
-		events, err := accountDataEvents(globalAD)
+	if !f.BlocksAllGlobalAccountData() {
+		globalAD, err := d.Store.GlobalAccountDataSince(ctx, verdict.UserID,
+			since.AccountData, now.AccountData, d.MSC3391Enabled)
 		if err != nil {
 			return nil, http.StatusInternalServerError, internalError(d, "global account data", err)
 		}
-		resp["account_data"] = map[string]any{"events": events}
+		if len(globalAD) > 0 {
+			events, err := accountDataEvents(globalAD)
+			if err != nil {
+				return nil, http.StatusInternalServerError, internalError(d, "global account data", err)
+			}
+			events = filterAccountDataEvents(f, "", events)
+			if len(events) > 0 {
+				resp["account_data"] = map[string]any{"events": events}
+			}
+		}
 	}
 
-	presenceStates, err := d.Store.PresenceSince(ctx, verdict.UserID, since.Presence, now.Presence)
-	if err != nil {
-		return nil, http.StatusInternalServerError, internalError(d, "presence", err)
+	var presenceStates []store.PresenceState
+	if !f.BlocksAllPresence() {
+		presenceStates, err = d.Store.PresenceSince(ctx, verdict.UserID, since.Presence, now.Presence)
+		if err != nil {
+			return nil, http.StatusInternalServerError, internalError(d, "presence", err)
+		}
 	}
 	// Joining a room entitles the caller to the presence of everyone already in
 	// it, whatever the presence stream has been doing. Without this, a client
@@ -261,7 +295,10 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 	// they were already in. Neither group need have touched the presence
 	// stream, so neither is found by the window query above.
 	extraUsers := append([]string(nil), joinedOrInvited...)
-	if len(newlyJoined) > 0 {
+	if f.BlocksAllPresence() {
+		extraUsers = nil
+	}
+	if len(newlyJoined) > 0 && !f.BlocksAllPresence() {
 		members, err := d.Store.JoinedMembersOf(ctx, newlyJoined)
 		if err != nil {
 			return nil, http.StatusInternalServerError, internalError(d, "newly joined members", err)
@@ -310,6 +347,7 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 		}
 		presenceStates = merged
 	}
+	presenceStates = filterPresence(f, presenceStates)
 	if len(presenceStates) > 0 {
 		events, err := syncPresenceEvents(presenceStates, timeNow)
 		if err != nil {
@@ -406,11 +444,41 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 func incrementalRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID string,
 	since, now streamtoken.Token, timeNow int64, cfg clientevent.Config,
 	raw []store.TimelineEvent, accountData []store.AccountDataEntry,
-	receipts []store.ReceiptRow, loadLimit int, useStateAfter bool) (map[string]any, error) {
+	receipts []store.ReceiptRow, loadLimit int, useStateAfter bool,
+	f *filter.Collection, deviceID string) (map[string]any, error) {
+
+	timelineLimit := f.TimelineLimit()
+
+	// A hole in the room's history inside this window changes the question. The
+	// events after the gap are not a continuation of the ones before it, so
+	// Synapse throws away what it loaded, re-paginates from the sync point back
+	// to the gap, and marks the timeline limited -- leaving the client to
+	// paginate across the hole itself rather than handing it two disjoint runs
+	// of events as though they were one.
+	sinceKey := &since.Room
+	gapStream, gap, err := d.Store.TimelineGap(ctx, room.RoomID, sinceKey, now.Room)
+	if err != nil {
+		return nil, err
+	}
+	if gap {
+		byRoom, err := d.Store.RoomTimelineSince(ctx, []string{room.RoomID},
+			map[string]string{room.RoomID: room.RoomVersion},
+			gapStream, now.Room.MaxStreamPos(), loadLimit)
+		if err != nil {
+			return nil, err
+		}
+		raw = byRoom[room.RoomID]
+	}
 
 	// More were loaded than will be returned, so hitting the load limit already
 	// means the window held more than fits.
-	limited := len(raw) >= loadLimit
+	limited := len(raw) >= loadLimit || gap
+
+	raw = filterTimeline(f, room.RoomID, raw)
+	raw, err = applyRelationFilter(ctx, d, f.TimelineFilter(), raw)
+	if err != nil {
+		return nil, err
+	}
 
 	// A state event still in current state is shown regardless of history
 	// visibility: withholding it from a client that can already see the state
@@ -426,10 +494,62 @@ func incrementalRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, u
 	}
 
 	// Trim to the limit, keeping the newest.
-	if len(messages) > defaultTimelineLimit {
+	if len(messages) > timelineLimit {
 		limited = true
-		messages = messages[len(messages)-defaultTimelineLimit:]
-		memberships = memberships[len(memberships)-defaultTimelineLimit:]
+		messages = messages[len(messages)-timelineLimit:]
+		memberships = memberships[len(memberships)-timelineLimit:]
+	}
+	// A filter that blocks the timeline outright reports it as unlimited: there
+	// is nothing for the client to paginate towards, because /messages applies
+	// the same filter.
+	if f.BlocksAllRoomTimeline() {
+		limited = false
+	}
+
+	adEvents, err := accountDataEvents(filterAccountDataEntries(f, room.RoomID, accountData))
+	if err != nil {
+		return nil, err
+	}
+
+	ephemeral := []json.RawMessage{}
+	if !f.BlocksAllRoomEphemeral() {
+		if len(receipts) > 0 {
+			ev, err := receiptEvent(room.RoomID, receipts, userID, true)
+			if err != nil {
+				return nil, err
+			}
+			if ev != nil {
+				ephemeral = append(ephemeral, ev)
+			}
+		}
+
+		if ev, err := typingEvent(d, room.RoomID); err != nil {
+			return nil, err
+		} else if ev != nil {
+			ephemeral = append(ephemeral, ev)
+		}
+		ephemeral = stripRoomIDs(filterEphemeral(f, room.RoomID, ephemeral))
+	}
+
+	// A room with nothing in it is left out of the response entirely.
+	//
+	// Deliberately BEFORE the state delta, and deliberately not counting it.
+	// Synapse decides this in `_generate_room_entry` before calling
+	// compute_state_delta, so a room whose only news is a state change outside
+	// the timeline is dropped -- the state block cannot keep a room alive on
+	// its own. Checking afterwards, and counting state, emits rooms Synapse
+	// omits; that only shows once a filter can empty the timeline while
+	// leaving a state delta behind.
+	if len(messages) == 0 && len(adEvents) == 0 && len(ephemeral) == 0 {
+		return nil, nil
+	}
+
+	// Lazy loading restricts the state block to the memberships this timeline
+	// needs. Unlike a full-state sync, our own membership is NOT added: the
+	// client already has it, and Synapse only forces it in on the full path.
+	var stateMembers map[string]bool
+	if f.LazyLoadMembers() {
+		stateMembers = timelineMembers(messages, useStateAfter)
 	}
 
 	// MSC4222 reports what current state BECAME over the window, taken straight
@@ -442,39 +562,46 @@ func incrementalRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, u
 		if err != nil {
 			return nil, err
 		}
+		// Lazy loading does not narrow the delta stream: Synapse deliberately
+		// returns every state change over the window, LL members included,
+		// because a client that missed a membership change cannot ask for it
+		// later (riot-web#7211). What lazy loading adds here is the memberships
+		// of timeline senders, which the delta stream would not carry if they
+		// did not change.
+		if len(stateMembers) > 0 {
+			current, err := d.Store.CurrentStateIDs(ctx, room.RoomID)
+			if err != nil {
+				return nil, err
+			}
+			for k, id := range keepOnlyMembers(current, stateMembers) {
+				if _, ok := stateIDs[k]; !ok {
+					stateIDs[k] = id
+				}
+			}
+		}
 		dropAliases(stateIDs)
 	} else {
-		stateIDs, err = incrementalStateDelta(ctx, d, room, messages, limited, since, now)
+		stateIDs, err = incrementalStateDelta(ctx, d, room, messages, limited, since, now,
+			stateMembers)
 		if err != nil {
 			return nil, err
 		}
 	}
+	dedupeLazyMembers(d, f, userID, deviceID, stateIDs, messages, false)
 
-	adEvents, err := accountDataEvents(accountData)
-	if err != nil {
-		return nil, err
-	}
-
-	ephemeral := []json.RawMessage{}
-	if len(receipts) > 0 {
-		ev, err := receiptEvent(room.RoomID, receipts, userID, true)
+	summary := map[string]any{}
+	var summaryValue any = summary
+	if wantSummary(f, messages, stateIDs, limited, false) {
+		computed, err := roomSummary(ctx, d, room.RoomID, userID, deviceID, f, stateIDs,
+			messages, now.Room)
 		if err != nil {
 			return nil, err
 		}
-		if ev != nil {
-			ephemeral = append(ephemeral, stripRoomID(ev))
+		if computed == nil {
+			summaryValue = nil
+		} else {
+			summaryValue = computed
 		}
-	}
-
-	if ev, err := typingEvent(d, room.RoomID); err != nil {
-		return nil, err
-	} else if ev != nil {
-		ephemeral = append(ephemeral, ev)
-	}
-
-	// A room with nothing in it is left out of the response entirely.
-	if len(messages) == 0 && len(stateIDs) == 0 && len(adEvents) == 0 && len(ephemeral) == 0 {
-		return nil, nil
 	}
 
 	stateEventIDs := make([]string, 0, len(stateIDs))
@@ -485,6 +612,7 @@ func incrementalRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, u
 	if err != nil {
 		return nil, err
 	}
+	stateEventIDs = filterStateBlock(f, room.RoomID, stateEventIDs, stateEvents)
 
 	ids := timelineEventIDs(messages)
 	ids = append(ids, stateEventIDs...)
@@ -587,7 +715,7 @@ func incrementalRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, u
 			"notification_count": unread.NotifyCount,
 			"highlight_count":    unread.HighlightCount,
 		},
-		"summary":                         map[string]any{},
+		"summary":                         summaryValue,
 		"org.matrix.msc2654.unread_count": unread.UnreadCount,
 	}, nil
 }
@@ -601,7 +729,7 @@ func incrementalRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, u
 // be waste. Only a gap, or a fork in the DAG, makes a state block necessary.
 func incrementalStateDelta(ctx context.Context, d Deps, room store.RoomForUser,
 	messages []store.TimelineEvent, limited bool,
-	since, now streamtoken.Token) (map[store.StateKey]string, error) {
+	since, now streamtoken.Token, members map[string]bool) (map[store.StateKey]string, error) {
 
 	if !limited && len(messages) > 0 {
 		linear, err := isLinearTimeline(ctx, d, room.RoomID, messages, since.Room)
@@ -609,7 +737,18 @@ func incrementalStateDelta(ctx context.Context, d Deps, room store.RoomForUser,
 			return nil, err
 		}
 		if linear {
-			return nil, nil
+			// Under lazy loading the state block is not empty even here: the
+			// client may never have been sent the memberships of the senders in
+			// this timeline, so those alone are returned. The caller dedupes
+			// the ones it has already sent.
+			if len(members) == 0 {
+				return nil, nil
+			}
+			state, err := stateAtEvent(ctx, d, messages[0].EventID)
+			if err != nil {
+				return nil, err
+			}
+			return keepOnlyMembers(state, members), nil
 		}
 	}
 	if !limited && len(messages) == 0 {
@@ -620,15 +759,9 @@ func incrementalStateDelta(ctx context.Context, d Deps, room store.RoomForUser,
 	var start map[store.StateKey]string
 	var err error
 	if len(messages) > 0 {
-		groups, err := d.Store.StateGroupsForEvents(ctx, []string{messages[0].EventID})
+		start, err = stateAtEvent(ctx, d, messages[0].EventID)
 		if err != nil {
 			return nil, err
-		}
-		if group, ok := groups[messages[0].EventID]; ok {
-			start, err = d.Store.FullStateForGroup(ctx, group)
-			if err != nil {
-				return nil, err
-			}
 		}
 	}
 	if start == nil {
@@ -637,17 +770,46 @@ func incrementalStateDelta(ctx context.Context, d Deps, room store.RoomForUser,
 			return nil, err
 		}
 	}
+	// The timeline start keeps the lazy-load restriction even on a gappy sync.
+	// That looks backwards and is deliberate: _calculate_state works out which
+	// members to send by subtracting the restricted timeline_start from what
+	// the client already had, so restricting it is what lets the unrestricted
+	// state at either end supply the rest.
+	restrictToMembers(start, members)
+
+	// A gappy sync turns lazy loading OFF for the two full state fetches. The
+	// client has missed events it will never be shown, so it cannot rebuild
+	// state from the timeline and needs the lot.
+	ends := members
+	if limited {
+		ends = nil
+	}
 
 	previous, err := d.Store.StateIDsAt(ctx, room.RoomID, since.Room)
 	if err != nil {
 		return nil, err
 	}
+	restrictToMembers(previous, ends)
 	end, err := d.Store.StateIDsAt(ctx, room.RoomID, now.Room)
 	if err != nil {
 		return nil, err
 	}
+	restrictToMembers(end, ends)
 
-	return calculateState(start, end, previous, messages), nil
+	return calculateState(start, end, previous, messages, members != nil), nil
+}
+
+// stateAtEvent resolves the state at (strictly, just after) one event.
+func stateAtEvent(ctx context.Context, d Deps, eventID string) (map[store.StateKey]string, error) {
+	groups, err := d.Store.StateGroupsForEvents(ctx, []string{eventID})
+	if err != nil {
+		return nil, err
+	}
+	group, ok := groups[eventID]
+	if !ok {
+		return nil, nil
+	}
+	return d.Store.FullStateForGroup(ctx, group)
 }
 
 // isLinearTimeline reports whether the timeline is an unbroken chain from the
@@ -697,7 +859,7 @@ func prevEventID(entry gjson.Result) string {
 // `previous_timeline_end` is what makes an incremental sync incremental: state
 // the client already had is subtracted, so only what changed is sent.
 func calculateState(start, end, previous map[store.StateKey]string,
-	messages []store.TimelineEvent) map[store.StateKey]string {
+	messages []store.TimelineEvent, lazyLoadMembers bool) map[store.StateKey]string {
 
 	// The last state event per key in the timeline, not every one: an earlier
 	// change to the same key still belongs in the state block.
@@ -707,18 +869,34 @@ func calculateState(start, end, previous map[store.StateKey]string,
 			timelineContains[store.StateKey{Type: ev.Type, StateKey: ev.StateKey}] = ev.EventID
 		}
 	}
-	excluded := map[string]bool{}
+	inTimeline := map[string]bool{}
 	for _, id := range timelineContains {
-		excluded[id] = true
+		inTimeline[id] = true
 	}
+	alreadySent := map[string]bool{}
 	for _, id := range previous {
-		excluded[id] = true
+		alreadySent[id] = true
+	}
+	// Under lazy loading, a membership present at the timeline start is sent
+	// even if the client already had it at the end of the previous sync. It has
+	// to be: `start` was restricted to the timeline's senders, and the client
+	// may never have been sent those memberships at all -- "already had it"
+	// here means "the state said so", not "we told them".
+	//
+	// Only this set is relaxed. An event carried by the timeline itself is
+	// still subtracted, lazy loading or not.
+	if lazyLoadMembers {
+		for k, id := range start {
+			if k.Type == memberType {
+				delete(alreadySent, id)
+			}
+		}
 	}
 
 	out := map[store.StateKey]string{}
 	for _, m := range []map[store.StateKey]string{start, end} {
 		for k, id := range m {
-			if excluded[id] || k.Type == "m.room.aliases" {
+			if inTimeline[id] || alreadySent[id] || k.Type == "m.room.aliases" {
 				continue
 			}
 			out[k] = id
@@ -857,8 +1035,10 @@ func isCurrentlyJoined(rooms []store.RoomForUser, roomID string) bool {
 // counts, no summary. Those describe a room you are in.
 func archivedRoomEntry(ctx context.Context, d Deps, roomID, userID string,
 	change store.MembershipChange, since, now streamtoken.Token, timeNow int64,
-	cfg clientevent.Config, msc3391, useStateAfter bool) (map[string]any, error) {
+	cfg clientevent.Config, msc3391, useStateAfter bool,
+	f *filter.Collection) (map[string]any, error) {
 
+	timelineLimit := f.TimelineLimit()
 	info, err := d.Store.RoomInfo(ctx, roomID)
 	if err != nil {
 		return nil, err
@@ -881,7 +1061,7 @@ func archivedRoomEntry(ctx context.Context, d Deps, roomID, userID string,
 			}}
 		}
 	} else {
-		loadLimit := defaultTimelineLimit * 2
+		loadLimit := timelineLimit * 2
 		if loadLimit < 10 {
 			loadLimit = 10
 		}
@@ -894,19 +1074,31 @@ func archivedRoomEntry(ctx context.Context, d Deps, roomID, userID string,
 		raw = byRoom[roomID]
 	}
 
-	limited := len(raw) >= defaultTimelineLimit*2
+	limited := len(raw) >= timelineLimit*2
+	raw = filterTimeline(f, roomID, raw)
+	raw, err = applyRelationFilter(ctx, d, f.TimelineFilter(), raw)
+	if err != nil {
+		return nil, err
+	}
 	messages, memberships, err := filterVisible(ctx, d, roomID, userID, raw, false, timeNow)
 	if err != nil {
 		return nil, err
 	}
-	if len(messages) > defaultTimelineLimit {
+	if len(messages) > timelineLimit {
 		limited = true
-		messages = messages[len(messages)-defaultTimelineLimit:]
-		memberships = memberships[len(memberships)-defaultTimelineLimit:]
+		messages = messages[len(messages)-timelineLimit:]
+		memberships = memberships[len(memberships)-timelineLimit:]
+	}
+	if f.BlocksAllRoomTimeline() {
+		messages, memberships, limited = nil, nil, false
 	}
 
 	room := store.RoomForUser{RoomID: roomID, RoomVersion: info.RoomVersion}
 	endToken := now.WithRoomKey(leaveKey)
+	var stateMembers map[string]bool
+	if f.LazyLoadMembers() {
+		stateMembers = timelineMembers(messages, useStateAfter)
+	}
 	var stateIDs map[store.StateKey]string
 	if !change.OutOfBand {
 		if useStateAfter {
@@ -914,7 +1106,8 @@ func archivedRoomEntry(ctx context.Context, d Deps, roomID, userID string,
 				since.Room.MaxStreamPos(), leaveKey.MaxStreamPos())
 			dropAliases(stateIDs)
 		} else {
-			stateIDs, err = incrementalStateDelta(ctx, d, room, messages, limited, since, endToken)
+			stateIDs, err = incrementalStateDelta(ctx, d, room, messages, limited, since,
+				endToken, stateMembers)
 		}
 		if err != nil {
 			return nil, err
@@ -926,12 +1119,14 @@ func archivedRoomEntry(ctx context.Context, d Deps, roomID, userID string,
 	if err != nil {
 		return nil, err
 	}
-	adEvents, err := accountDataEvents(accountData[roomID])
+	adEvents, err := accountDataEvents(filterAccountDataEntries(f, roomID, accountData[roomID]))
 	if err != nil {
 		return nil, err
 	}
 
-	if len(messages) == 0 && len(stateIDs) == 0 && len(adEvents) == 0 {
+	// As in incrementalRoomEntry: the state block does not keep a room in the
+	// response, because Synapse decides this before it is computed.
+	if len(messages) == 0 && len(adEvents) == 0 {
 		return nil, nil
 	}
 
@@ -943,6 +1138,7 @@ func archivedRoomEntry(ctx context.Context, d Deps, roomID, userID string,
 	if err != nil {
 		return nil, err
 	}
+	stateEventIDs = filterStateBlock(f, roomID, stateEventIDs, stateEvents)
 	redactions, err := d.Store.Redactions(ctx, append(timelineEventIDs(messages), stateEventIDs...))
 	if err != nil {
 		return nil, err
