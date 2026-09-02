@@ -373,7 +373,12 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 	// ended up rather than what it must apply first.
 	var stateIDs map[store.StateKey]string
 	if useStateAfter {
-		stateIDs, err = d.Store.StateIDsAt(ctx, room.RoomID, endKey)
+		if stateMembers != nil {
+			stateIDs, err = d.Store.LazyStateIDsAt(ctx, room.RoomID, endKey,
+				memberList(stateMembers))
+		} else {
+			stateIDs, err = d.Store.StateIDsAt(ctx, room.RoomID, endKey)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -583,12 +588,30 @@ func syncStateBlock(ctx context.Context, d Deps, room store.RoomForUser,
 	messages []store.TimelineEvent, endKey streamtoken.RoomKey,
 	members map[string]bool) (map[store.StateKey]string, error) {
 
+	// A lazy-loading client keeps every non-member state event and the members
+	// its timeline mentions, so that is what is asked for. Resolving the whole
+	// state map and then discarding it is the same answer and a different
+	// order of cost: 500 rooms that way took 209 seconds and 1.5GB on a real
+	// account, because a large public room's state is six figures of members
+	// and every one of them was fetched to be thrown away.
+	//
+	// StateFilter.from_lazy_load_member_list is the same idea upstream.
+	wanted := memberList(members)
+
 	// The state at the END of the timeline -- which is the now token, NOT the
 	// room's current state. They differ whenever the room changed between the
 	// token being minted and this query running, which in a busy room is most
 	// of the time, and the response would then describe state the client's
 	// token does not cover.
-	end, err := d.Store.StateIDsAt(ctx, room.RoomID, endKey)
+	var (
+		end map[store.StateKey]string
+		err error
+	)
+	if members != nil {
+		end, err = d.Store.LazyStateIDsAt(ctx, room.RoomID, endKey, wanted)
+	} else {
+		end, err = d.Store.StateIDsAt(ctx, room.RoomID, endKey)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -603,7 +626,11 @@ func syncStateBlock(ctx context.Context, d Deps, room store.RoomForUser,
 		if group, ok := groups[messages[0].EventID]; ok {
 			// Strictly this is the state *after* the first timeline event
 			// rather than before it, which is what Synapse uses too.
-			start, err = d.Store.FullStateForGroup(ctx, group)
+			if members != nil {
+				start, err = d.Store.LazyStateForGroup(ctx, group, wanted)
+			} else {
+				start, err = d.Store.FullStateForGroup(ctx, group)
+			}
 			if err != nil {
 				return nil, err
 			}

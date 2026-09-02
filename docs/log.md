@@ -871,3 +871,41 @@ than a real client -- scale and history, not behaviour.
 MSC4155 invite rules are the other half of Synapse's test and are not
 implemented. No account on this server has that config, so it changes nothing
 today; recorded in README.md as a gap.
+
+## Lazy state, because 500 rooms cost 209 seconds (2026-09-02)
+
+A real account -- 500 rooms, big public ones among them -- did an initial sync
+against this worker: **223,720,043 bytes in 209 seconds**, at 1.5GB resident.
+The client then spent eight minutes writing it inside one SQLite transaction,
+which locked its own database and made everything else look broken.
+
+The response SIZE turned out to be right. Same request, same account, both
+workers: Synapse 9,607,785 bytes, us 9,583,417 -- 0.25% apart, and we were
+marginally faster at 30 rooms. A fresh login on a 500-room account is simply a
+very large sync, and parity forbids making it smaller.
+
+The 209 seconds and the 1.5GB were ours. `syncStateBlock` resolved each room's
+ENTIRE state map twice -- `StateIDsAt` and `FullStateForGroup` -- and then threw
+nearly all of it away in `restrictToMembers`. On a public room with tens of
+thousands of members that is tens of thousands of rows fetched to keep three.
+`roomHasName` was worse in its way: a full state resolution to answer a yes/no
+question about two keys, once per room per initial sync.
+
+Now the queries ask for what is kept: everything except members, plus the
+members the timeline mentions. Measured on a 3,094-entry room: 49 rows instead
+of 3,094, 6.1ms instead of 14.7ms. The win grows with the room.
+
+### Two things this cost me
+
+I nearly shipped a conclusion twice over. The first timing run showed us at
+5.99s against Synapse's 1.22s and looked like a serious regression -- it was a
+cold cache on a just-started process; warm, we are at 1.0s against 1.1s. And a
+`prev_content.pinned` difference appeared on the new build three runs running
+while the old build passed, which looked exactly like causation; ten minutes
+later it had vanished from both. It was the shared-event-cache artefact in the
+busiest room on the server.
+
+The lazy comparisons then flapped, which was also my fault: two workers were
+running against the same account, and each keeps its own lazy-load member cache.
+With one worker it is 10/10. That is comparability source 8 biting the person
+who wrote it down.

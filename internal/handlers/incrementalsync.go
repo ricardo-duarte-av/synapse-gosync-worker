@@ -767,7 +767,9 @@ func incrementalStateDelta(ctx context.Context, d Deps, room store.RoomForUser,
 			if len(members) == 0 {
 				return nil, nil
 			}
-			state, err := stateAtEvent(ctx, d, messages[0].EventID)
+			// Only the members are kept, so only the members are fetched.
+			state, err := stateAtEvent(ctx, d, messages[0].EventID,
+				members, memberList(members))
 			if err != nil {
 				return nil, err
 			}
@@ -779,16 +781,22 @@ func incrementalStateDelta(ctx context.Context, d Deps, room store.RoomForUser,
 		return nil, nil
 	}
 
+	// Everything below asks the state store for only what a lazy-loading
+	// client keeps, when there is such a restriction. Fetching a large room's
+	// entire state map to discard all but a handful of members is the same
+	// answer at a wholly different cost -- see LazyStateForGroup.
+	wanted := memberList(members)
+
 	var start map[store.StateKey]string
 	var err error
 	if len(messages) > 0 {
-		start, err = stateAtEvent(ctx, d, messages[0].EventID)
+		start, err = stateAtEvent(ctx, d, messages[0].EventID, members, wanted)
 		if err != nil {
 			return nil, err
 		}
 	}
 	if start == nil {
-		start, err = d.Store.StateIDsAt(ctx, room.RoomID, now.Room)
+		start, err = stateIDsAtFor(ctx, d, room.RoomID, now.Room, members, wanted)
 		if err != nil {
 			return nil, err
 		}
@@ -808,12 +816,13 @@ func incrementalStateDelta(ctx context.Context, d Deps, room store.RoomForUser,
 		ends = nil
 	}
 
-	previous, err := d.Store.StateIDsAt(ctx, room.RoomID, since.Room)
+	endWanted := memberList(ends)
+	previous, err := stateIDsAtFor(ctx, d, room.RoomID, since.Room, ends, endWanted)
 	if err != nil {
 		return nil, err
 	}
 	restrictToMembers(previous, ends)
-	end, err := d.Store.StateIDsAt(ctx, room.RoomID, now.Room)
+	end, err := stateIDsAtFor(ctx, d, room.RoomID, now.Room, ends, endWanted)
 	if err != nil {
 		return nil, err
 	}
@@ -822,8 +831,11 @@ func incrementalStateDelta(ctx context.Context, d Deps, room store.RoomForUser,
 	return calculateState(start, end, previous, messages, members != nil), nil
 }
 
-// stateAtEvent resolves the state at (strictly, just after) one event.
-func stateAtEvent(ctx context.Context, d Deps, eventID string) (map[store.StateKey]string, error) {
+// stateAtEvent resolves the state at (strictly, just after) one event,
+// restricted to what a lazy-loading client keeps when there is a restriction.
+func stateAtEvent(ctx context.Context, d Deps, eventID string,
+	members map[string]bool, wanted []string) (map[store.StateKey]string, error) {
+
 	groups, err := d.Store.StateGroupsForEvents(ctx, []string{eventID})
 	if err != nil {
 		return nil, err
@@ -832,7 +844,20 @@ func stateAtEvent(ctx context.Context, d Deps, eventID string) (map[store.StateK
 	if !ok {
 		return nil, nil
 	}
+	if members != nil {
+		return d.Store.LazyStateForGroup(ctx, group, wanted)
+	}
 	return d.Store.FullStateForGroup(ctx, group)
+}
+
+// stateIDsAtFor is StateIDsAt, lazy when the caller is lazy-loading.
+func stateIDsAtFor(ctx context.Context, d Deps, roomID string, key streamtoken.RoomKey,
+	members map[string]bool, wanted []string) (map[store.StateKey]string, error) {
+
+	if members != nil {
+		return d.Store.LazyStateIDsAt(ctx, roomID, key, wanted)
+	}
+	return d.Store.StateIDsAt(ctx, roomID, key)
 }
 
 // isLinearTimeline reports whether the timeline is an unbroken chain from the

@@ -28,6 +28,69 @@ const fullStateGroupQuery = `
 	  INNER JOIN sgs USING (state_group)
 	 ORDER BY type, state_key, state_group DESC`
 
+// lazyStateGroupQuery resolves the state at a group, keeping every type except
+// m.room.member and only the member events for the named users.
+//
+// This is StateFilter.from_lazy_load_member_list in SQL. It matters far more
+// than it looks: the full query walks every state event in the room, and in a
+// large public room that is six figures of members, nearly all of which a
+// lazy-loading client is about to discard. Resolving 500 rooms that way cost
+// 209 seconds and 1.5GB on a real account; the members a timeline actually
+// mentions are a handful.
+const lazyStateGroupQuery = `
+	WITH RECURSIVE sgs(state_group) AS (
+		VALUES($1::bigint)
+	  UNION ALL
+		SELECT prev_state_group FROM state_group_edges e, sgs s
+		WHERE s.state_group = e.state_group
+	)
+	SELECT DISTINCT ON (type, state_key) type, state_key, event_id
+	  FROM state_groups_state
+	  INNER JOIN sgs USING (state_group)
+	 WHERE type <> 'm.room.member' OR state_key = ANY($2)
+	 ORDER BY type, state_key, state_group DESC`
+
+// LazyStateForGroup resolves the state at a group for a lazy-loading client:
+// everything except member events, plus the members named.
+//
+// A nil or empty member list still returns all the non-member state, which is
+// what a lazy-loading sync of a room whose timeline mentions nobody needs.
+func (s *Store) LazyStateForGroup(ctx context.Context, group int64, members []string) (
+	map[StateKey]string, error) {
+
+	if members == nil {
+		members = []string{}
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, fmt.Errorf("store: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `SET LOCAL enable_seqscan = off`); err != nil {
+		return nil, fmt.Errorf("store: disable seqscan: %w", err)
+	}
+	rows, err := tx.Query(ctx, lazyStateGroupQuery, group, members)
+	if err != nil {
+		return nil, fmt.Errorf("store: lazy state for group: %w", err)
+	}
+	defer rows.Close()
+
+	state := make(map[StateKey]string)
+	for rows.Next() {
+		var k StateKey
+		var eventID string
+		if err := rows.Scan(&k.Type, &k.StateKey, &eventID); err != nil {
+			return nil, fmt.Errorf("store: lazy state for group: %w", err)
+		}
+		state[k] = eventID
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: lazy state for group: %w", err)
+	}
+	return state, nil
+}
+
 // FullStateForGroup resolves the complete state map at a state group.
 func (s *Store) FullStateForGroup(ctx context.Context, group int64) (map[StateKey]string, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
@@ -743,6 +806,67 @@ func (s *Store) PushRules(ctx context.Context, userID string) ([]pushrules.UserR
 // take the state after it. Synapse notes this returns an arbitrary one of
 // several forward extremities when the room had a fork at that moment; we
 // inherit that, because we resolve the same event it does.
+// FilteredStateAt resolves a few named state keys at a stream position.
+//
+// For callers that need two or three entries rather than a room's whole state:
+// resolving the full map to read one key is the difference between a handful
+// of rows and six figures of them. The underlying filtered lookup is cached,
+// because a state group's contents never change.
+func (s *Store) FilteredStateAt(ctx context.Context, roomID string, key streamtoken.RoomKey,
+	keys []StateKey) (map[StateKey]string, error) {
+
+	group, ok, err := s.stateGroupAt(ctx, roomID, key)
+	if err != nil || !ok {
+		return map[StateKey]string{}, err
+	}
+	entries, err := s.FilteredStateForGroup(ctx, group, keys)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[StateKey]string, len(entries))
+	for k, e := range entries {
+		out[k] = e.EventID
+	}
+	return out, nil
+}
+
+// LazyStateIDsAt is StateIDsAt for a lazy-loading client: it resolves the same
+// point in the room but asks for only the state such a client keeps.
+func (s *Store) LazyStateIDsAt(ctx context.Context, roomID string, key streamtoken.RoomKey,
+	members []string) (map[StateKey]string, error) {
+
+	group, ok, err := s.stateGroupAt(ctx, roomID, key)
+	if err != nil || !ok {
+		return map[StateKey]string{}, err
+	}
+	return s.LazyStateForGroup(ctx, group, members)
+}
+
+// stateGroupAt finds the state group in force at a stream position.
+func (s *Store) stateGroupAt(ctx context.Context, roomID string, key streamtoken.RoomKey) (
+	int64, bool, error) {
+
+	const lastQ = `
+		SELECT event_id FROM events
+		 WHERE room_id = $1 AND stream_ordering <= $2 AND outlier = FALSE
+		   AND rejection_reason IS NULL
+		 ORDER BY stream_ordering DESC LIMIT 1`
+	var eventID string
+	err := s.pool.QueryRow(ctx, lastQ, roomID, key.MaxStreamPos()).Scan(&eventID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("store: last event before position: %w", err)
+	}
+	groups, err := s.StateGroupsForEvents(ctx, []string{eventID})
+	if err != nil {
+		return 0, false, err
+	}
+	group, ok := groups[eventID]
+	return group, ok, nil
+}
+
 func (s *Store) StateIDsAt(ctx context.Context, roomID string, key streamtoken.RoomKey) (map[StateKey]string, error) {
 	const lastQ = `
 		SELECT event_id FROM events

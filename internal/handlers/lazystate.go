@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"sort"
 
 	"github.com/tidwall/gjson"
 
@@ -244,7 +245,15 @@ func roomHasName(ctx context.Context, d Deps, roomID string,
 	// The state at the sync point, not the room's current state: a room
 	// renamed after the token was minted must still be named as the client's
 	// window saw it.
-	state, err := d.Store.StateIDsAt(ctx, roomID, endKey)
+	//
+	// Two state keys, asked for by name. This used to resolve the room's
+	// ENTIRE state map to answer a yes/no question about two of its entries,
+	// which on a large room is six figures of rows for one boolean -- and a
+	// summary is computed for every lazy-loading room in an initial sync.
+	state, err := d.Store.FilteredStateAt(ctx, roomID, endKey, []store.StateKey{
+		{Type: "m.room.name"},
+		{Type: "m.room.canonical_alias"},
+	})
 	if err != nil {
 		return false, err
 	}
@@ -270,4 +279,19 @@ func roomHasName(ctx context.Context, d Deps, roomID string,
 		return true, nil
 	}
 	return false, nil
+}
+
+// memberList turns the lazy-load member set into the sorted list the state
+// queries take.
+//
+// Sorted so the same set produces the same query text and the same plan, and
+// so a cache keyed on it would be stable. Nil in, empty out: a room whose
+// timeline names nobody still wants all of the non-member state.
+func memberList(members map[string]bool) []string {
+	out := make([]string, 0, len(members))
+	for user := range members {
+		out = append(out, user)
+	}
+	sort.Strings(out)
+	return out
 }

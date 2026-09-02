@@ -985,3 +985,33 @@ worker until the filter was added.
 The MSC4155 half (`invite_config.get_invite_rule`) is NOT implemented here. It
 reads a separate account-data event that no account on this server has set, so
 it changes nothing today -- recorded as a gap rather than silently skipped.
+
+## Ask the state store for what a lazy client keeps (2026-09-02)
+
+`StateFilter.from_lazy_load_member_list(members)` is `{m.room.member: {those
+users}}` with `include_others=True`, and Synapse passes it all the way down to
+the state store. It never resolves a room's whole state map and then filters in
+Python.
+
+The distinction is invisible on a small room and decisive on a large one. State
+resolution walks `state_groups_state` -- the largest table in the database, 17GB
+here -- through the state-group edge chain, and the cost of the walk is roughly
+the number of rows it returns. A public room's state is mostly members, and a
+lazy-loading client keeps a handful of them.
+
+Measured on one 3,094-entry room here:
+
+| | rows | time |
+|---|---|---|
+| whole state map | 3094 | 14.7ms |
+| lazy (one member) | 49 | 6.1ms |
+
+Two and a half times faster, sixty times less to hold in memory -- and that room
+is small. The account that surfaced this has 500 rooms including public ones
+with tens of thousands of members; resolving them the wrong way cost 209 seconds
+and 1.5GB for a single initial sync.
+
+The same applies to any question about one state key. `compute_summary` asks
+whether a room has a name; resolving the entire state map to read
+`m.room.name` is the same answer at four orders of magnitude more work, and a
+summary is computed for every lazy-loading room in an initial sync.
