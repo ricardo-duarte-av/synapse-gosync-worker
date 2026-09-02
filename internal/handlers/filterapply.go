@@ -17,39 +17,100 @@ import (
 // exist, once per room, on every sync.
 const maxTimelineRepeats = 5
 
-// loadFilteredRecents builds a room's timeline for an initial sync.
+// loadFilteredRecents builds a room's timeline.
 //
-// Port of Synapse's _load_filtered_recents with `potential_recents` empty,
-// which is the initial-sync case: there is no window to work from, so events
-// are paginated backwards from the now token.
+// Port of Synapse's _load_filtered_recents, and it serves every path: an
+// initial sync (no `since`, no events supplied, walk backwards from now), an
+// incremental one (a window of events already loaded, a `since` to stop at),
+// and an archived room (walk back from the leave event).
 //
-// The loop is the part that is easy to leave out and wrong to. Events are
-// loaded, then thinned twice -- once by the client's filter, once by history
-// visibility -- and either pass can leave the timeline short of the limit. When
-// it does, Synapse goes back for more, up to five times. Without the loop, a
-// filter selecting one event type returns a nearly empty timeline for a busy
-// room, and `limited` says the client should paginate for the rest, which sends
-// it round the same filter again.
+// The arguments mirror Synapse's, because the differences between the paths
+// are entirely in what is passed:
+//
+//   - `upto` is Synapse's `upto_token`: the token a client should paginate
+//     from when the timeline is NOT trimmed. For a joined room in an
+//     incremental sync it is the start of the chunk that was loaded, which is
+//     the `since` token itself for a room whose events all fit; for an initial
+//     sync it is the now token; for an archived room, the leave token.
+//   - `sinceKey` is the lower bound of the walk, nil on an initial sync. Its
+//     presence also chooses the ordering: stream for updates, topological for
+//     history.
+//   - `potential` is the window of events the caller already loaded, with
+//     `hasPotential` distinguishing "loaded, and there were none" from "not
+//     loaded at all". That distinction decides `limited` and cannot be
+//     recovered from an empty slice.
+//
+// Two things here are easy to leave out and wrong to.
+//
+// The first is the loop. Events are thinned twice -- once by the client's
+// filter, once by history visibility -- and either pass can leave the timeline
+// short of the limit, so Synapse goes back for more, up to five times. Without
+// it, a filter selecting one event type returns a nearly empty timeline for a
+// busy room and calls it limited, sending the client round the same filter
+// again.
+//
+// The second is that `limited` is decided BEFORE any filtering, from how many
+// events the window held against the TIMELINE limit -- not from how many
+// survived, and not against the load limit. A timeline that ends up short
+// because the filter removed things is not limited; the client has everything
+// there was.
 func loadFilteredRecents(ctx context.Context, d Deps, room store.RoomForUser, userID string,
-	endKey streamtoken.RoomKey, timeNow int64, f *filter.Collection) (
-	[]store.TimelineEvent, []string, streamtoken.RoomKey, bool, error) {
+	now, upto streamtoken.Token, sinceKey *streamtoken.RoomKey,
+	potential []store.TimelineEvent, hasPotential, newlyJoined bool,
+	timeNow int64, f *filter.Collection) (
+	[]store.TimelineEvent, []string, streamtoken.Token, bool, error) {
 
 	timelineLimit := f.TimelineLimit()
 
-	// A hole in the room's history makes the timeline `limited` whatever else
-	// happens, so the client knows to paginate rather than assume the events
-	// it was given are contiguous. On an initial sync that is the gap's only
-	// effect -- there is no `since` for it to move.
-	_, gap, err := d.Store.TimelineGap(ctx, room.RoomID, nil, endKey)
+	// Not loaded at all means there is nothing to be sure about; a newly
+	// joined room is limited by definition, because the client has none of its
+	// history. Otherwise: did the window hold more than we may return?
+	limited := !hasPotential || newlyJoined || timelineLimit < len(potential)
+
+	// A hole in the room's history changes the question. The events after the
+	// gap are not a continuation of the ones before it, so Synapse throws away
+	// the window it was given, walks back from the sync point to the gap
+	// instead, and marks the timeline limited -- leaving the client to
+	// paginate across the hole rather than handing it two disjoint runs of
+	// events as though they were one.
+	gapStream, gap, err := d.Store.TimelineGap(ctx, room.RoomID, sinceKey, now.Room)
 	if err != nil {
-		return nil, nil, endKey, false, err
+		return nil, nil, upto, false, err
+	}
+	if gap {
+		potential, hasPotential = nil, false
+		upto = now
+		limited = true
+		if sinceKey != nil {
+			gapKey := streamtoken.Live(gapStream)
+			sinceKey = &gapKey
+		}
 	}
 
 	// A filter that can match nothing gets an empty, explicitly unlimited
 	// timeline: telling the client to paginate would be pointless, because the
-	// same filter applies to /messages.
+	// same filter applies to /messages. Synapse reaches this by way of
+	// block_all_timeline taking the not-limited exit with everything filtered
+	// out.
 	if f.BlocksAllRoomTimeline() || f.BlocksAllRooms() || timelineLimit <= 0 {
-		return nil, nil, endKey, false, nil
+		return nil, nil, upto, false, nil
+	}
+
+	messages, memberships, err := filterAndVisible(ctx, d, room.RoomID, userID,
+		potential, timeNow, f)
+	if err != nil {
+		return nil, nil, upto, false, err
+	}
+
+	if !limited {
+		// Nothing was withheld, so the client can paginate from wherever the
+		// window began -- or from just before the first event it is being
+		// given, when there is one.
+		prev := upto
+		if len(messages) > 0 {
+			prev = upto.WithRoomKey(streamtoken.Live(messages[0].StreamOrdering - 1))
+		}
+		return messages, memberships, prev, false, nil
 	}
 
 	loadLimit := timelineLimit * 2
@@ -57,50 +118,37 @@ func loadFilteredRecents(ctx context.Context, d Deps, room store.RoomForUser, us
 		loadLimit = 10
 	}
 
-	var (
-		messages    []store.TimelineEvent
-		memberships []string
-		start       = endKey
-		limited     = true
-		from        = endKey
-	)
+	// roomKey is only ever moved by the trim below. Synapse keeps it at the
+	// token it was given and assigns the pagination cursor to a DIFFERENT
+	// variable, so an untrimmed timeline reports a prev_batch equal to where
+	// the window began even though pagination walked past it. Following the
+	// cursor instead looks more correct and is measurably not what Synapse
+	// returns.
+	roomKey := upto.Room
+	from := upto.Room
+
 	for repeat := 0; repeat < maxTimelineRepeats && limited && len(messages) < timelineLimit; repeat++ {
-		loaded, next, more, err := d.Store.PaginateBackwards(ctx, room.RoomID,
-			room.RoomVersion, loadLimit, from)
+		var (
+			loaded []store.TimelineEvent
+			next   streamtoken.RoomKey
+			more   bool
+			err    error
+		)
+		if sinceKey != nil {
+			loaded, next, more, err = d.Store.PaginateBackwardsStream(ctx, room.RoomID,
+				room.RoomVersion, loadLimit, from, *sinceKey)
+		} else {
+			loaded, next, more, err = d.Store.PaginateBackwards(ctx, room.RoomID,
+				room.RoomVersion, loadLimit, from)
+		}
 		if err != nil {
-			return nil, nil, endKey, false, err
+			return nil, nil, upto, false, err
 		}
-		if len(loaded) == 0 && !more {
-			limited = false
-			break
-		}
-		// `from` advances so the next pass walks further back; `start` does
-		// NOT. Synapse keeps `room_key` at the token it was given and only
-		// moves it when the timeline is trimmed below, so an untrimmed
-		// timeline reports a prev_batch equal to the sync point itself --
-		// even though pagination walked past it. Following the pagination
-		// cursor instead looks more correct and is measurably not what
-		// Synapse returns.
 		from, limited = next, more
 
-		loaded = filterTimeline(f, room.RoomID, loaded)
-		loaded, err = applyRelationFilter(ctx, d, f.TimelineFilter(), loaded)
+		visible, ms, err := filterAndVisible(ctx, d, room.RoomID, userID, loaded, timeNow, f)
 		if err != nil {
-			return nil, nil, endKey, false, err
-		}
-
-		// The always-include set is computed from what SURVIVED the client's
-		// filter, not from what was loaded: an event the client filtered out
-		// is gone, and re-admitting it because it happens to be current state
-		// would override the client's own request.
-		alwaysInclude, err := stateEventIDsInCurrentState(ctx, d, loaded)
-		if err != nil {
-			return nil, nil, endKey, false, err
-		}
-		visible, ms, err := filterVisibleAlways(ctx, d, room.RoomID, userID, loaded,
-			false, timeNow, alwaysInclude)
-		if err != nil {
-			return nil, nil, endKey, false, err
+			return nil, nil, upto, false, err
 		}
 
 		// Each pass walks further back, so its events are OLDER than what we
@@ -109,17 +157,44 @@ func loadFilteredRecents(ctx context.Context, d Deps, room store.RoomForUser, us
 		memberships = append(ms, memberships...)
 	}
 
-	// Trim to the requested limit, keeping the NEWEST events. The token form
-	// changes with it: a trimmed page reports a live position just before the
-	// first event kept, an untrimmed one reports where the topological walk
-	// stopped.
+	// Trim to the requested limit, keeping the NEWEST events. This is the only
+	// thing that moves the prev_batch token: what was cut off is exactly what
+	// the client must paginate for.
 	if len(messages) > timelineLimit {
 		limited = true
 		messages = messages[len(messages)-timelineLimit:]
 		memberships = memberships[len(memberships)-timelineLimit:]
-		start = streamtoken.Live(messages[0].StreamOrdering - 1)
+		roomKey = streamtoken.Live(messages[0].StreamOrdering - 1)
 	}
-	return messages, memberships, start, limited || gap, nil
+
+	// A gap and a newly joined room are limited whatever the pagination said.
+	return messages, memberships, upto.WithRoomKey(roomKey), limited || newlyJoined || gap, nil
+}
+
+// filterAndVisible applies the client's timeline filter and then history
+// visibility, in that order.
+//
+// The order is load-bearing for the always-include set: it is computed from
+// what SURVIVED the client's filter, not from what was loaded. An event the
+// client filtered out is gone, and re-admitting it because it happens to be
+// current state would override the client's own request.
+func filterAndVisible(ctx context.Context, d Deps, roomID, userID string,
+	events []store.TimelineEvent, timeNow int64, f *filter.Collection) (
+	[]store.TimelineEvent, []string, error) {
+
+	if len(events) == 0 {
+		return nil, nil, nil
+	}
+	events = filterTimeline(f, roomID, events)
+	events, err := applyRelationFilter(ctx, d, f.TimelineFilter(), events)
+	if err != nil {
+		return nil, nil, err
+	}
+	alwaysInclude, err := stateEventIDsInCurrentState(ctx, d, events)
+	if err != nil {
+		return nil, nil, err
+	}
+	return filterVisibleAlways(ctx, d, roomID, userID, events, false, timeNow, alwaysInclude)
 }
 
 // filterTimeline applies the client's timeline filter, room filter included.

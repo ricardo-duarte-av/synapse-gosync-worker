@@ -85,13 +85,16 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 	strippedCfg.IncludeStrippedRoomState = true
 
 	timelineLimit := f.TimelineLimit()
-	// Load twice the limit, as Synapse does: visibility filtering happens after
-	// and would otherwise leave the timeline short, and a short timeline shifts
-	// both prev_batch and the state delta that hangs off its first event.
-	loadLimit := timelineLimit * 2
-	if loadLimit < 10 {
-		loadLimit = 10
-	}
+	// ONE MORE than the limit, which is exactly what Synapse asks for
+	// (`get_room_events_stream_for_rooms(limit=timeline_limit + 1)`). The extra
+	// row is not spare capacity, it is the question being asked: a room that
+	// returns it held more than the client may be given, and is therefore
+	// `limited`. Loading a larger page instead makes that unanswerable, because
+	// "we loaded more than we will return" stops meaning anything.
+	//
+	// Under-filling is handled where Synapse handles it, by re-paginating in
+	// loadFilteredRecents rather than by over-fetching here.
+	loadLimit := timelineLimit + 1
 	timelines := map[string][]store.TimelineEvent{}
 	if !f.BlocksAllRooms() && !f.BlocksAllRoomTimeline() && timelineLimit > 0 {
 		timelines, err = d.Store.RoomTimelineSince(ctx, joinedIDs, roomVersions,
@@ -139,8 +142,19 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 		}
 		if wasJoined != "join" {
 			newlyJoined = append(newlyJoined, room.RoomID)
+			// The room is given a full-state entry, but its timeline still
+			// comes from the window this sync loaded: Synapse builds the
+			// chunk first and marks the room newly joined afterwards, so the
+			// prev_batch of an untrimmed timeline is the start of that chunk,
+			// not the now token.
+			raw := timelines[room.RoomID]
+			src := timelineSource{upto: since, potential: raw, hasPotential: true, newlyJoined: true}
+			if len(raw) > 0 {
+				src.upto = now.WithRoomKey(streamtoken.Live(raw[0].StreamOrdering - 1))
+			}
 			entry, err := syncRoomEntry(ctx, d, room, verdict.UserID, now.Room, timeNow, cfg,
-				accountDataByRoom[room.RoomID], now, useStateAfter, f, verdict.DeviceID, false)
+				accountDataByRoom[room.RoomID], now, useStateAfter, f, verdict.DeviceID, false,
+				src)
 			if err != nil {
 				return nil, http.StatusInternalServerError, internalError(d, "room entry", err)
 			}
@@ -165,7 +179,7 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 
 		entry, err := incrementalRoomEntry(ctx, d, room, verdict.UserID, since, now,
 			timeNow, cfg, timelines[room.RoomID],
-			accountDataByRoom[room.RoomID], receiptsByRoom[room.RoomID], loadLimit,
+			accountDataByRoom[room.RoomID], receiptsByRoom[room.RoomID],
 			useStateAfter, f, verdict.DeviceID)
 		if err != nil {
 			return nil, http.StatusInternalServerError, internalError(d, "room entry", err)
@@ -453,66 +467,24 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 func incrementalRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID string,
 	since, now streamtoken.Token, timeNow int64, cfg clientevent.Config,
 	raw []store.TimelineEvent, accountData []store.AccountDataEntry,
-	receipts []store.ReceiptRow, loadLimit int, useStateAfter bool,
+	receipts []store.ReceiptRow, useStateAfter bool,
 	f *filter.Collection, deviceID string) (map[string]any, error) {
 
-	timelineLimit := f.TimelineLimit()
+	// Where the loaded chunk begins, which is Synapse's per-room `upto_token`
+	// and the prev_batch of an untrimmed timeline. For a room whose events all
+	// fit in the window that is the `since` token itself -- the whole token,
+	// not just its room key, because Synapse hands `since_token` straight
+	// through for a room that had nothing in it.
+	upto := since
+	if len(raw) > 0 {
+		upto = now.WithRoomKey(streamtoken.Live(raw[0].StreamOrdering - 1))
+	}
+	sinceKey := since.Room
 
-	// A hole in the room's history inside this window changes the question. The
-	// events after the gap are not a continuation of the ones before it, so
-	// Synapse throws away what it loaded, re-paginates from the sync point back
-	// to the gap, and marks the timeline limited -- leaving the client to
-	// paginate across the hole itself rather than handing it two disjoint runs
-	// of events as though they were one.
-	sinceKey := &since.Room
-	gapStream, gap, err := d.Store.TimelineGap(ctx, room.RoomID, sinceKey, now.Room)
+	messages, memberships, prevBatch, limited, err := loadFilteredRecents(ctx, d, room, userID,
+		now, upto, &sinceKey, raw, true, false, timeNow, f)
 	if err != nil {
 		return nil, err
-	}
-	if gap {
-		byRoom, err := d.Store.RoomTimelineSince(ctx, []string{room.RoomID},
-			map[string]string{room.RoomID: room.RoomVersion},
-			gapStream, now.Room.MaxStreamPos(), loadLimit)
-		if err != nil {
-			return nil, err
-		}
-		raw = byRoom[room.RoomID]
-	}
-
-	// More were loaded than will be returned, so hitting the load limit already
-	// means the window held more than fits.
-	limited := len(raw) >= loadLimit || gap
-
-	raw = filterTimeline(f, room.RoomID, raw)
-	raw, err = applyRelationFilter(ctx, d, f.TimelineFilter(), raw)
-	if err != nil {
-		return nil, err
-	}
-
-	// A state event still in current state is shown regardless of history
-	// visibility: withholding it from a client that can already see the state
-	// it established gains nothing.
-	alwaysInclude, err := stateEventIDsInCurrentState(ctx, d, raw)
-	if err != nil {
-		return nil, err
-	}
-	messages, memberships, err := filterVisibleAlways(ctx, d, room.RoomID, userID, raw,
-		false, timeNow, alwaysInclude)
-	if err != nil {
-		return nil, err
-	}
-
-	// Trim to the limit, keeping the newest.
-	if len(messages) > timelineLimit {
-		limited = true
-		messages = messages[len(messages)-timelineLimit:]
-		memberships = memberships[len(memberships)-timelineLimit:]
-	}
-	// A filter that blocks the timeline outright reports it as unlimited: there
-	// is nothing for the client to paginate towards, because /messages applies
-	// the same filter.
-	if f.BlocksAllRoomTimeline() {
-		limited = false
 	}
 
 	adEvents, err := accountDataEvents(filterAccountDataEntries(f, room.RoomID, accountData))
@@ -699,11 +671,6 @@ func incrementalRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, u
 			return nil, err
 		}
 		stateJSON = append(stateJSON, body)
-	}
-
-	prevBatch := now
-	if len(messages) > 0 {
-		prevBatch = now.WithRoomKey(streamtoken.Live(messages[0].StreamOrdering - 1))
 	}
 
 	unread, err := d.Store.UnreadNotifications(ctx, room.RoomID, userID)
@@ -1047,14 +1014,18 @@ func archivedRoomEntry(ctx context.Context, d Deps, roomID, userID string,
 	cfg clientevent.Config, msc3391, useStateAfter bool,
 	f *filter.Collection) (map[string]any, error) {
 
-	timelineLimit := f.TimelineLimit()
 	info, err := d.Store.RoomInfo(ctx, roomID)
 	if err != nil {
 		return nil, err
 	}
 	leaveKey := streamtoken.Live(change.StreamOrdering)
+	room := store.RoomForUser{RoomID: roomID, RoomVersion: info.RoomVersion}
+	endToken := now.WithRoomKey(leaveKey)
 
-	var raw []store.TimelineEvent
+	var (
+		raw          []store.TimelineEvent
+		hasPotential bool
+	)
 	if change.OutOfBand {
 		// An out-of-band membership -- a federated invite or its rejection --
 		// arrived without the room's state, so there is nothing to paginate.
@@ -1069,41 +1040,21 @@ func archivedRoomEntry(ctx context.Context, d Deps, roomID, userID string,
 				IsState: true, StreamOrdering: change.StreamOrdering,
 			}}
 		}
-	} else {
-		loadLimit := timelineLimit * 2
-		if loadLimit < 10 {
-			loadLimit = 10
-		}
-		byRoom, err := d.Store.RoomTimelineSince(ctx, []string{roomID},
-			map[string]string{roomID: info.RoomVersion},
-			since.Room.MaxStreamPos(), change.StreamOrdering, loadLimit)
-		if err != nil {
-			return nil, err
-		}
-		raw = byRoom[roomID]
+		hasPotential = true
 	}
 
-	limited := len(raw) >= timelineLimit*2
-	raw = filterTimeline(f, roomID, raw)
-	raw, err = applyRelationFilter(ctx, d, f.TimelineFilter(), raw)
+	// Nothing is pre-loaded for an ordinary leave: Synapse passes
+	// `events=None` and lets _load_filtered_recents walk back from the leave
+	// position to the client's `since`. An out-of-band membership is the
+	// exception -- it arrived without the room's state, so the membership event
+	// is the whole timeline and there is nothing to paginate.
+	sinceKey := since.Room
+	messages, memberships, prevBatch, limited, err := loadFilteredRecents(ctx, d, room, userID,
+		now, endToken, &sinceKey, raw, hasPotential, false, timeNow, f)
 	if err != nil {
 		return nil, err
 	}
-	messages, memberships, err := filterVisible(ctx, d, roomID, userID, raw, false, timeNow)
-	if err != nil {
-		return nil, err
-	}
-	if len(messages) > timelineLimit {
-		limited = true
-		messages = messages[len(messages)-timelineLimit:]
-		memberships = memberships[len(memberships)-timelineLimit:]
-	}
-	if f.BlocksAllRoomTimeline() {
-		messages, memberships, limited = nil, nil, false
-	}
 
-	room := store.RoomForUser{RoomID: roomID, RoomVersion: info.RoomVersion}
-	endToken := now.WithRoomKey(leaveKey)
 	var stateMembers map[string]bool
 	if f.LazyLoadMembers() {
 		stateMembers = timelineMembers(messages, useStateAfter)
@@ -1188,11 +1139,6 @@ func archivedRoomEntry(ctx context.Context, d Deps, roomID, userID string,
 			return nil, err
 		}
 		stateJSON = append(stateJSON, body)
-	}
-
-	prevBatch := endToken
-	if len(messages) > 0 {
-		prevBatch = now.WithRoomKey(streamtoken.Live(messages[0].StreamOrdering - 1))
 	}
 
 	return map[string]any{

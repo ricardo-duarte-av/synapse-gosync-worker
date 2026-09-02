@@ -633,6 +633,31 @@ func isReceiptThreadID(path string) bool {
 	return strings.HasPrefix(path, ".receipts[") && strings.HasSuffix(path, ".thread_id")
 }
 
+// isLeftOnlyDeviceLists matches a whole `device_lists` object that Synapse
+// emitted and we did not, when its ONLY content is `left`.
+//
+// The same tolerance as `.device_lists.left`, reached by a different route: if
+// `left` is all Synapse had to say, then omitting those entries omits the
+// object with them, and the diff reports the missing key rather than the
+// missing entries. Deliberately narrow -- a `device_lists` carrying `changed`
+// is still a mismatch, because failing to name a user whose keys changed is
+// how a client ends up unable to decrypt.
+func isLeftOnlyDeviceLists(path string, want any) bool {
+	if path != ".device_lists" {
+		return false
+	}
+	obj, ok := want.(map[string]any)
+	if !ok || len(obj) == 0 {
+		return false
+	}
+	for k := range obj {
+		if k != "left" {
+			return false
+		}
+	}
+	return true
+}
+
 func diff(path string, got, want any, out *[]string) {
 	if len(*out) > 40 {
 		return
@@ -657,6 +682,10 @@ func diff(path string, got, want any, out *[]string) {
 			switch {
 			case !inGot:
 				if isToleratedUpstreamOnly(path + "." + k) {
+					tolerated++
+					continue
+				}
+				if isLeftOnlyDeviceLists(path+"."+k, wv) {
 					tolerated++
 					continue
 				}

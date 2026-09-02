@@ -496,6 +496,95 @@ func (s *Store) PaginateBackwards(ctx context.Context, roomID, roomVersion strin
 	return ascending, next, limited, nil
 }
 
+// PaginateBackwardsStream walks a room's events backwards by STREAM ordering,
+// from `from` down to but not including `to`.
+//
+// The companion to PaginateBackwards, and the difference is not cosmetic.
+// Synapse picks between the two by whether the sync has a `since`
+// (`_load_filtered_recents`: "use topological_ordering for historical events,
+// stream_ordering for updates"). An incremental sync is asking what arrived
+// since the client last looked, which is a question about the order the server
+// received things in; an initial sync is asking for a historical slice of the
+// room, which is a question about the DAG. An event backfilled today sits in a
+// different place in each order, so using the wrong one silently returns a
+// different set of events.
+//
+// The lower bound is what keeps an incremental timeline honest: without it, a
+// filter that thins the page sends the re-pagination loop straight past the
+// client's `since` and into events it already has.
+func (s *Store) PaginateBackwardsStream(ctx context.Context, roomID, roomVersion string,
+	limit int, from, to streamtoken.RoomKey) ([]TimelineEvent, streamtoken.RoomKey, bool, error) {
+
+	if limit <= 0 {
+		return nil, from, false, nil
+	}
+	if from.MaxStreamPos() <= to.MaxStreamPos() {
+		// Already at or below the lower bound. Synapse returns the bound
+		// itself here rather than the starting point.
+		return nil, to, false, nil
+	}
+
+	// Twice what was asked for, as Synapse does: the result set is filtered
+	// afterwards and would otherwise come up short.
+	requested := limit * 2
+
+	const q = `
+		SELECT e.event_id, e.type, e.sender, e.stream_ordering,
+		       e.topological_ordering, COALESCE(e.instance_name, ''),
+		       COALESCE(e.state_key, ''), e.state_key IS NOT NULL,
+		       ej.json, ej.internal_metadata
+		  FROM events e JOIN event_json ej USING (event_id)
+		 WHERE e.outlier = FALSE AND e.room_id = $1
+		   AND e.stream_ordering <= $2 AND e.stream_ordering > $3
+		 ORDER BY e.stream_ordering DESC
+		 LIMIT $4`
+
+	rows, err := s.pool.Query(ctx, q, roomID, from.MaxStreamPos(), to.MaxStreamPos(), requested)
+	if err != nil {
+		return nil, from, false, fmt.Errorf("store: paginate backwards by stream: %w", err)
+	}
+	defer rows.Close()
+
+	var descending []TimelineEvent
+	for rows.Next() {
+		var ev TimelineEvent
+		if err := rows.Scan(&ev.EventID, &ev.Type, &ev.Sender, &ev.StreamOrdering,
+			&ev.TopologicalOrder, &ev.InstanceName, &ev.StateKey, &ev.IsState,
+			&ev.JSON, &ev.InternalMetadata); err != nil {
+			return nil, from, false, fmt.Errorf("store: paginate backwards by stream: %w", err)
+		}
+		ev.RoomID = roomID
+		ev.RoomVersion = roomVersion
+		descending = append(descending, ev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, from, false, fmt.Errorf("store: paginate backwards by stream: %w", err)
+	}
+
+	limited := len(descending) >= requested
+	if len(descending) > limit {
+		limited = true
+		descending = descending[:limit]
+	}
+	if len(descending) == 0 {
+		// No rows means the bound was reached, and the bound is what the
+		// caller should resume from.
+		return nil, to, limited, nil
+	}
+
+	// A token names a position between events. Live form, not historical:
+	// this walk was ordered by stream position, so that is what the token
+	// must mean (generate_next_token with last_topo_ordering=None).
+	oldest := descending[len(descending)-1]
+	next := streamtoken.Live(oldest.StreamOrdering - 1)
+
+	ascending := make([]TimelineEvent, len(descending))
+	for i, ev := range descending {
+		ascending[len(descending)-1-i] = ev
+	}
+	return ascending, next, limited, nil
+}
+
 // EventsInCurrentState reports which of the given events are part of the
 // room's current state.
 //

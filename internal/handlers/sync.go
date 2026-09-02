@@ -160,7 +160,8 @@ func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter 
 		}
 
 		entry, err := syncRoomEntry(ctx, d, room, verdict.UserID, now.Room, timeNow, cfg,
-			accountDataByRoom[room.RoomID], now, useStateAfter, f, verdict.DeviceID, true)
+			accountDataByRoom[room.RoomID], now, useStateAfter, f, verdict.DeviceID, true,
+			timelineSource{upto: now})
 		if err != nil {
 			return nil, http.StatusInternalServerError, internalError(d, "room entry", err)
 		}
@@ -283,14 +284,40 @@ func syncPresenceEvents(states []store.PresenceState, timeNow int64) ([]json.Raw
 	return out, nil
 }
 
-// syncRoomEntry builds one joined room's section of an initial /sync.
+// timelineSource describes where a room's timeline is to come from.
+//
+// Both callers of syncRoomEntry give the room a full-state entry, but they do
+// not build its timeline the same way, and Synapse does not either. An initial
+// sync has no window and no `since`, so everything is paginated backwards from
+// the now token. A room joined inside an incremental sync's window HAS a
+// window: Synapse loads it like any other joined room and only then treats it
+// as newly joined, which leaves the room's `upto_token` — and so the prev_batch
+// of an untrimmed timeline — at the start of that chunk rather than at the now
+// token.
+type timelineSource struct {
+	// upto is Synapse's upto_token: where a client paginates from when the
+	// timeline was not trimmed.
+	upto streamtoken.Token
+	// potential is the window already loaded, with hasPotential separating
+	// "loaded, and there were none" from "not loaded at all".
+	potential    []store.TimelineEvent
+	hasPotential bool
+	// newlyJoined makes the timeline limited whatever the pagination says: the
+	// client has none of this room's history.
+	newlyJoined bool
+}
+
+// syncRoomEntry builds one joined room's full-state section.
 func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID string,
 	endKey streamtoken.RoomKey, timeNow int64, cfg clientevent.Config,
 	accountData []store.AccountDataEntry, now streamtoken.Token,
-	useStateAfter bool, f *filter.Collection, deviceID string, initial bool) (map[string]any, error) {
+	useStateAfter bool, f *filter.Collection, deviceID string, initial bool,
+	src timelineSource) (map[string]any, error) {
 
-	messages, memberships, start, limited, err := loadFilteredRecents(ctx, d, room, userID,
-		endKey, timeNow, f)
+	// No `since` in either case: a newly joined room is paginated as history,
+	// exactly as an initial sync is, because the client has none of it.
+	messages, memberships, prevBatch, limited, err := loadFilteredRecents(ctx, d, room, userID,
+		now, src.upto, nil, src.potential, src.hasPotential, src.newlyJoined, timeNow, f)
 	if err != nil {
 		return nil, err
 	}
@@ -482,7 +509,7 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 	return map[string]any{
 		"timeline": map[string]any{
 			"events":     timeline,
-			"prev_batch": now.WithRoomKey(start).String(),
+			"prev_batch": prevBatch.String(),
 			"limited":    limited,
 		},
 		stateKeyName(useStateAfter): map[string]any{"events": stateJSON},

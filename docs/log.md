@@ -577,3 +577,56 @@ reports `limited: true` and a `prev_batch` of `first_event - 1` where Synapse
 reports `false` and the `since` token. It has its own path rather than going
 through `loadFilteredRecents`, and differs from `_load_filtered_recents` in
 three ways. Diagnosed in milestones.md; it is the next thing to fix.
+
+## One timeline path instead of three (2026-09-02)
+
+The defect M8's regression turned up, fixed. `incrementalRoomEntry` and
+`archivedRoomEntry` each had their own timeline code; now every path goes
+through `loadFilteredRecents`, which is the port of `_load_filtered_recents`
+and nothing else is.
+
+Symptom: with a `types` filter one busy room reported `limited: true` and a
+`prev_batch` of `first_event - 1` where Synapse reported `false` and the `since`
+token, on the same single event. Four things were wrong at once, and each of
+them is invisible under the default filter:
+
+- `limited` was computed after filtering and against the load limit. Synapse
+  decides it *before* filtering and against the timeline limit: a timeline that
+  is short because the filter removed things is not limited.
+- The window was loaded at twice the limit. Synapse loads `limit + 1`, and the
+  extra row is the question being asked — a room that returns it held more than
+  the client may be given.
+- `prev_batch` always followed the first event. Synapse moves it only when the
+  timeline is trimmed; otherwise it stays where the window began.
+- There was no re-pagination loop outside the initial-sync path, so a filter
+  that thinned the page was never topped up.
+
+Two smaller things fell out of doing it properly. Backwards pagination by
+*stream* ordering, bounded below by `since`, is a different query from the
+topological walk the initial path uses — Synapse chooses between them on
+whether there is a `since`, because an incremental sync asks what arrived since
+the client last looked. And a newly joined room keeps the window's
+`upto_token`: Synapse builds its chunk like any other joined room and marks it
+newly joined afterwards, where we were handing it to the initial-sync path
+whole.
+
+Also tolerated in the comparator: a `device_lists` object Synapse emits and we
+do not, when `left` is all it contains. `.device_lists.left` was already a named
+tolerance — the same artefact, reported as a missing key rather than missing
+entries when `left` was the only thing in it. Narrow on purpose: a
+`device_lists` carrying `changed` is still a mismatch.
+
+### Verified
+
+Both accounts, everything green: 39 rooms of `room_initial_sync`,
+`/initialSync`, initial `/sync`, incremental at rewinds of 3k / 30k / 200k /
+500k / 1M, `state_after`, `to_device`, and the filter set including two shapes
+that did not exist before — `{"limit":100,"types":[...]}`, which leaves the
+timeline unlimited while removing its oldest events, and `include_leave` with a
+`types` filter for the archived path.
+
+Non-vacuity checked twice. Following the first event unconditionally is named on
+a `types` filter; never trusting the window is named only by the unlimited-plus-
+types filter, because the two prev_batch rules agree whenever nothing was
+filtered out of the front of the window. The default filter catches neither, and
+that is the whole reason this survived from M3 to M8.

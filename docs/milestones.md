@@ -126,31 +126,49 @@ second was found the same way: a sticky event still in the timeline is removed
 from that section by Synapse, so the section appears only once the event ages
 out — or the moment a filter excludes it from the timeline.
 
-## A pre-existing timeline defect, surfaced 2026-09-02
+## The incremental timeline path, fixed (2026-09-02)
 
-Found by the M8 regression, reproduced on the M6 build, so it predates this
-milestone and is **not fixed**. With `{"room":{"timeline":{"limit":5,
-"types":["m.room.message"]}}}` one busy room reports `limited: true` and a
-`prev_batch` of `first_event - 1` where Synapse reports `false` and the `since`
-token. Same single event on both sides.
+Surfaced by the M8 regression and reproduced on the M6 build, so it predated
+that milestone. With `{"room":{"timeline":{"limit":5,"types":
+["m.room.message"]}}}` one busy room reported `limited: true` and a `prev_batch`
+of `first_event - 1` where Synapse reported `false` and the `since` token — the
+same single event on both sides.
 
-The cause is that `incrementalRoomEntry` has its own timeline path rather than
-using `loadFilteredRecents`, and it differs from `_load_filtered_recents` in
-three ways:
+The cause was that `incrementalRoomEntry` and `archivedRoomEntry` each had
+their own timeline path instead of going through `loadFilteredRecents`, and all
+three differed from `_load_filtered_recents`. `loadFilteredRecents` is now the
+single port of that function and every path calls it: initial sync, incremental,
+newly joined, and archived. What changed:
 
-1. `limited` is `len(raw) >= loadLimit`; Synapse's is `timeline_limit <
-   len(potential_recents)`, decided **before** filtering and against the
-   timeline limit, not the load limit.
-2. `prev_batch` is always `first_event - 1`. Synapse only moves `room_key` when
-   the timeline is **trimmed**; otherwise it stays at the per-room `upto_token`,
-   which is the start key of the loaded chunk — the `since` token for a room
-   that was not limited. This is the M6 `prev_batch` finding again, in the path
-   M6 did not touch.
-3. There is no re-pagination loop, so a filter that thins the page does not pull
-   older events in as Synapse does.
+1. **`limited` is decided before any filtering**, from how many events the
+   window held against the TIMELINE limit — not from how many survived, and not
+   against the load limit. A timeline that ends up short because the filter
+   removed things is not limited; the client has everything there was.
+2. **The window is loaded with `timeline_limit + 1`**, which is what Synapse
+   asks for. The extra row is the question, not spare capacity: a room that
+   returns it held more than the client may be given. Loading a larger page
+   makes that unanswerable.
+3. **`prev_batch` only moves when the timeline is trimmed.** Otherwise it stays
+   at the room's `upto_token` — the start of the loaded chunk, which is the
+   `since` token itself for a room whose events all fit. This is the M6
+   `prev_batch` finding again, in the two paths M6 did not touch.
+4. **The re-pagination loop now runs on every path**, so a filter that thins the
+   page pulls older events in as Synapse does — bounded by `since`, and ordered
+   by stream position rather than topologically. Synapse picks between the two
+   orderings on whether there is a `since`: an incremental sync asks what
+   arrived since the client last looked, which is a question about the order the
+   server received things in. `Store.PaginateBackwardsStream` is the new half of
+   that pair.
+5. **A newly joined room keeps the window's `upto_token`.** Synapse builds the
+   chunk like any other joined room and marks it newly joined afterwards, so an
+   untrimmed timeline's `prev_batch` is the chunk start, not the now token. Ours
+   was handing the room to the initial-sync path wholesale.
 
-The fix is to make the incremental path go through `loadFilteredRecents` with a
-per-room `upto_token`, which is a real piece of work rather than a patch.
+Non-vacuity checked twice, as CLAUDE.md requires. Following the first event
+unconditionally is named on a `types` filter; never trusting the window is named
+by `{"timeline":{"limit":100,"types":[...]}}` — a filter that leaves the
+timeline UNLIMITED while removing its oldest events, which is the only shape
+that separates the two prev_batch rules. The default filter catches neither.
 
 ## M8 — done
 

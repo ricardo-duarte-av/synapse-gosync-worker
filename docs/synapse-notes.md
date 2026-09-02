@@ -700,3 +700,54 @@ the previous ones removed.
 shares a stream id across them; ids are unique only within a `(user_id,
 device_id)` pair. That is why Synapse will only apply a limit when querying a
 single device.
+
+## `_load_filtered_recents`, in full (2026-09-02)
+
+The function every /sync timeline goes through, and four of its details are
+counter-intuitive enough that we got each one wrong at least once.
+
+**`limited` is decided before anything is filtered.** It is
+`potential_recents is None or newly_joined_room or timeline_limit <
+len(potential_recents)` — the size of the window that was LOADED, against the
+timeline limit. Not how many survived the client's filter, and not the load
+limit. A timeline that comes back short because a filter removed things is not
+limited, because there is nothing more for the client to fetch: /messages
+applies the same filter.
+
+**The window is loaded with `timeline_limit + 1`.**
+`_get_room_changes_for_incremental_sync` asks
+`get_room_events_stream_for_rooms(limit=timeline_limit + 1)`, and that one extra
+row IS the `limited` test above. Loading more than that — twice the limit, say —
+does not make the answer safer, it makes it unanswerable.
+
+**`prev_batch` moves only when the timeline is trimmed.** `room_key` starts at
+`upto_token.room_key` and is reassigned in exactly one place, the
+`len(filtered_recents) > timeline_limit` branch. The pagination cursor goes to
+`end_key`, a different variable. So an untrimmed timeline reports where the
+WINDOW began, even though pagination may have walked far past it.
+
+The `upto_token` that anchors it is per room, and it is not the now token:
+
+| Room | `upto_token` |
+|---|---|
+| Joined, events in the window | `now_token` with the room key set to the chunk's start — `oldest_returned.stream_ordering - 1` |
+| Joined, nothing in the window | **`since_token`**, the whole token, not just its room key |
+| Joined, newly joined | the chunk start, as above; `since_token` is passed as None but `upto_token` is not |
+| Archived | the leave token |
+| Initial sync | `now_token` |
+
+**Which ordering pagination uses depends on whether there is a `since`.**
+`pagination_method` is topological when `since_key is None` and by stream
+ordering otherwise, with the comment "use topological_ordering for historical
+events, stream_ordering for updates". An incremental sync asks what arrived
+since the client last looked, which is a question about the order the server
+received things in; an initial sync asks for a historical slice of the room,
+which is a question about the DAG. An event backfilled today sits in a different
+place in each order. The incremental walk is also bounded below by `since` (or
+by the gap token when there is a gap), which is what stops a thinned page from
+being topped up with events the client already has.
+
+`generate_next_token` subtracts one from the stream ordering when paginating
+backwards, because "tokens are positions between events" — and it carries the
+topological ordering only when the walk was topological, so the two paths
+produce different token FORMS as well as different events.
