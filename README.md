@@ -21,7 +21,7 @@ real client's `/sync` request actually looks like.
 |---|---|
 | `/_matrix/client/*/rooms/{roomId}/initialSync` | **served**, at parity on all 39 rooms of two test accounts |
 | `/_matrix/client/*/initialSync` | **served**, at parity for both test accounts (except `archived=true`) |
-| `/_matrix/client/*/sync` | **initial and incremental served**, at parity for both test accounts, with or without MSC4222 `state_after`, and with or without a filter |
+| `/_matrix/client/*/sync` | **initial and incremental served**, at parity for both test accounts, with or without MSC4222 `state_after`, and with or without a filter. `to_device` is served only when configured; see below |
 | `/_matrix/client/*/events` | not implemented |
 
 ### Deliberate deviations
@@ -36,6 +36,20 @@ loud failure beats a quiet wrong answer:
   not joined at the time, Synapse returns a redacted copy; we drop the event.
   The per-room-version prune exists, so this is a wiring job. Dropping withholds
   content rather than publishing content that should have been stripped.
+
+**`to_device` is served only when the worker can delete.** Synapse's `/sync`
+deletes the to-device messages a device has acknowledged, bounded by its
+`since`. A worker that served the section without deleting would hand a client
+the same room keys on every sync for ever, so the two are one setting rather
+than two: with `to_device.enabled: false` the section is omitted entirely, which
+is correct as long as a real Synapse worker is also syncing that device.
+
+Enabling it is the one place this worker writes. It opens a *second* connection
+as a role granted `SELECT, DELETE` on `device_inbox` and nothing else
+(`deploy/device-inbox-role.sql`), verifies at startup that the role really is
+that narrow — refusing to run if it can delete from `events` or insert into
+`device_inbox` — and keeps the main pool on the read-only role. Every query in
+`internal/store` is still a `SELECT`.
 
 **`unread_thread_notifications` is not implemented.** A filter may set it
 (`msc3773_enabled` is on for this deployment, so both the stable and unstable
@@ -98,6 +112,7 @@ never fail CI:
 GOSYNC_TEST_DSN="host=/var/sockets user=gopro_ro dbname=synapse-db" \
 GOSYNC_LIVE_REF_SOCKET=/var/sockets/nginx/av-sync-worker-2.sock \
 GOSYNC_LIVE_TOKEN_FILE=~/.gosync-test-token \
+GOSYNC_TEST_TODEVICE_DSN="host=/var/sockets user=gosync_inbox dbname=synapse-db" \
   go test ./... -run Live -v
 ```
 
@@ -106,7 +121,8 @@ GOSYNC_LIVE_TOKEN_FILE=~/.gosync-test-token \
 See `deploy/gosync-worker.example.yaml`, which documents every field and why it
 is set the way it is. The worker needs a read-only PostgreSQL role
 (`deploy/readonly-role.sql`), a Redis/KeyDB socket, and a Synapse client-API
-endpoint to validate access tokens against.
+endpoint to validate access tokens against. Serving `to_device` additionally
+needs the narrow deleting role in `deploy/device-inbox-role.sql`.
 
 ## Documentation
 

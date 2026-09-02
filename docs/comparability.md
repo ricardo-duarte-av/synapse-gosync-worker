@@ -9,7 +9,7 @@ diff the bytes. `/sync` is not that. **Sending the same request twice — even t
 the same Synapse worker — legitimately yields different answers.** A naive A/B
 diff would drown in false positives and teach us nothing.
 
-Eight independent sources of divergence:
+Nine independent sources of divergence:
 
 1. **`now_token` differs.** Each side snapshots
    `event_sources.get_current_token()` at its own start
@@ -38,7 +38,20 @@ Eight independent sources of divergence:
    `store.delete_messages_for_device` up to `since_token.to_device_key`.
    Querying Synapse first *deletes the to-device messages our replay would then
    need to see.* This is the trap most likely to be mistaken for a bug in our
-   code.
+   code — and since M8 **both sides delete**, so it cuts both ways.
+
+   Deletion is bounded by the client's own `since`, which is what makes the
+   ordinary comparison safe: the window a response returns is `(since, now]`,
+   and only messages at or below `since` are removed. Replaying the same
+   `since`, or a rewound one, changes nothing.
+
+   It stops being safe the moment the two sides carry **different** `since`
+   tokens, which is exactly the situation `-endpoint to_device` creates on
+   purpose in its second step. There, whoever is asked second sees an inbox the
+   first has already been through. **Synapse is always asked first.** Ask us
+   first and we delete the messages Synapse is about to be asked for, and a
+   worker that skipped the rest of a backlog looks identical to one that did
+   not.
 
 4. **`set_presence` mutates state** and emits `USER_SYNC` over replication.
    The comparator always sends `set_presence=offline`.
@@ -92,6 +105,28 @@ Eight independent sources of divergence:
    implementation: do not read a passing incremental lazy-load comparison as
    proof that two *independently driven* caches would agree. They would not,
    and nothing requires them to — a given client is served by one worker.
+
+9. **The pin hides the to-device token wind-back.** When more than 100 to-device
+   messages are waiting, `_generate_sync_entry_for_to_device` returns the first
+   hundred and **replaces** the `to_device` field of its own now token with the
+   position of the last one it sent, so the client's `next_batch` resumes
+   mid-backlog rather than skipping the remainder.
+
+   The pin then hands us Synapse's already-wound token. A worker that never
+   winds anything back computes the same window from it, returns the same
+   hundred messages, and reports the same `next_batch`: under a pin the defect
+   is not merely hard to see, it is **unobservable**. Confirmed by building it
+   deliberately — pinned, the comparison passes.
+
+   → `syncdiff -endpoint to_device` is the one comparison that does not pin. It
+   sends the messages itself (so the section is not compared empty), lets both
+   sides find their own now token, compares the section *and* the `to_device`
+   position of `next_batch`, then asks both again from their own `next_batch`
+   and compares what comes back. The deliberate defect is named twice by that.
+
+   The same shape of blindness applies wherever Synapse mutates its own
+   now_token mid-response — `prev_batch` is the other case, already tolerated.
+   Anything derived from a token we supplied cannot be tested by supplying it.
 
 **Consequence.** The proxy/shadow/canary ladder is *not* built first: it depends
 on comparing two answers to the same live request, which sources 1–4 make

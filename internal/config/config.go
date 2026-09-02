@@ -36,6 +36,7 @@ type Config struct {
 
 	Listen       Listen       `yaml:"listen"`
 	Database     Database     `yaml:"database"`
+	ToDevice     ToDevice     `yaml:"to_device"`
 	Replication  Replication  `yaml:"replication"`
 	Auth         Auth         `yaml:"auth"`
 	Reference    Reference    `yaml:"reference"`
@@ -72,6 +73,30 @@ type Database struct {
 	// starve it. Zero means 16.
 	MaxConns int `yaml:"max_conns"`
 	// ConnectTimeoutSeconds bounds pool acquisition at startup. Zero means 10.
+	ConnectTimeoutSeconds int `yaml:"connect_timeout_seconds"`
+}
+
+// ToDevice governs the to_device section of /sync, and with it the one write
+// this worker makes.
+//
+// Serving to_device and deleting it are a single decision. Synapse's /sync
+// deletes the messages a device has acknowledged, bounded by its `since`; a
+// worker that served the section without deleting would hand a client the same
+// room keys on every sync for ever. So there is no "serve but do not delete"
+// setting: leave this disabled and the section is omitted entirely, which is
+// correct as long as a real Synapse worker is also syncing that device.
+//
+// The DSN must name a role granted SELECT and DELETE on device_inbox and
+// nothing more (deploy/device-inbox-role.sql). It is deliberately a second
+// connection: the main pool keeps its read-only role and its startup check, so
+// the read-only guarantee is weakened in exactly one named place.
+type ToDevice struct {
+	Enabled bool `yaml:"enabled"`
+	// DSN is a libpq connection string for the deleting role.
+	DSN string `yaml:"dsn"`
+	// MaxConns bounds the deleting pool. Zero means 4.
+	MaxConns int `yaml:"max_conns"`
+	// ConnectTimeoutSeconds bounds the initial connection. Zero means 10.
 	ConnectTimeoutSeconds int `yaml:"connect_timeout_seconds"`
 }
 
@@ -276,6 +301,18 @@ func (c *Config) validate() error {
 	if c.Database.MaxConns < 0 || c.Database.ConnectTimeoutSeconds < 0 {
 		return fmt.Errorf("database: values must not be negative")
 	}
+	if c.ToDevice.Enabled {
+		if c.ToDevice.DSN == "" {
+			return fmt.Errorf("to_device: dsn is required when enabled")
+		}
+		if c.ToDevice.DSN == c.Database.DSN {
+			return fmt.Errorf("to_device: dsn must not be the read-only database dsn; " +
+				"deletion needs its own narrowly granted role")
+		}
+	}
+	if c.ToDevice.MaxConns < 0 || c.ToDevice.ConnectTimeoutSeconds < 0 {
+		return fmt.Errorf("to_device: values must not be negative")
+	}
 	if c.Replication.Enabled && c.Replication.Address == "" {
 		return fmt.Errorf("replication: address is required when enabled")
 	}
@@ -322,6 +359,20 @@ func (d Database) ConnectTimeout() time.Duration {
 		return 10 * time.Second
 	}
 	return time.Duration(d.ConnectTimeoutSeconds) * time.Second
+}
+
+func (t ToDevice) Conns() int32 {
+	if t.MaxConns == 0 {
+		return 4
+	}
+	return int32(t.MaxConns)
+}
+
+func (t ToDevice) ConnectTimeout() time.Duration {
+	if t.ConnectTimeoutSeconds == 0 {
+		return 10 * time.Second
+	}
+	return time.Duration(t.ConnectTimeoutSeconds) * time.Second
 }
 
 func (a Auth) Positive() time.Duration {

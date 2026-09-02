@@ -521,3 +521,59 @@ Non-vacuity checked twice, as CLAUDE.md requires. Disabling the lazy-load state
 restriction fails the lazy filter and still passes the default one. Disabling
 the lazy-load cache dedupe fails at two of three rewinds — which is what
 establishes that the incremental passes are not vacuous.
+
+## M8 — to-device, and the one write (2026-09-02)
+
+The blocker recorded since M1 was decided rather than worked around: a narrow
+`DELETE` on `device_inbox` alone, the owner's call. `device_lists` and the key
+counts had worked since M4, so what M8 actually added is `to_device` — and with
+it the first non-`SELECT` this project issues.
+
+The grant is kept narrow by construction, not by intention. A separate role
+(`gosync_inbox`, `SELECT, DELETE` on `device_inbox` and nothing else), a
+separate package and pool (`internal/deviceinbox`), and a startup check that
+refuses to run if the role is read-only, cannot delete from `device_inbox`, can
+delete from `events`, or can insert into `device_inbox`. A role that is too
+powerful fails as loudly as one that is too weak; `internal/store` keeps its
+read-only role, and every query in it is still a `SELECT`.
+
+Serving and deleting are one setting. There is no "serve but do not delete":
+that would hand a client the same room keys on every sync for ever.
+
+### What the pin could not see
+
+The interesting part was not the section but its token. Above 100 waiting
+messages Synapse returns the first hundred and winds the `to_device` field of
+its now token back to the last one it sent. Pin us to that already-wound token
+and a worker that never winds anything back computes the identical window,
+returns the identical hundred messages and reports the identical `next_batch`.
+Built deliberately, the defect passed a pinned comparison.
+
+So `syncdiff` gained `-endpoint to_device`, the one comparison here that does
+not pin: it sends the messages itself, lets both sides find their own token,
+compares the section *and* the token position, then asks both again from their
+own `next_batch`. The deliberate defect is named twice by that, and a second
+deliberate defect — dropping one message — is named twice as well.
+
+Its second step is also the destructive-endpoint trap in concrete form. Both
+sides delete what their `since` acknowledges, so whoever is asked second sees an
+inbox the first has been through. Asking us first turned "we skipped the rest of
+the backlog" into two identical empty answers; Synapse is now always asked
+first. That cost a run to find and is exactly the failure mode
+comparability.md's source 3 warns about.
+
+### Verified
+
+Both accounts. Identical sections and `next_batch` for 3, 5, 105 and 120
+waiting messages; truncation at 100 and the resume that follows it; deletion
+observed at the row level — the syncing device's rows gone, every other device
+of the same user untouched. Full M1–M6 regression re-run green: 39 rooms of
+`room_initial_sync`, `/initialSync`, initial and incremental `/sync` at rewinds
+of 30k, 200k and 500k, `state_after`, and four filters, on both accounts.
+
+One reproducible defect surfaced by that regression is **not** fixed, because
+the M6 build reproduces it: with a `types` filter, `incrementalRoomEntry`
+reports `limited: true` and a `prev_batch` of `first_event - 1` where Synapse
+reports `false` and the `since` token. It has its own path rather than going
+through `loadFilteredRecents`, and differs from `_load_filtered_recents` in
+three ways. Diagnosed in milestones.md; it is the next thing to fix.

@@ -21,6 +21,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -43,11 +44,13 @@ func main() {
 		tokenFile  = flag.String("token-file", "", "file holding the test account's access token")
 		rooms      = flag.String("rooms", "", "comma-separated room IDs; default is every joined room")
 		limit      = flag.Int("limit", 10, "pagination limit to request")
-		endpoint   = flag.String("endpoint", "room_initial_sync", "room_initial_sync | initial_sync | sync | incremental_sync")
+		endpoint   = flag.String("endpoint", "room_initial_sync", "room_initial_sync | initial_sync | sync | incremental_sync | to_device")
 		stateAfter = flag.Bool("state-after", false, "request MSC4222 org.matrix.msc4222.state_after")
 		rewind     = flag.Int("rewind", 2000, "for incremental_sync: how far to rewind the room key to build a `since`")
 		verbose    = flag.Bool("v", false, "print each compared response")
 		filterJSON = flag.String("filter", "", "inline sync filter JSON, sent as ?filter=")
+		toDevice   = flag.Int("to-device", 105, "for -endpoint to_device: how many messages to send to the account's own device. More than 100 exercises truncation")
+		homeserver = flag.String("homeserver", "", "base URL of the homeserver, e.g. https://example.com; required by -to-device")
 	)
 	flag.Parse()
 
@@ -66,6 +69,21 @@ func main() {
 	ref := unixClient(*refSocket)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+
+	if *endpoint == "to_device" {
+		if *homeserver == "" {
+			fmt.Fprintln(os.Stderr, "-endpoint to_device needs -homeserver")
+			os.Exit(2)
+		}
+		res := compareToDevice(ctx, ours, ref, token, *homeserver, *toDevice, *verbose)
+		printOne("/sync (to_device)", res)
+		report(boolToInt(res.kind == resultMatch), boolToInt(res.kind == resultMismatch),
+			boolToInt(res.kind == resultSkip))
+		if res.kind == resultMismatch {
+			os.Exit(1)
+		}
+		return
+	}
 
 	if *endpoint == "incremental_sync" {
 		res := compareIncrementalSync(ctx, ours, ref, token, *rewind, *verbose, *stateAfter,
@@ -1130,6 +1148,135 @@ func compareIncrementalSync(ctx context.Context, ours, ref *http.Client, token s
 	return result{resultMismatch, strings.Join(diffs, "\n")}
 }
 
+// compareToDevice compares the to_device section, end to end and UNPINNED.
+//
+// It is the one comparison here that deliberately does not pin, because the pin
+// hides the defect it is looking for. When more than 100 to-device messages are
+// waiting, Synapse returns the first 100 and winds the to_device field of its
+// now token back to the last one it sent, so that the client's next sync
+// resumes mid-backlog instead of skipping the rest. Pin us to Synapse's
+// already-wound token and a worker that never winds anything back computes the
+// same window, returns the same hundred messages and reports the same
+// next_batch: the bug is invisible for as long as we are only ever asked once,
+// with an answer we were handed.
+//
+// So both sides find their own now token, and the check is made in two steps:
+//
+//  1. both sync from the same `since` and must return the same messages AND
+//     the same to_device position in next_batch;
+//  2. both then sync again from their OWN next_batch, and must return the same
+//     remainder. A worker that did not wind its token back returns nothing
+//     here, because it has already claimed to be past the backlog.
+//
+// Unpinning is sound because only to_device is compared, and neither side's
+// answer depends on a clock or on where the event stream happens to be. It
+// needs the messages to stop arriving, which is why the comparator sends them
+// itself.
+//
+// Both sides delete as they go -- that is what makes step 2 meaningful -- so
+// this runs against a test account's device and nothing else.
+func compareToDevice(ctx context.Context, ours, ref *http.Client, token,
+	homeserver string, n int, verbose bool) result {
+
+	path := "/_matrix/client/v3/sync"
+	probe := url.Values{"timeout": {"0"}, "set_presence": {"offline"}}
+
+	probeBody, status, err := get(ctx, ref, path+"?"+probe.Encode(), token)
+	if err != nil || status != http.StatusOK {
+		return result{resultSkip, fmt.Sprintf("probe failed: %v (status %d)", err, status)}
+	}
+	var probeResp map[string]any
+	if err := json.Unmarshal(probeBody, &probeResp); err != nil {
+		return result{resultSkip, fmt.Sprintf("probe body is not JSON: %v", err)}
+	}
+	since, ok := probeResp["next_batch"].(string)
+	if !ok {
+		return result{resultSkip, "probe returned no next_batch"}
+	}
+
+	if err := sendToDevice(ctx, homeserver, token, n); err != nil {
+		return result{resultSkip, fmt.Sprintf("sending to-device messages failed: %v", err)}
+	}
+
+	q := url.Values{"timeout": {"0"}, "set_presence": {"offline"}, "since": {since}}
+
+	// Synapse first, here and in step two, and it matters. Both sides delete
+	// what their `since` acknowledges, so whoever is asked SECOND sees an inbox
+	// the first has already been through. In step two the two sides resume from
+	// different tokens when the bug is present, and asking us first would have
+	// us delete the very messages Synapse is about to be asked for -- turning
+	// "we skipped the rest of the backlog" into two identical empty answers.
+	refResp, res := syncOnce(ctx, ref, path+"?"+q.Encode(), token, "Synapse")
+	if res != nil {
+		return *res
+	}
+	ourResp, res := syncOnce(ctx, ours, path+"?"+q.Encode(), token, "we")
+	if res != nil {
+		return *res
+	}
+
+	var diffs []string
+	diff(".to_device", ourResp["to_device"], refResp["to_device"], &diffs)
+
+	ourNext, _ := ourResp["next_batch"].(string)
+	refNext, _ := refResp["next_batch"].(string)
+	ourPos, refPos := toDeviceField(ourNext), toDeviceField(refNext)
+	if ourPos != refPos {
+		diffs = append(diffs, fmt.Sprintf(
+			".next_batch to_device position: we said %s, Synapse said %s", ourPos, refPos))
+	}
+	if verbose {
+		fmt.Printf("--- to_device: since=%s, we resume at %s, Synapse at %s ---\n",
+			since, ourPos, refPos)
+	}
+
+	// Step two: each side resumes from its own token.
+	q.Set("since", refNext)
+	refAgain, res := syncOnce(ctx, ref, path+"?"+q.Encode(), token, "Synapse")
+	if res != nil {
+		return *res
+	}
+	q.Set("since", ourNext)
+	ourAgain, res := syncOnce(ctx, ours, path+"?"+q.Encode(), token, "we")
+	if res != nil {
+		return *res
+	}
+	diff(".resumed.to_device", ourAgain["to_device"], refAgain["to_device"], &diffs)
+
+	if len(diffs) == 0 {
+		return result{resultMatch, ""}
+	}
+	return result{resultMismatch, strings.Join(diffs, "\n")}
+}
+
+// syncOnce performs one sync and decodes it, or returns the result to report.
+func syncOnce(ctx context.Context, client *http.Client, url, token, who string) (
+	map[string]any, *result) {
+
+	body, status, err := get(ctx, client, url, token)
+	if err != nil {
+		return nil, &result{resultSkip, fmt.Sprintf("%s: request failed: %v", who, err)}
+	}
+	if status != http.StatusOK {
+		return nil, &result{resultMismatch, fmt.Sprintf("%s: returned %d: %s", who, status, truncate(body))}
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, &result{resultMismatch, fmt.Sprintf("%s: body is not JSON: %v", who, err)}
+	}
+	return resp, nil
+}
+
+// toDeviceField pulls the seventh underscore-separated field out of a stream
+// token, which is where to_device lives.
+func toDeviceField(tok string) string {
+	parts := strings.Split(tok, "_")
+	if len(parts) < 7 {
+		return "?"
+	}
+	return parts[6]
+}
+
 // rewindRoomKey moves a token's room key back by n stream positions, leaving
 // every other stream where it was.
 //
@@ -1148,4 +1295,82 @@ func rewindRoomKey(tokenStr string, n int) (string, error) {
 		return "", fmt.Errorf("cannot rewind %q by %d: would go negative", tokenStr, n)
 	}
 	return fmt.Sprintf("s%d_%s", pos-int64(n), rest), nil
+}
+
+// sendToDevice puts n to-device messages into the account's OWN device inbox,
+// so that a comparison has something to compare.
+//
+// Without it the to_device section is vacuous. An incremental comparison builds
+// its `since` by rewinding only the room key, so the to-device position of that
+// `since` is already the current one and the window (since, now] is empty --
+// both sides correctly return nothing, and a section that was never built would
+// pass just as well as one that was.
+//
+// The account sends to itself, which needs no second account and no second
+// token. It goes over the homeserver's public API rather than a worker socket
+// deliberately: sendToDevice is not a sync endpoint, and nginx knows which
+// worker should have it.
+//
+// This WRITES to the homeserver. Only ever point it at a test account.
+func sendToDevice(ctx context.Context, hs, token string, n int) error {
+	hs = strings.TrimSuffix(hs, "/")
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	whoami, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		hs+"/_matrix/client/v3/account/whoami", nil)
+	if err != nil {
+		return err
+	}
+	whoami.Header.Set("Authorization", "Bearer "+token)
+	resp, err := client.Do(whoami)
+	if err != nil {
+		return err
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("whoami returned %d: %s", resp.StatusCode, truncate(body))
+	}
+	var who struct {
+		UserID   string `json:"user_id"`
+		DeviceID string `json:"device_id"`
+	}
+	if err := json.Unmarshal(body, &who); err != nil {
+		return err
+	}
+	if who.DeviceID == "" {
+		return fmt.Errorf("token has no device_id; to-device messages need one")
+	}
+
+	stamp := time.Now().UnixNano()
+	for i := 1; i <= n; i++ {
+		payload, err := json.Marshal(map[string]any{
+			"messages": map[string]any{
+				who.UserID: map[string]any{
+					who.DeviceID: map[string]any{"syncdiff": i, "batch": stamp},
+				},
+			},
+		})
+		if err != nil {
+			return err
+		}
+		url := fmt.Sprintf("%s/_matrix/client/v3/sendToDevice/pt.aguiarvieira.syncdiff/%d-%d",
+			hs, stamp, i)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(payload))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("sendToDevice returned %d: %s", resp.StatusCode, truncate(body))
+		}
+	}
+	return nil
 }

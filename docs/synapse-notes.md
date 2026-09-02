@@ -658,3 +658,45 @@ Without the filter flag, every thread's notification and highlight counts are
 folded into the room's `notification_count` and `highlight_count`. With it, the
 threads are reported separately under `unread_thread_notifications` and the main
 counts carry only the main timeline. It is not an additive field.
+
+## To-device messages (2026-09-02, M8)
+
+**`/sync` deletes, and the deletion is bounded by `since`, not by the window.**
+`_wait_for_sync_for_user` calls `delete_messages_for_device(user, device,
+since_token.to_device_key)` before it does anything else — before the notifier
+wait, once per request, not once per pass round the long-poll loop. So a
+response's own messages are never deleted by the request that returns them:
+they go out in `(since, now]`, and the *next* request's `since` is what
+acknowledges them. That is what makes a replayed comparison safe.
+
+**The section is served on an initial sync too.** The guard is
+`device_id is not None and since_stream_id != now_token.to_device_key`, with
+`since_stream_id = 0` when there is no `since`. A device that has never synced
+still has an inbox waiting for it. Nothing is deleted on that path, because
+there is no `since` to prove the client received anything.
+
+**100 at a time, and the token is wound back to match.** `get_messages_for_device`
+takes `limit=100` and `/sync` never overrides it. When the limit is reached the
+storage layer returns *the stream id of the last row*, not the requested upper
+bound, and `_generate_sync_entry_for_to_device` assigns that to the now token:
+`now_token.copy_and_replace(TO_DEVICE, stream_id)`. So `next_batch` resumes
+mid-backlog and the remainder arrives on the following sync. Leave the token
+alone and everything past the hundredth message is skipped for ever. Measured:
+120 messages waiting, first sync returns 1..100 and a `next_batch` at the 100th
+message's position, second returns 101..120.
+
+Under 100 the same function returns the *requested upper bound* rather than the
+last row's position, which matters when the last row is not the last message in
+the stream — the device's inbox is sparse in a stream shared by every device on
+the server.
+
+**Deleting needs `SELECT` as well as `DELETE`.** PostgreSQL cannot put a `LIMIT`
+on a `DELETE`, so `delete_messages_for_device_between` first reads
+`MAX(stream_id)` over a windowed subquery and then deletes up to it, 1000 rows
+at a time, keeping a moving lower bound so successive batches do not rescan what
+the previous ones removed.
+
+**Stream ids are not unique.** One to-device message sent to several devices
+shares a stream id across them; ids are unique only within a `(user_id,
+device_id)` pair. That is why Synapse will only apply a limit when querying a
+single device.

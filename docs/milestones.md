@@ -16,7 +16,7 @@ Status is recorded here; what actually happened is in [log.md](log.md).
 | M6 | Filters and lazy-loading | **done** |
 | — | MSC4222 `state_after` | **done** |
 | M7 | Ephemeral: receipts, typing, presence | not started |
-| M8 | To-device and device lists | not started |
+| M8 | To-device and device lists | **done** |
 | M9 | Soak, then possibly the promotion ladder | not started |
 
 ## M1 and M2 — done, no gaps
@@ -68,8 +68,7 @@ room has no events at all before that `since`), so the state-group walk itself
 is under-returning for that room. Worth chasing when the state resolver is next
 touched.
 
-`to_device` is not implemented; that is M8, and it needs the deletion decision
-first.
+`to_device` is not implemented; that is M8.
 
 ## M5 — done
 
@@ -127,7 +126,72 @@ second was found the same way: a sticky event still in the timeline is removed
 from that section by Synapse, so the section appears only once the event ages
 out — or the moment a filter excludes it from the timeline.
 
-## M8 has an unresolved blocker
+## A pre-existing timeline defect, surfaced 2026-09-02
 
-Synapse's `/sync` deletes the to-device messages it returns; a read-only role
-cannot. See [decisions.md](decisions.md) before starting it.
+Found by the M8 regression, reproduced on the M6 build, so it predates this
+milestone and is **not fixed**. With `{"room":{"timeline":{"limit":5,
+"types":["m.room.message"]}}}` one busy room reports `limited: true` and a
+`prev_batch` of `first_event - 1` where Synapse reports `false` and the `since`
+token. Same single event on both sides.
+
+The cause is that `incrementalRoomEntry` has its own timeline path rather than
+using `loadFilteredRecents`, and it differs from `_load_filtered_recents` in
+three ways:
+
+1. `limited` is `len(raw) >= loadLimit`; Synapse's is `timeline_limit <
+   len(potential_recents)`, decided **before** filtering and against the
+   timeline limit, not the load limit.
+2. `prev_batch` is always `first_event - 1`. Synapse only moves `room_key` when
+   the timeline is **trimmed**; otherwise it stays at the per-room `upto_token`,
+   which is the start key of the loaded chunk — the `since` token for a room
+   that was not limited. This is the M6 `prev_batch` finding again, in the path
+   M6 did not touch.
+3. There is no re-pagination loop, so a filter that thins the page does not pull
+   older events in as Synapse does.
+
+The fix is to make the incremental path go through `loadFilteredRecents` with a
+per-room `upto_token`, which is a real piece of work rather than a patch.
+
+## M8 — done
+
+`device_lists.changed` / `left` and the key counts had worked since M4. What M8
+added is `to_device`, and with it **the only write this worker makes**.
+
+**The blocker was decided rather than worked around** (2026-09-02, the owner's
+call): a narrow `DELETE` on `device_inbox` alone. Synapse's `/sync` deletes the
+to-device messages a device has acknowledged, and serving the section without
+deleting hands a client the same room keys on every sync for ever — so the two
+are one decision, not two. See [decisions.md](decisions.md).
+
+The grant is kept honest by three things rather than by intention:
+
+- a **separate role** (`deploy/device-inbox-role.sql`), granted `SELECT, DELETE`
+  on `device_inbox` and nothing else;
+- a **separate package and pool** (`internal/deviceinbox`), so `internal/store`
+  keeps its read-only role and its startup check, and every query in it is
+  still a `SELECT`;
+- a **startup check that refuses to run** if the role is read-only, cannot
+  delete from `device_inbox`, can delete from `events`, or can insert into
+  `device_inbox`. A role that is too powerful fails as loudly as one that is
+  too weak.
+
+Verified against both accounts: identical `to_device` sections and identical
+`next_batch`, the 100-message truncation, the resume that follows it, and the
+deletion — 3 messages gone for the syncing device, and every other device of
+that user untouched to the row.
+
+**What the pin hides, and the comparator's answer to it.** With more than 100
+messages waiting Synapse returns the first 100 and winds the `to_device` field
+of its now token back to the last one it sent. Pin us to that already-wound
+token and a worker that never winds anything back computes the same window,
+returns the same hundred messages and reports the same `next_batch` — the defect
+is invisible. `syncdiff -endpoint to_device` is therefore the one comparison
+that does not pin: it sends the messages itself, lets both sides find their own
+token, and then asks both again from their own `next_batch`. Confirmed by
+building the defect deliberately: unpinned it is named twice, pinned it passes.
+
+Order matters in that second step, and it is the destructive-endpoint trap in
+concrete form: whoever is asked second sees an inbox the first has already been
+through. Ask us first and we delete the very messages Synapse is about to be
+asked for, turning "we skipped the rest of the backlog" into two identical empty
+answers. Synapse is always asked first.

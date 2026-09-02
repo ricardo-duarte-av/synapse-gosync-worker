@@ -44,6 +44,11 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 	if mxErr != nil {
 		return nil, http.StatusBadRequest, mxErr
 	}
+	// May wind now.ToDevice back, so it runs before next_batch is recorded.
+	toDevice, err := toDeviceEvents(ctx, d, verdict, since.ToDevice, &now)
+	if err != nil {
+		return nil, http.StatusInternalServerError, internalError(d, "to-device", err)
+	}
 	if ann != nil {
 		ann.NextBatch = now.String()
 	}
@@ -260,6 +265,10 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 	}
 
 	resp := map[string]any{"next_batch": now.String()}
+
+	if len(toDevice) > 0 {
+		resp["to_device"] = map[string]any{"events": toDevice}
+	}
 
 	if !f.BlocksAllGlobalAccountData() {
 		globalAD, err := d.Store.GlobalAccountDataSince(ctx, verdict.UserID,

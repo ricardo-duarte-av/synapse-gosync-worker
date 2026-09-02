@@ -12,6 +12,7 @@ import (
 
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/auth"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/clientevent"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/deviceinbox"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/lazyload"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/matrixerr"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/notifier"
@@ -52,6 +53,10 @@ type Deps struct {
 	// LazyLoad remembers which member events each device has been sent, so a
 	// lazy-loading sync does not repeat them.
 	LazyLoad *lazyload.Cache
+	// Inbox deletes acknowledged to-device messages. Nil when to_device is not
+	// configured, in which case the section is omitted entirely rather than
+	// served without ever being cleared.
+	Inbox *deviceinbox.Deleter
 }
 
 // defaultPaginationLimit is Synapse's PaginationConfig default for the legacy

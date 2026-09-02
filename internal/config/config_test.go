@@ -83,6 +83,13 @@ func TestValidationRejects(t *testing.T) {
 		{"replication without address", minimal + "replication:\n  enabled: true\n", "address is required"},
 		{"bad socket mode", "server_name: e.com\nlisten:\n  socket: /a\n  socket_mode: \"98\"\ndatabase:\n  dsn: x\nauth:\n  whoami_url: http://x\n", "socket_mode"},
 		{"both reference forms", minimal + "reference:\n  socket: /a\n  url: http://b\n", "at most one"},
+		{"to_device without dsn", minimal + "to_device:\n  enabled: true\n", "dsn is required"},
+		// The deleting role must be a second, narrower one. Reusing the
+		// read-only dsn would fail later anyway -- the role cannot delete --
+		// but failing at config time says why.
+		{"to_device reusing the read-only dsn",
+			minimal + "to_device:\n  enabled: true\n  dsn: \"host=/var/sockets user=gosync_ro dbname=synapse-db\"\n",
+			"must not be the read-only"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

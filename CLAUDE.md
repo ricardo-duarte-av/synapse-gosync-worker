@@ -70,6 +70,12 @@ for. Two consequences drive everything:
   of them were guessable.
 - **Test the transport you actually run.** Production listens on a unix socket;
   media-worker's notes record a bug that a TCP-only test run hid.
+- **This worker reads, with one named exception.** Every query in
+  `internal/store` is a `SELECT` and the role enforces it. To-device deletion
+  (`internal/deviceinbox`) is the sole write: a separate package, a separate
+  pool, a separate role granted `SELECT, DELETE` on `device_inbox` alone, and a
+  startup check that refuses a role any broader. Do not widen it, and do not
+  reach for that pool from anywhere else.
 - **Never re-encode stored event JSON.** 14,654 events on this server contain
   escaped NUL characters that PostgreSQL `jsonb` cannot even cast. Responses are
   built by splicing `event_json.json` with `sjson`, not by unmarshal/marshal.
@@ -105,6 +111,12 @@ go run ./cmd/syncdiff \
 ```
 
 Add `-endpoint initial_sync` for the whole-account snapshot.
+
+`-endpoint to_device -to-device 105 -homeserver https://aguiarvieira.pt` is the
+one comparison that deliberately does **not** pin, because the pin hides the
+only defect it is looking for. It sends the messages itself and asks both sides
+twice. It writes to the homeserver and both sides delete, so point it at a test
+account. See docs/comparability.md source 9.
 
 With no `-rooms`, it compares every room the test account has joined. Do that:
 the two rooms it was already in, not the seven purpose-built ones, are what

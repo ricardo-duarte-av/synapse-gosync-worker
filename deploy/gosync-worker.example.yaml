@@ -30,13 +30,38 @@ listen:
 # migrations for no additional guarantee. deploy/readonly-role.sql remains for
 # a deployment that has no such role yet.
 #
-# Read-only is not merely a convention here. Synapse's own /sync DELETES
-# to-device messages it has just returned, and a read-only role means we
-# physically cannot -- see the note in README.md before serving to_device.
+# Read-only is not merely a convention here: every query in internal/store is a
+# SELECT, and the role enforces it. The one exception is to-device deletion,
+# which gets its own role and its own pool below.
 database:
   dsn: "host=/var/sockets user=gopro_ro dbname=synapse-db"
   # Bounded well below Synapse's own pool so this worker cannot starve it.
   max_conns: 16
+  connect_timeout_seconds: 10
+
+# The to_device section of /sync, and the only write this worker makes.
+#
+# Synapse's /sync deletes the to-device messages a device has acknowledged,
+# bounded by its `since`. Serving the section without deleting would hand a
+# client the same room keys on every sync for ever, so there is no
+# "serve but do not delete" setting: leave this disabled and the section is
+# omitted entirely, which is correct as long as a real Synapse worker is also
+# syncing that device.
+#
+# The dsn must name the narrow role from deploy/device-inbox-role.sql, granted
+# SELECT and DELETE on device_inbox and nothing else. The worker verifies that
+# at startup and refuses to run if the role is broader.
+#
+# WARNING: enabling this makes the worker destructive for every device that
+# syncs against it. A device syncing against BOTH this worker and Synapse will
+# have messages deleted by whichever one it acknowledges them to -- which is
+# fine, deletion is bounded by the client's own `since` either way -- but a
+# device driven by a comparator whose `since` runs ahead of a real client's
+# would delete messages that client has not yet seen. Point it at test devices.
+to_device:
+  enabled: false
+  dsn: "host=/var/sockets user=gosync_inbox dbname=synapse-db"
+  max_conns: 4
   connect_timeout_seconds: 10
 
 # Synapse's replication stream, over Redis (KeyDB here).

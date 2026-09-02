@@ -57,6 +57,12 @@ func Sync(d Deps) http.Handler {
 			if ann != nil {
 				ann.Since = since
 			}
+			// Synapse deletes acknowledged to-device messages once per request,
+			// before it starts waiting -- not once per pass round the long-poll
+			// loop, and not per room. Doing it here keeps that shape.
+			if tok, err := streamtoken.Parse(since); err == nil {
+				deleteAcknowledgedToDevice(r.Context(), d, verdict, tok)
+			}
 			body, status, mxErr = longPoll(r, d, verdict, since, useStateAfter, f, ann)
 		} else {
 			body, status, mxErr = initialSyncV2(r, d, verdict, useStateAfter, f)
@@ -82,6 +88,13 @@ func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter 
 	timeNow, mxErr := nowMillis(r, d)
 	if mxErr != nil {
 		return nil, http.StatusBadRequest, mxErr
+	}
+	// Before next_batch is recorded anywhere: a truncated to-device backlog
+	// winds the token back, and the annotation must show what the client will
+	// actually be handed.
+	toDevice, err := toDeviceEvents(ctx, d, verdict, 0, &now)
+	if err != nil {
+		return nil, http.StatusInternalServerError, internalError(d, "to-device", err)
 	}
 	if ann != nil {
 		ann.NextBatch = now.String()
@@ -155,6 +168,12 @@ func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter 
 	}
 
 	resp := map[string]any{"next_batch": now.String()}
+
+	// Absent rather than empty when there is nothing, as Synapse's
+	// `if sync_result.to_device:` gives.
+	if len(toDevice) > 0 {
+		resp["to_device"] = map[string]any{"events": toDevice}
+	}
 
 	if !f.BlocksAllGlobalAccountData() {
 		globalAD, err := d.Store.GlobalAccountData(ctx, verdict.UserID, d.MSC3391Enabled)

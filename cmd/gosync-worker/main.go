@@ -22,6 +22,7 @@ import (
 
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/auth"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/config"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/deviceinbox"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/handlers"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/lazyload"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/metrics"
@@ -104,6 +105,24 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 		log.Warn().Msg("database role is NOT read-only; see deploy/readonly-role.sql")
 	}
 
+	// The one writing connection, and only when to_device is configured. It
+	// holds a role granted SELECT and DELETE on device_inbox alone, verified at
+	// startup by deviceinbox.Open -- so the main pool above keeps its read-only
+	// role and its check, and the guarantee is weakened in exactly one place.
+	var inbox *deviceinbox.Deleter
+	if cfg.ToDevice.Enabled {
+		inbox, err = deviceinbox.Open(openCtx, deviceinbox.Config{
+			DSN:            cfg.ToDevice.DSN,
+			MaxConns:       cfg.ToDevice.Conns(),
+			ConnectTimeout: cfg.ToDevice.ConnectTimeout(),
+		})
+		if err != nil {
+			return err
+		}
+		defer inbox.Close()
+		log.Info().Msg("to_device enabled: acknowledged messages will be deleted")
+	}
+
 	authenticator, err := auth.New(auth.Config{
 		WhoamiSocket: cfg.Auth.WhoamiSocket,
 		WhoamiURL:    cfg.Auth.WhoamiURL,
@@ -127,6 +146,7 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 		log.Info().
 			Str("listen", server.Describe(spec)).
 			Bool("database_read_only", readOnly).
+			Bool("to_device", inbox != nil).
 			Str("replication_channel", cfg.Replication.Channel).
 			Msg("configuration and database access are usable")
 		return nil
@@ -169,6 +189,7 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 		Notifier:            notif,
 		LazyLoad: lazyload.New(cfg.Caches.LazyLoadMembersCacheSize,
 			cfg.Caches.LazyLoadMembersCacheTTL),
+		Inbox: inbox,
 		PushRuleFeatures: pushrules.Features{
 			MSC1767Enabled:             cfg.Experimental.MSC1767Enabled,
 			MSC3381PollsEnabled:        cfg.Experimental.MSC3381PollsEnabled,
