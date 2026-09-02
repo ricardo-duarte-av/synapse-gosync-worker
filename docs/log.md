@@ -769,3 +769,58 @@ Worth recording why this went unnoticed for eight milestones: every test until
 now has been curl or syncdiff, and neither sends a preflight or enforces CORS.
 The comparator compares bodies. Nothing in it looks at a header, so nothing in
 it could have caught this.
+
+## Two bugs a real client found in ten minutes (2026-09-02)
+
+gomuks connected, and every sync came back 400. Both bugs were in code that
+passed the whole comparator suite, and neither could have been found by it.
+
+### Refusing a filter Synapse accepts
+
+`{"presence":{"not_rooms":["*"]}}` -- gomuks uploads it, Synapse stores it, and
+we answered `"*" is not a valid room ID in presence.not_rooms` to every sync
+until the client gave up retrying.
+
+Two upstream facts, both wrong in our port. Synapse validates a filter when it
+is UPLOADED and when it arrives inline in the query string; `get_user_filter`
+reads a stored one back with no schema check at all. And `presence` uses
+FILTER_SCHEMA, which declares no `rooms`/`not_rooms` and allows additional
+properties, so a room list there is never checked even on upload.
+
+So stored filters are now parsed unvalidated, inline ones keep their checks
+(`filter.NewInline`), and room lists are validated only in the sections whose
+schema declares them. My own comment on the old code said "a stored filter
+passed validation when it was uploaded, so failing to read it back is our bug"
+-- true, and the premise that our validation matched Synapse's was the bug.
+
+### Serving events the server rejected
+
+Found while checking the first fix: with gomuks's `timeline.limit: 100`, one
+federated room's timeline started two events later than Synapse's and carried
+two member events Synapse never sends. They are REJECTED events --
+`rejection_reason = 'auth_error'` -- and `outlier = FALSE` does not exclude
+them. A rejected event is not an outlier; it is a real event at a real position
+that failed an auth check.
+
+Synapse filters them in every range query (`LEFT JOIN rejections ... IS NULL`)
+and asserts in `_get_events_from_cache_or_db` that none escapes. Every
+event-range query here now filters `rejection_reason IS NULL`. One of ours
+already did -- redactions.go -- which makes it a thing known once and not
+generalised.
+
+That room has 13 rejected events in 727, and two of them inside a 100-event
+window were enough to move the timeline. The default ten-event timeline never
+reached far enough back to include one, which is why eight milestones of
+comparison never saw it.
+
+### What this says about the comparator
+
+Neither bug was reachable from syncdiff. The first needs a filter uploaded by a
+client -- the comparator only ever sends filters it wrote itself, and it wrote
+valid ones. The second needs a timeline long enough to span a rejected event,
+and every test used a limit of 5, 10 or 100 against rooms chosen for being
+interesting in other ways.
+
+Ten minutes of a real client beat a day of a comparator. Both are now covered:
+the filter case by unit tests carrying gomuks's document verbatim, and the
+rejected-event case by the `filter=3` comparison, which reproduces it.

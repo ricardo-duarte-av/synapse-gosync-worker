@@ -894,3 +894,46 @@ preflight will not send the real request, even to an endpoint that would have
 worked.
 
 `Synapse-Trace-Id` is exposed whether or not anything emits it.
+
+## Filters are validated on upload, not on read (2026-09-02)
+
+Three paths, and they do not agree:
+
+| Path | Validated? |
+|---|---|
+| `POST /user/{id}/filter` | yes — `add_user_filter` calls `check_valid_filter` |
+| `?filter={...}` inline | yes — `sync.py` calls `check_valid_filter`, cached per literal string |
+| `?filter=<id>` stored | **no** — `get_user_filter` hands the stored JSON straight to `FilterCollection` |
+
+So a filter in the table is used exactly as stored, whatever it contains. A
+worker that re-validates on read can refuse a filter the homeserver has been
+serving for months, and there is no way for the client to recover: it did
+nothing wrong and the filter is not going to change.
+
+**`presence` and top-level `account_data` use FILTER_SCHEMA, which declares no
+`rooms` or `not_rooms` at all** — only `limit`, `senders`, `not_senders`,
+`types`, `not_types` and the MSC3874 rel_types — and it sets
+`additionalProperties: true`. A room list under `presence` is therefore never
+checked, even on the upload path. gomuks uploads
+`{"presence":{"not_rooms":["*"]}}` and Synapse stores it happily.
+
+At runtime the key is read anyway (`Filter.__init__` takes `not_rooms` for any
+filter) but never matches, because a presence EDU has no room for `_check` to
+test against.
+
+## Rejected events are never served (2026-09-02)
+
+`get_events_as_list` defaults to `allow_rejected=False`, and
+`_get_events_from_cache_or_db` **asserts** that no rejected event escapes when
+it is false. Range queries filter them in SQL:
+`LEFT JOIN rejections USING (event_id) ... AND rejections.event_id IS NULL`,
+which this schema also denormalises into `events.rejection_reason`.
+
+`outlier = FALSE` is not enough. A rejected event is not an outlier: it is a
+real event, in the room, at a real position, that failed an auth check. Serving
+one is worse than a parity bug -- it is showing a client something the server
+decided was not allowed to happen.
+
+They are common enough to matter. One federated room here holds 13 rejected and
+12 soft-failed events out of 727, and two rejected `m.room.member` events inside
+a single 100-event window were enough to shift the whole timeline by two.

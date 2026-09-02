@@ -156,16 +156,66 @@ func TestMSC3773AliasIsGated(t *testing.T) {
 }
 
 func TestInvalidFiltersAreRejected(t *testing.T) {
+	// Structural faults are rejected on BOTH paths: a document like this is
+	// not a filter at all, however it arrived.
 	for _, doc := range []string{
 		`{"room":{"timeline":{"limit":"ten"}}}`,
-		`{"room":{"timeline":{"senders":["not-a-user"]}}}`,
-		`{"room":{"rooms":["not-a-room"]}}`,
 		`{"event_format":"carrier-pigeon"}`,
 		`{"room":{"timeline":{"types":[1,2]}}}`,
 		`[]`,
 	} {
 		if _, err := New(json.RawMessage(doc)); err == nil {
 			t.Errorf("New(%s) should have failed", doc)
+		}
+		if _, err := NewInline(json.RawMessage(doc), Features{}); err == nil {
+			t.Errorf("NewInline(%s) should have failed", doc)
+		}
+	}
+}
+
+// TestIDsAreValidatedOnlyInline pins the asymmetry that broke a real client.
+//
+// Synapse validates a filter when it is UPLOADED and when it arrives inline in
+// the query string; `get_user_filter` reads the stored JSON back with no schema
+// check at all. Re-validating on read means rejecting filters the homeserver
+// has been serving for months.
+func TestIDsAreValidatedOnlyInline(t *testing.T) {
+	for _, doc := range []string{
+		`{"room":{"timeline":{"senders":["not-a-user"]}}}`,
+		`{"room":{"rooms":["not-a-room"]}}`,
+	} {
+		if _, err := NewInline(json.RawMessage(doc), Features{}); err == nil {
+			t.Errorf("NewInline(%s) should have rejected the ID", doc)
+		}
+		if _, err := New(json.RawMessage(doc)); err != nil {
+			t.Errorf("New(%s) must accept a stored filter unvalidated: %v", doc, err)
+		}
+	}
+}
+
+// TestPresenceRoomListsAreNeverValidated is gomuks's filter, verbatim.
+//
+// `presence` uses FILTER_SCHEMA, which declares no `rooms` or `not_rooms` at
+// all and allows additional properties -- so Synapse accepts `["*"]` there even
+// on the upload path, and stores it. We rejected it on every read, and the
+// client retried forever against a 400.
+func TestPresenceRoomListsAreNeverValidated(t *testing.T) {
+	doc := json.RawMessage(
+		`{"presence":{"not_rooms":["*"]},"room":{"state":{"lazy_load_members":true},` +
+			`"timeline":{"lazy_load_members":true,"limit":100}}}`)
+
+	for name, parse := range map[string]func() (*Collection, error){
+		"stored": func() (*Collection, error) { return New(doc) },
+		"inline": func() (*Collection, error) { return NewInline(doc, Features{}) },
+	} {
+		c, err := parse()
+		if err != nil {
+			t.Fatalf("%s: gomuks's filter must be accepted: %v", name, err)
+		}
+		// And the room list must not affect presence, which has no room to
+		// match against: Synapse's _check skips the room test for an EDU.
+		if !c.CheckPresence(Event{IsPresence: true, Sender: "@a:example.com"}) {
+			t.Errorf("%s: presence was filtered out by a room list", name)
 		}
 	}
 }

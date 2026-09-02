@@ -42,7 +42,9 @@ func resolveFilter(ctx context.Context, d Deps, userID, param string) (*filter.C
 		if err != nil {
 			return nil, &matrixerr.Error{ErrCode: matrixerr.CodeUnknown, Error: err.Error()}
 		}
-		c, err := filter.NewWithFeatures(capped, d.filterFeatures())
+		// Inline filters ARE validated, as Synapse's check_valid_filter does
+		// on this branch and only this branch.
+		c, err := filter.NewInline(capped, d.filterFeatures())
 		if err != nil {
 			return nil, &matrixerr.Error{ErrCode: matrixerr.CodeUnknown, Error: err.Error()}
 		}
@@ -62,10 +64,15 @@ func resolveFilter(ctx context.Context, d Deps, userID, param string) (*filter.C
 	if err != nil {
 		return nil, internalError(d, "user filter", err)
 	}
+	// NOT validated: Synapse's get_user_filter hands the stored JSON straight
+	// to FilterCollection with no schema check. Whatever is in the table is
+	// what the client gets, and a filter we refuse to read is a client that
+	// cannot sync at all.
 	c, err := filter.NewWithFeatures(raw, d.filterFeatures())
 	if err != nil {
-		// A stored filter passed validation when it was uploaded, so failing
-		// to read it back is our bug, not the client's.
+		// Only a structurally broken document reaches here -- not JSON, or a
+		// field of the wrong type. That is our bug or a corrupt row, not the
+		// client's fault.
 		return nil, internalError(d, "parse stored filter", err)
 	}
 	return c, nil

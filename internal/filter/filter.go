@@ -344,8 +344,34 @@ func New(doc json.RawMessage) (*Collection, error) {
 	return NewWithFeatures(doc, Features{})
 }
 
-// NewWithFeatures parses a user filter under the given experimental flags.
+// NewWithFeatures parses a user filter under the given experimental flags,
+// WITHOUT validating user or room IDs.
+//
+// That is not laxness, it is Synapse's read path. `get_user_filter` hands the
+// stored JSON straight to FilterCollection with no schema check at all:
+// validation happens when a filter is UPLOADED, and never again. A worker that
+// re-validates on read can reject a filter the homeserver has been serving
+// happily for months -- which is exactly what happened the first time a real
+// client pointed at this one. gomuks uploads
+// `{"presence":{"not_rooms":["*"]}}`, Synapse stores it, and we answered 400
+// to every sync until the client gave up.
+//
+// Use NewInline for a filter that arrived in the query string, which Synapse
+// does validate.
 func NewWithFeatures(doc json.RawMessage, feat Features) (*Collection, error) {
+	return parseCollection(doc, feat, false)
+}
+
+// NewInline parses a filter that arrived inline in the query string, and
+// validates it as Synapse's check_valid_filter does.
+//
+// The difference from a stored filter is upstream's, not ours: sync.py calls
+// check_valid_filter on the inline branch and not on the stored one.
+func NewInline(doc json.RawMessage, feat Features) (*Collection, error) {
+	return parseCollection(doc, feat, true)
+}
+
+func parseCollection(doc json.RawMessage, feat Features, validateIDs bool) (*Collection, error) {
 	if len(doc) == 0 {
 		doc = json.RawMessage(`{}`)
 	}
@@ -360,33 +386,42 @@ func NewWithFeatures(doc json.RawMessage, feat Features) (*Collection, error) {
 	c := &Collection{raw: doc}
 	room := root.Get("room")
 
+	// ROOM_FILTER_SCHEMA and ROOM_EVENT_FILTER_SCHEMA declare `rooms` and
+	// `not_rooms` as room_id_array, so those are validated. FILTER_SCHEMA --
+	// which is what `presence` and the top-level `account_data` use -- does
+	// NOT declare them at all, and has additionalProperties: true. A room list
+	// under `presence` is therefore never checked by Synapse, whatever it
+	// contains.
+	roomOpts := parseOpts{feat: feat, validateIDs: validateIDs, schemaHasRoomIDs: true}
+	plainOpts := parseOpts{feat: feat, validateIDs: validateIDs}
+
 	// The room-level filter carries only `rooms` and `not_rooms`; the other
 	// keys under `room` are whole sub-filters of their own.
 	c.room = Filter{}
-	if err := parseRoomIDList(room.Get("rooms"), "room.rooms", &c.room.Rooms); err != nil {
+	if err := parseRoomIDList(room.Get("rooms"), "room.rooms", &c.room.Rooms, roomOpts); err != nil {
 		return nil, err
 	}
-	if err := parseRoomIDList(room.Get("not_rooms"), "room.not_rooms", &c.room.NotRooms); err != nil {
+	if err := parseRoomIDList(room.Get("not_rooms"), "room.not_rooms", &c.room.NotRooms, roomOpts); err != nil {
 		return nil, err
 	}
 
 	var err error
-	if c.roomTimeline, err = parseFilter(room.Get("timeline"), "room.timeline", feat); err != nil {
+	if c.roomTimeline, err = parseFilter(room.Get("timeline"), "room.timeline", roomOpts); err != nil {
 		return nil, err
 	}
-	if c.roomState, err = parseFilter(room.Get("state"), "room.state", feat); err != nil {
+	if c.roomState, err = parseFilter(room.Get("state"), "room.state", roomOpts); err != nil {
 		return nil, err
 	}
-	if c.roomEphemeral, err = parseFilter(room.Get("ephemeral"), "room.ephemeral", feat); err != nil {
+	if c.roomEphemeral, err = parseFilter(room.Get("ephemeral"), "room.ephemeral", roomOpts); err != nil {
 		return nil, err
 	}
-	if c.roomAccountData, err = parseFilter(room.Get("account_data"), "room.account_data", feat); err != nil {
+	if c.roomAccountData, err = parseFilter(room.Get("account_data"), "room.account_data", roomOpts); err != nil {
 		return nil, err
 	}
-	if c.presence, err = parseFilter(root.Get("presence"), "presence", feat); err != nil {
+	if c.presence, err = parseFilter(root.Get("presence"), "presence", plainOpts); err != nil {
 		return nil, err
 	}
-	if c.globalAccountData, err = parseFilter(root.Get("account_data"), "account_data", feat); err != nil {
+	if c.globalAccountData, err = parseFilter(root.Get("account_data"), "account_data", plainOpts); err != nil {
 		return nil, err
 	}
 
@@ -412,8 +447,23 @@ func NewWithFeatures(doc json.RawMessage, feat Features) (*Collection, error) {
 	return c, nil
 }
 
+// parseOpts carries the two things that differ between call sites: whether IDs
+// are validated at all, and whether this section's schema declares room IDs.
+type parseOpts struct {
+	feat Features
+	// validateIDs is true only for a filter Synapse would run through
+	// check_valid_filter -- an inline one. A stored filter is never
+	// re-validated.
+	validateIDs bool
+	// schemaHasRoomIDs distinguishes ROOM_EVENT_FILTER_SCHEMA, which declares
+	// rooms/not_rooms as room_id_array, from FILTER_SCHEMA, which does not
+	// declare them at all.
+	schemaHasRoomIDs bool
+}
+
 // parseFilter reads one FILTER_SCHEMA / ROOM_EVENT_FILTER_SCHEMA object.
-func parseFilter(v gjson.Result, path string, feat Features) (Filter, error) {
+func parseFilter(v gjson.Result, path string, opts parseOpts) (Filter, error) {
+	feat := opts.feat
 	f := Filter{Limit: 10}
 	if !v.Exists() {
 		return f, nil
@@ -474,7 +524,7 @@ func parseFilter(v gjson.Result, path string, feat Features) (Filter, error) {
 		{"senders", &f.Senders},
 		{"not_senders", &f.NotSenders},
 	} {
-		if err := parseUserIDList(v.Get(l.key), path+"."+l.key, l.dst); err != nil {
+		if err := parseUserIDList(v.Get(l.key), path+"."+l.key, l.dst, opts); err != nil {
 			return f, err
 		}
 	}
@@ -485,7 +535,7 @@ func parseFilter(v gjson.Result, path string, feat Features) (Filter, error) {
 		{"rooms", &f.Rooms},
 		{"not_rooms", &f.NotRooms},
 	} {
-		if err := parseRoomIDList(v.Get(l.key), path+"."+l.key, l.dst); err != nil {
+		if err := parseRoomIDList(v.Get(l.key), path+"."+l.key, l.dst, opts); err != nil {
 			return f, err
 		}
 	}
@@ -527,9 +577,12 @@ func parseStringList(v gjson.Result, path string, dst *[]string) error {
 	return nil
 }
 
-func parseUserIDList(v gjson.Result, path string, dst *[]string) error {
+func parseUserIDList(v gjson.Result, path string, dst *[]string, opts parseOpts) error {
 	if err := parseStringList(v, path, dst); err != nil {
 		return err
+	}
+	if !opts.validateIDs {
+		return nil
 	}
 	for _, id := range *dst {
 		if !ValidUserID(id) {
@@ -539,9 +592,12 @@ func parseUserIDList(v gjson.Result, path string, dst *[]string) error {
 	return nil
 }
 
-func parseRoomIDList(v gjson.Result, path string, dst *[]string) error {
+func parseRoomIDList(v gjson.Result, path string, dst *[]string, opts parseOpts) error {
 	if err := parseStringList(v, path, dst); err != nil {
 		return err
+	}
+	if !opts.validateIDs || !opts.schemaHasRoomIDs {
+		return nil
 	}
 	for _, id := range *dst {
 		if !ValidRoomID(id) {

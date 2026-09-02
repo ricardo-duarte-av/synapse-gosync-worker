@@ -503,7 +503,7 @@ func (s *Store) PaginateBackwards(ctx context.Context, roomID, roomVersion strin
 	if from.IsHistorical() {
 		sql = `SELECT ` + cols + `
 		  FROM events e JOIN event_json ej USING (event_id)
-		 WHERE e.outlier = FALSE AND e.room_id = $1
+		 WHERE e.outlier = FALSE AND e.rejection_reason IS NULL AND e.room_id = $1
 		   AND (e.topological_ordering < $2
 		        OR (e.topological_ordering = $2 AND e.stream_ordering <= $3))
 		 ORDER BY e.topological_ordering DESC, e.stream_ordering DESC
@@ -512,7 +512,7 @@ func (s *Store) PaginateBackwards(ctx context.Context, roomID, roomVersion strin
 	} else {
 		sql = `SELECT ` + cols + `
 		  FROM events e JOIN event_json ej USING (event_id)
-		 WHERE e.outlier = FALSE AND e.room_id = $1
+		 WHERE e.outlier = FALSE AND e.rejection_reason IS NULL AND e.room_id = $1
 		   AND e.stream_ordering <= $2
 		 ORDER BY e.topological_ordering DESC, e.stream_ordering DESC
 		 LIMIT $3`
@@ -601,7 +601,7 @@ func (s *Store) PaginateBackwardsStream(ctx context.Context, roomID, roomVersion
 		       COALESCE(e.state_key, ''), e.state_key IS NOT NULL,
 		       ej.json, ej.internal_metadata
 		  FROM events e JOIN event_json ej USING (event_id)
-		 WHERE e.outlier = FALSE AND e.room_id = $1
+		 WHERE e.outlier = FALSE AND e.rejection_reason IS NULL AND e.room_id = $1
 		   AND e.stream_ordering <= $2 AND e.stream_ordering > $3
 		 ORDER BY e.stream_ordering DESC
 		 LIMIT $4`
@@ -747,6 +747,7 @@ func (s *Store) StateIDsAt(ctx context.Context, roomID string, key streamtoken.R
 	const lastQ = `
 		SELECT event_id FROM events
 		 WHERE room_id = $1 AND stream_ordering <= $2 AND outlier = FALSE
+		   AND rejection_reason IS NULL
 		 ORDER BY stream_ordering DESC LIMIT 1`
 	var eventID string
 	err := s.pool.QueryRow(ctx, lastQ, roomID, key.MaxStreamPos()).Scan(&eventID)

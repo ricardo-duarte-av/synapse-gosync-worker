@@ -33,7 +33,7 @@ func (s *Store) RoomEventsForward(ctx context.Context, roomIDs []string,
 			       ROW_NUMBER() OVER (PARTITION BY e.room_id
 			                          ORDER BY e.stream_ordering ASC) AS rn
 			  FROM events e JOIN event_json ej USING (event_id)
-			 WHERE e.outlier = FALSE AND e.room_id = ANY($1)
+			 WHERE e.outlier = FALSE AND e.rejection_reason IS NULL AND e.room_id = ANY($1)
 			   AND e.stream_ordering > $2 AND e.stream_ordering <= $3
 		) x WHERE rn <= $4
 		ORDER BY stream_ordering ASC`
@@ -86,7 +86,7 @@ func (s *Store) MembershipEventsForUser(ctx context.Context, userID string,
 		  JOIN event_json ej USING (event_id)
 		  LEFT JOIN rooms r ON r.room_id = e.room_id
 		 WHERE e.type = 'm.room.member' AND e.state_key = $1
-		   AND e.outlier = FALSE
+		   AND e.outlier = FALSE AND e.rejection_reason IS NULL
 		   AND e.stream_ordering > $2 AND e.stream_ordering <= $3
 		 ORDER BY e.stream_ordering ASC`
 

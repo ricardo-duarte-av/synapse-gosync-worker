@@ -201,7 +201,7 @@ func (s *Store) RecentEvents(ctx context.Context, roomID, roomVersion string, li
 			       e.topological_ordering, COALESCE(e.instance_name, ''),
 			       COALESCE(e.state_key, ''), e.state_key IS NOT NULL, ej.json, ej.internal_metadata
 			  FROM events e JOIN event_json ej USING (event_id)
-			 WHERE e.outlier = FALSE AND e.room_id = $1
+			 WHERE e.outlier = FALSE AND e.rejection_reason IS NULL AND e.room_id = $1
 			   AND (e.topological_ordering < $2
 			        OR (e.topological_ordering = $2 AND e.stream_ordering <= $3))
 			 ORDER BY e.topological_ordering DESC, e.stream_ordering DESC
@@ -213,7 +213,7 @@ func (s *Store) RecentEvents(ctx context.Context, roomID, roomVersion string, li
 			       e.topological_ordering, COALESCE(e.instance_name, ''),
 			       COALESCE(e.state_key, ''), e.state_key IS NOT NULL, ej.json, ej.internal_metadata
 			  FROM events e JOIN event_json ej USING (event_id)
-			 WHERE e.outlier = FALSE AND e.room_id = $1
+			 WHERE e.outlier = FALSE AND e.rejection_reason IS NULL AND e.room_id = $1
 			   AND e.stream_ordering <= $2
 			 ORDER BY e.topological_ordering DESC, e.stream_ordering DESC
 			 LIMIT $3`

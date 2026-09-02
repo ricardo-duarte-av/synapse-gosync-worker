@@ -90,7 +90,7 @@ func (s *Store) RoomTimelineSince(ctx context.Context, roomIDs []string, roomVer
 			       ROW_NUMBER() OVER (PARTITION BY e.room_id
 			                          ORDER BY e.stream_ordering DESC) AS rn
 			  FROM events e JOIN event_json ej USING (event_id)
-			 WHERE e.outlier = FALSE AND e.room_id = ANY($1)
+			 WHERE e.outlier = FALSE AND e.rejection_reason IS NULL AND e.room_id = ANY($1)
 			   AND e.stream_ordering > $2 AND e.stream_ordering <= $3
 		) x WHERE rn <= $4`
 	rows, err := s.pool.Query(ctx, q, roomIDs, since, now, limit)
@@ -135,6 +135,7 @@ func (s *Store) LastEventBefore(ctx context.Context, roomID string, key streamto
 	const q = `
 		SELECT event_id FROM events
 		 WHERE room_id = $1 AND stream_ordering <= $2 AND outlier = FALSE
+		   AND rejection_reason IS NULL
 		 ORDER BY stream_ordering DESC LIMIT 1`
 	var id string
 	err := s.pool.QueryRow(ctx, q, roomID, key.MaxStreamPos()).Scan(&id)
