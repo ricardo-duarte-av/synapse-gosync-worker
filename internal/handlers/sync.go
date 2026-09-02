@@ -136,6 +136,16 @@ func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter 
 		}
 	}
 
+	// Invites from ignored users are dropped, as Synapse's
+	// _get_room_changes_for_initial_sync does. Being shown the invitations of
+	// somebody you have ignored is the one case where ignoring plainly does
+	// not work -- and on a real account it is not rare: four invites from 2025
+	// reappeared the first time a 500-room account synced here.
+	ignored, err := d.Store.IgnoredUsers(ctx, verdict.UserID)
+	if err != nil {
+		return nil, http.StatusInternalServerError, internalError(d, "ignored users", err)
+	}
+
 	joinedIDs := make([]string, 0, len(rooms))
 	for _, room := range rooms {
 		if room.Membership == "join" {
@@ -164,6 +174,9 @@ func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter 
 			break
 		}
 		if room.Membership == "invite" {
+			if ignored[room.Sender] {
+				continue
+			}
 			invite, err := d.Store.InviteEvent(ctx, room.EventID, room.RoomID, room.RoomVersion)
 			if err != nil {
 				return nil, http.StatusInternalServerError, internalError(d, "invite event", err)

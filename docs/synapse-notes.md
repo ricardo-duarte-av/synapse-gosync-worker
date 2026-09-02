@@ -957,3 +957,31 @@ It is invisible to a pinned comparator: one request in isolation carries the
 same typing event either way, and `m.typing` differences are a tolerated known
 gap precisely because typing lives only in memory. Only a client that syncs in
 a loop can see it.
+
+## Invites from ignored users are not reported (2026-09-02)
+
+Both room-change paths drop them, and it is easy to miss because it is two
+lines in the middle of a long function:
+
+```python
+elif event.membership == Membership.INVITE:
+    if event.sender in ignored_users:
+        continue
+    if invite_config.get_invite_rule(event.sender) == InviteRule.IGNORE:
+        continue
+```
+
+`_get_room_changes_for_initial_sync` has that; the incremental one has the same
+test around `last_non_join.sender`. The sender of the membership event is the
+inviter, which is what is checked against `m.ignored_user_list`.
+
+Nothing else about an ignored user's invite is special: the room stays in
+`local_current_membership` as `invite` for ever, so any implementation that
+lists memberships and reports them will show invitations from people the user
+ignored years ago. A 500-room account here carried four such invites from
+March 2025, invisible in Element against Synapse and present against this
+worker until the filter was added.
+
+The MSC4155 half (`invite_config.get_invite_rule`) is NOT implemented here. It
+reads a separate account-data event that no account on this server has set, so
+it changes nothing today -- recorded as a gap rather than silently skipped.

@@ -852,3 +852,22 @@ object form of `query`, which older Grafana ignores, leaving `$job` empty and
 every panel with it. They now use the plain-string form, default to All, and
 carry `allValue: ".*"` so the expressions match even if the variable never
 populates.
+
+## Four invites from 2025 (2026-09-02)
+
+A 500-room account synced against this worker and showed four invites that
+Element does not show against Synapse -- the oldest from March 2025. All four
+senders are on the account's `m.ignored_user_list` (161 users).
+
+Synapse drops an invite whose sender is ignored, in both the initial and the
+incremental path, and we reported every invite `local_current_membership` knew
+about. Nothing ever clears those rows: an ignored user's invitation sits there
+for ever, so the bug is permanent and grows with the account.
+
+Neither test account ignores anybody, which is why 39 rooms of comparison never
+saw it. That is now three defects in a row that needed a real account rather
+than a real client -- scale and history, not behaviour.
+
+MSC4155 invite rules are the other half of Synapse's test and are not
+implemented. No account on this server has that config, so it changes nothing
+today; recorded in README.md as a gap.

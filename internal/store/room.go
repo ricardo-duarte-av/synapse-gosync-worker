@@ -262,6 +262,44 @@ func (s *Store) RecentEvents(ctx context.Context, roomID, roomVersion string, li
 	return ascending, start, nil
 }
 
+// IgnoredUsers reads the caller's m.ignored_user_list.
+//
+// Needed once per sync rather than per room, because it decides which INVITES
+// are reported at all: Synapse drops an invite whose sender the caller has
+// ignored, in both the initial and the incremental path. Ignoring someone and
+// still being shown their invitations is the one case where ignoring plainly
+// does not work.
+func (s *Store) IgnoredUsers(ctx context.Context, userID string) (map[string]bool, error) {
+	const q = `
+		SELECT content FROM account_data
+		 WHERE user_id = $1 AND account_data_type = 'm.ignored_user_list'`
+	var raw *string
+	err := s.pool.QueryRow(ctx, q, userID).Scan(&raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: ignored users: %w", err)
+	}
+	if raw == nil {
+		return nil, nil
+	}
+	var parsed struct {
+		IgnoredUsers map[string]json.RawMessage `json:"ignored_users"`
+	}
+	if err := json.Unmarshal([]byte(*raw), &parsed); err != nil {
+		return nil, fmt.Errorf("store: parsing ignore list: %w", err)
+	}
+	if len(parsed.IgnoredUsers) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]bool, len(parsed.IgnoredUsers))
+	for user := range parsed.IgnoredUsers {
+		out[user] = true
+	}
+	return out, nil
+}
+
 // VisibilityExtras are the per-request facts a visibility decision needs
 // beyond the room state resolved at each event.
 type VisibilityExtras struct {

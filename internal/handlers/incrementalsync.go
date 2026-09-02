@@ -230,6 +230,11 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 	if err != nil {
 		return nil, http.StatusInternalServerError, internalError(d, "membership changes", err)
 	}
+	ignored, err := d.Store.IgnoredUsers(ctx, verdict.UserID)
+	if err != nil {
+		return nil, http.StatusInternalServerError, internalError(d, "ignored users", err)
+	}
+
 	invitedRooms := map[string]any{}
 	lastChange := map[string]store.MembershipChange{}
 	for _, c := range changes {
@@ -237,6 +242,12 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 	}
 	for roomID, c := range lastChange {
 		if c.Membership != "invite" {
+			continue
+		}
+		// An invite from an ignored user is not reported at all. The sender of
+		// the membership event is the inviter, which is exactly what Synapse
+		// checks against the ignore list.
+		if ignored[c.Sender] {
 			continue
 		}
 		invite, err := d.Store.InviteEvent(ctx, c.EventID, roomID, roomVersions[roomID])

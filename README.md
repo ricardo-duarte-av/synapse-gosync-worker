@@ -62,6 +62,13 @@ Synapse but nothing else: it is a single-event lookup with no notifier, no
 tokens and no streaming, and it belongs to whichever worker serves the room
 endpoints rather than to a sync worker.
 
+**MSC4155 invite rules are not implemented.** Synapse drops an invite when
+either the sender is on the caller's `m.ignored_user_list` -- which this worker
+does honour -- or when the caller's MSC4155 invite-permission config says to
+ignore them. The second half reads an account-data event that no account on
+this deployment has set, so it changes nothing here; a deployment whose users
+set it would see invites we report and Synapse does not.
+
 **One upstream bug is deliberately not reproduced.** Synapse's
 `_get_unread_counts_by_pos_txn` adds a room's post-rotation main-timeline counts
 to a leftover loop variable rather than to the main timeline, so they land on
