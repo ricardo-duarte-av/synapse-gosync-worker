@@ -1015,3 +1015,22 @@ The same applies to any question about one state key. `compute_summary` asks
 whether a room has a name; resolving the entire state map to read
 `m.room.name` is the same answer at four orders of magnitude more work, and a
 summary is computed for every lazy-loading room in an initial sync.
+
+## Rooms are built ten at a time (2026-09-02)
+
+`_generate_sync_entry_for_rooms` ends with
+
+```python
+await concurrently_execute(handle_room_entries, room_entries, 10)
+```
+
+so Synapse builds ten room entries at once. This is not an optimisation bolted
+on to a sequential design; it is the design, and a port that walks rooms one at
+a time is slower than upstream by roughly that factor on any account large
+enough to notice. 500 rooms sequentially took 193 seconds here.
+
+The number matters beyond throughput. The lazy-loaded member cache is written as
+rooms are built, so how many run concurrently decides which members a later room
+considers already sent -- another reason the two implementations can disagree
+about lazy loading, and another reason to match the constant rather than pick
+one.

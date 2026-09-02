@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"sort"
+	"sync"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -167,6 +170,9 @@ func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter 
 	joinedRooms := map[string]any{}
 	invitedRooms := map[string]any{}
 
+	// Invites first, and sequentially: there are few of them and each is one
+	// event, so there is nothing to parallelise.
+	var toBuild []store.RoomForUser
 	for _, room := range rooms {
 		// A filter naming no rooms drops the whole section, which is cheaper
 		// than building it and discarding every entry.
@@ -190,14 +196,37 @@ func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter 
 			}
 			continue
 		}
+		toBuild = append(toBuild, room)
+	}
 
-		entry, err := syncRoomEntry(ctx, d, room, verdict.UserID, now.Room, timeNow, cfg,
-			accountDataByRoom[room.RoomID], now, useStateAfter, f, verdict.DeviceID, true,
-			timelineSource{upto: now}, sticky[room.RoomID])
-		if err != nil {
-			return nil, http.StatusInternalServerError, internalError(d, "room entry", err)
-		}
-		joinedRooms[room.RoomID] = entry
+	// Rooms are built ten at a time, which is what Synapse does --
+	// `concurrently_execute(handle_room_entries, room_entries, 10)`,
+	// handlers/sync.py:2700 -- and not a liberty taken for speed.
+	//
+	// It is the difference between a usable initial sync and an unusable one at
+	// real scale. Each room costs a handful of sequential round trips to a
+	// database holding a 17GB state table, and 500 of them one after another
+	// took 193 seconds on a live account. The response is a map keyed by room
+	// id, so the order rooms complete in does not reach the client.
+	group, gctx := errgroup.WithContext(ctx)
+	group.SetLimit(roomEntryConcurrency)
+	var mu sync.Mutex
+	for _, room := range toBuild {
+		group.Go(func() error {
+			entry, err := syncRoomEntry(gctx, d, room, verdict.UserID, now.Room, timeNow, cfg,
+				accountDataByRoom[room.RoomID], now, useStateAfter, f, verdict.DeviceID, true,
+				timelineSource{upto: now}, sticky[room.RoomID])
+			if err != nil {
+				return err
+			}
+			mu.Lock()
+			joinedRooms[room.RoomID] = entry
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := group.Wait(); err != nil {
+		return nil, http.StatusInternalServerError, internalError(d, "room entry", err)
 	}
 
 	resp := map[string]any{"next_batch": now.String()}
@@ -819,6 +848,14 @@ func longPoll(r *http.Request, d Deps, verdict auth.Verdict, since string,
 		}
 	}
 }
+
+// roomEntryConcurrency is how many rooms are built at once.
+//
+// Ten, because that is Synapse's number: `concurrently_execute(...,
+// room_entries, 10)`. Matching it matters for more than speed -- the
+// lazy-loaded member cache is written as rooms are built, so how many run
+// concurrently changes which members a sync considers already sent.
+const roomEntryConcurrency = 10
 
 // maxSyncTimeout caps how long a client may ask to wait.
 //

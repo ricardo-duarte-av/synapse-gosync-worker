@@ -909,3 +909,24 @@ The lazy comparisons then flapped, which was also my fault: two workers were
 running against the same account, and each keeps its own lazy-load member cache.
 With one worker it is 10/10. That is comparability source 8 biting the person
 who wrote it down.
+
+## Ten at a time (2026-09-02)
+
+The lazy state fetch was necessary and not sufficient: the 500-room initial sync
+went from 209 seconds to 193. Per room we are fine -- warm, we serve the same
+9.6MB initial sync in 1.1s against Synapse's 1.3s -- but we were doing 500 rooms
+one after another, and each room is a handful of sequential round trips to a
+database with a 17GB state table.
+
+Synapse builds ten room entries at once (`concurrently_execute(...,
+room_entries, 10)`, sync.py:2700). We now do the same, with the same limit.
+
+Measured cold on 30 rooms, which is small enough that only three batches run:
+**5.4-6.2s sequential, 2.0-2.2s concurrent**. At 500 rooms the ratio should be
+closer to the full ten.
+
+The lazy-load member cache is written while rooms are built, so concurrency
+changes which members a later room thinks it has already sent. That is a reason
+to match Synapse's number exactly rather than pick a bigger one -- and the race
+detector is clean, because the cache and the LRUs were mutex-guarded from the
+start.
