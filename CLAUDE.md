@@ -14,13 +14,14 @@ Start with the ground rules below, then whichever of these the task touches.
 
 | Document | Read it when |
 |---|---|
-| [docs/comparability.md](docs/comparability.md) | Writing or interpreting any parity test. Explains why two `/sync` answers legitimately differ, what pinning fixes, and the two things pinning cannot fix. **The most important document here.** |
+| [docs/comparability.md](docs/comparability.md) | Writing or interpreting any parity test. Nine reasons two `/sync` answers legitimately differ, what pinning fixes, and the three it cannot. **The most important document here.** |
 | [docs/tokens.md](docs/tokens.md) | Touching stream tokens, or wondering why the `end` token is approximate before M5. |
 | [docs/synapse-notes.md](docs/synapse-notes.md) | Implementing anything new. Findings that contradict a plain reading of the source, plus a map of where things live in Synapse. |
 | [docs/auth.md](docs/auth.md) | Touching authentication. Why we ask Synapse rather than reading `access_tokens`. |
 | [docs/decisions.md](docs/decisions.md) | Before deciding something that looks already-decided. |
 | [docs/log.md](docs/log.md) | Catching up on what has been done, in order. |
 | [docs/milestones.md](docs/milestones.md) | Picking up the next piece of work. |
+| [deploy/grafana/README.md](deploy/grafana/README.md) | Watching a running worker. Which panels mislead, and the two things the dashboard cannot see. |
 
 ## 2. What this is
 
@@ -35,8 +36,15 @@ drift into it"*). Conventions, dependency choices, config shape, unix-socket
 serving and live-test gating are reused from `synapse-gopro-worker` and
 `synapse-media-worker` rather than reinvented.
 
-**Nothing is routed to this worker.** It is driven deliberately by
-`cmd/syncdiff` and the test account.
+**It is routed to, but only on its own hostname.** `gosync.aguiarvieira.pt` is
+a second nginx host that sends the four endpoints here and everything else to
+Synapse's own workers; `aguiarvieira.pt` is untouched, so no real client reaches
+this worker by accident. Element Web and gomuks run against it on the owner's
+main account (654 rooms), alongside `cmd/syncdiff` and the two test accounts.
+
+That split is why `/login` needs rewriting on the second host: Synapse puts
+`public_baseurl` in the login response's `well_known`, and a client obeys it and
+goes straight back to the real hostname. See §6.
 
 ### Why, measured
 
@@ -54,10 +62,12 @@ scope, and a scope with a hole in it is not a finished scope.
 Roughly seven times the entire federation read volume gopro-worker was built
 for. Two consequences drive everything:
 
-- **Almost all real traffic is incremental**, so the early milestones cannot be
-  validated by watching production. They have to be driven from the test account.
-- **The three legacy endpoints serve nobody here.** They are warm-up targets,
-  not deliverables.
+- **Almost all real traffic is incremental**, so the early milestones could not
+  be validated by watching production. They were driven from a test account, and
+  since the split host exists, from real clients on a real one.
+- **The three legacy endpoints serve nobody here.** They were warm-up targets;
+  they are served and at parity because the scope said so, not because anything
+  asks for them.
 
 ---
 
@@ -79,13 +89,33 @@ for. Two consequences drive everything:
   pool, a separate role granted `SELECT, DELETE` on `device_inbox` alone, and a
   startup check that refuses a role any broader. Do not widen it, and do not
   reach for that pool from anywhere else.
+- **The comparator cannot see everything, and knowing its shape is part of
+  using it.** It compares one request at a time, bodies only, with filters it
+  wrote itself, and it never follows `next_batch` in a loop. So it is blind to
+  anything about liveness, headers, or client-uploaded filters — and four
+  defects in one evening were found by pointing real clients at it instead:
+  CORS (no preflight, no header comparison), a typing hot loop (needs a client
+  that syncs in a loop), a rejected filter (needs a filter a client wrote), and
+  invites from ignored users (needs an account that ignores somebody). Prefer
+  the comparator for equivalence; prefer a real client for liveness.
+- **Anything derived from a token we supplied cannot be tested by supplying
+  it.** Pinning hands the implementation its own answer. Three instances so
+  far: `prev_batch`, the to-device wind-back, and `/events`' `end` token — in
+  each case a deliberately broken build passed a pinned comparison. When a
+  field is computed FROM the now token, the comparison has to stop pinning that
+  field. See docs/comparability.md sources 3 and 9.
+- **Scale and history find what behaviour does not.** The test accounts have 9
+  and 30 rooms and ignore nobody. The main account has 654 rooms and 161 ignored
+  users, and produced: a 209-second initial sync, 1.5GB of state maps, four
+  invites from 2025, and a room whose newest 1,587 events are all rejected. None
+  of those are behavioural differences a small account can express.
 - **Never re-encode stored event JSON.** 14,654 events on this server contain
   escaped NUL characters that PostgreSQL `jsonb` cannot even cast. Responses are
   built by splicing `event_json.json` with `sjson`, not by unmarshal/marshal.
 
 ---
 
-## 7. Commands
+## 4. Commands
 
 ```sh
 go build ./... && go test -race ./...
@@ -104,7 +134,7 @@ all three workers in this family share the workflow's shape.
 Live tests gate on env vars and `t.Skip()` otherwise — they never fail CI and
 run only against the real deployment. See `.claude/deployment-notes.md`.
 
-## 8. Running the comparator
+## 5. Running the comparator
 
 The reference worker must have `sync_response_cache_duration: 0`. Verify that
 before trusting a run: a cached reference answer is reported as a *match*.
@@ -141,3 +171,62 @@ untrimmed one.
 **Check the comparator still bites** after changing it. Build the worker with
 one field deliberately wrong and confirm syncdiff names it and exits non-zero. A
 comparator that always says "ok" is worse than none.
+
+## 6. Driving it with a real client
+
+Worth doing, and the last four defects came from it. Four things to get right
+first, because three of them fail in ways that look like our bug and one of them
+is destructive.
+
+**The login response overrides the hostname.** Synapse puts `public_baseurl`
+into `/login`'s `well_known`, so a client logging in against the second host is
+told to go back to `aguiarvieira.pt` and does. Rewrite it on that host:
+
+```nginx
+location ~ ^/_matrix/client/(api/v1|r0|v3|unstable)/login$ {
+	include /data/nginx/custom/matrix-config.conf;
+	sub_filter_types application/json;
+	sub_filter_once off;
+	sub_filter "https://aguiarvieira.pt" "https://gosync.aguiarvieira.pt";
+	proxy_pass http://av-client-requests-lc;
+}
+```
+
+Do NOT add a bare `proxy_set_header` to that block. nginx inherits those from
+the enclosing level only when the level defines none, so one `proxy_set_header`
+silently drops `X-Forwarded-For`, and Synapse's login handler then calls `.host`
+on a `UNIXAddress` and 500s. The `include` carries the four headers, and
+`Accept-Encoding ""` with them, which `sub_filter` needs anyway.
+
+**`socket_mode` must be `0666`.** nginx runs in another container as a different
+uid. The example config's `0660` is right for the comparator and wrong the
+moment nginx has to connect.
+
+**`allow_pin_now` must be false.** It accepts a window that has not happened
+yet. It is for the comparator, never for a host a client can reach.
+
+**`to_device` deletes, and the blast radius is exactly one device.** Deletion is
+per `(user_id, device_id)` and bounded by that client's own `since`, so a fresh
+device is safe and an existing one is not: get it wrong and real messages become
+undecryptable. Use a new login. With `to_device.enabled: false` nothing is lost
+either — Synapse keeps the messages, and the device receives them when it next
+syncs against the real host — so that is the setting for a first pass.
+
+Also true and visible to other people: **we never write presence**, so an
+account syncing only against this worker appears permanently offline.
+
+### Comparing against a real account
+
+`cmd/syncdiff` is read-only with one exception each way: skip `-endpoint
+to_device` (it sends and deletes) and `-endpoint events` (it marks the account
+online — that endpoint has no `set_presence`). Everything else writes nothing.
+
+Two flags make a large account legible:
+
+```sh
+-filter '{"presence":{"not_types":["*"]},"room":{"state":{"lazy_load_members":true},"timeline":{"limit":1}}}'
+```
+
+`not_types: ["*"]` blocks presence, which is otherwise unpinnable noise that
+buries every real difference on an account with thousands of co-occupants. The
+timeline limit keeps the comparator from holding two 200MB documents as Go maps.
