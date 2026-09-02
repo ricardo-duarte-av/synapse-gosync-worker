@@ -960,3 +960,37 @@ Synapse is self-consistent about it.
 
 Everything else that showed up was live data: presence, receipts, typing, and
 unread counts drifting between the two requests on an account this busy.
+
+## The typist who never stopped (2026-09-02)
+
+Visible symptom: a user left "typing" in a room for ever. Cause: `typingEvent`
+returned nil for an empty typist list, so "stopped typing" was never sent.
+Synapse always builds the event -- `{"user_ids": []}` -- for any room whose
+typing serial moved, and that empty event is the only thing that clears the
+indicator; there is no timeout at the client end.
+
+Bounding typing by the token this evening made it visible rather than causing
+it: before that, the current typists were re-sent on every sync, so a client
+would keep being told somebody was typing and never that they had stopped.
+Either way the indicator stuck; only the reason changed.
+
+Initial and incremental now follow the same rule with different starting
+positions -- report a room whose serial moved past the client's token, then
+render whatever the list is. On an initial sync that position is 0, which is
+what Synapse's typing source is given when there is no `since`.
+
+### The short polls were not ours
+
+The same report came with 1.5 syncs a second and 15% CPU, which looked like the
+hot loop again. It is not. Measured against the same account with the same
+token, Synapse answers in 0.05-0.62s with one or two presence events and
+339-481 bytes; we answer in ~1s with the same shape. An account in 654 rooms
+gets a presence update roughly every half second, both implementations return as
+soon as they have something to say, and Synapse would drive a TIGHTER loop than
+we do.
+
+So the cadence is inherent to the account, and the CPU is what 1.5 syncs a second
+over 654 rooms costs us. Synapse spends less because it answers "has this room
+changed since X?" from in-memory stream-change caches before touching the
+database; we ask the database every time. That is the next optimisation if one is
+wanted, and it is not a correctness problem.

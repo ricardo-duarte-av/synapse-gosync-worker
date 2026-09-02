@@ -180,7 +180,7 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 			}
 			entry, err := syncRoomEntry(ctx, d, room, verdict.UserID, now.Room, timeNow, cfg,
 				accountDataByRoom[room.RoomID], now, useStateAfter, f, verdict.DeviceID, false,
-				src, sticky[room.RoomID])
+				src, sticky[room.RoomID], typingRooms[room.RoomID])
 			if err != nil {
 				return nil, http.StatusInternalServerError, internalError(d, "room entry", err)
 			}

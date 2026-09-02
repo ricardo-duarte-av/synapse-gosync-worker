@@ -1076,3 +1076,21 @@ returned whole. The extra member's event does live in a delta row of a nearby
 state group. If that is right, matching it would mean reproducing the storage
 layout rather than the algorithm, and returning exactly what was asked for is
 the better answer -- but it is recorded as unexplained rather than dismissed.
+
+## An empty typing list is an event (2026-09-02)
+
+`TypingNotificationEventSource._make_event_for` builds
+`{"type": "m.typing", "room_id": ..., "content": {"user_ids": list(typing)}}`
+for every room the source returns, and the source returns rooms by SERIAL, not
+by whether anyone is typing. So a room where the last typist stopped yields
+`{"user_ids": []}`.
+
+That empty event is the only thing that ever clears a typing indicator. There
+is no timeout at the client end and no later sync will mention the room again
+until somebody types in it once more, so omitting it leaves a user shown as
+typing indefinitely -- which is exactly what happened here, and it looked like a
+stuck client rather than a missing event.
+
+The rule is the same on both paths, with only the starting position differing:
+report a room when its typing serial has moved past the client's token (0 on an
+initial sync), and then render whatever the current list is, empty or not.

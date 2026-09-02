@@ -275,9 +275,17 @@ func typingEvent(d Deps, roomID string) (json.RawMessage, error) {
 	if d.Replication == nil || !d.Replication.Live() {
 		return nil, nil
 	}
+	// An EMPTY list is an event, not an absence. Synapse's _make_event_for
+	// builds `{"user_ids": []}` for any room whose typing serial moved, and
+	// that empty event is the only thing that tells a client somebody STOPPED
+	// typing. Returning nil instead leaves the indicator on the screen for
+	// ever -- there is no timeout on the client side, and no later sync will
+	// mention the room again until somebody types in it once more.
+	//
+	// The caller decides which rooms to ask about; this only renders.
 	users := d.Replication.TypingIn(roomID)
-	if len(users) == 0 {
-		return nil, nil
+	if users == nil {
+		users = []string{}
 	}
 	return json.Marshal(map[string]any{
 		"type":    "m.typing",

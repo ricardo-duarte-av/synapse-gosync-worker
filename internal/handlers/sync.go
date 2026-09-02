@@ -163,6 +163,15 @@ func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter 
 	if err != nil {
 		return nil, http.StatusInternalServerError, internalError(d, "sticky events", err)
 	}
+
+	// From position 0, which is what Synapse's typing source is given when
+	// there is no `since`.
+	typingRooms := map[string]bool{}
+	if d.Replication != nil {
+		for _, id := range d.Replication.TypingChangedSince(0) {
+			typingRooms[id] = true
+		}
+	}
 	if ann != nil {
 		ann.NextBatch = now.String()
 	}
@@ -215,7 +224,7 @@ func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter 
 		group.Go(func() error {
 			entry, err := syncRoomEntry(gctx, d, room, verdict.UserID, now.Room, timeNow, cfg,
 				accountDataByRoom[room.RoomID], now, useStateAfter, f, verdict.DeviceID, true,
-				timelineSource{upto: now}, sticky[room.RoomID])
+				timelineSource{upto: now}, sticky[room.RoomID], typingRooms[room.RoomID])
 			if err != nil {
 				return err
 			}
@@ -373,7 +382,7 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 	endKey streamtoken.RoomKey, timeNow int64, cfg clientevent.Config,
 	accountData []store.AccountDataEntry, now streamtoken.Token,
 	useStateAfter bool, f *filter.Collection, deviceID string, initial bool,
-	src timelineSource, stickyIDs []string) (map[string]any, error) {
+	src timelineSource, stickyIDs []string, typingChanged bool) (map[string]any, error) {
 
 	// No `since` in either case: a newly joined room is paginated as history,
 	// exactly as an initial sync is, because the client has none of it.
@@ -557,10 +566,16 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 			ephemeral = append(ephemeral, ev)
 		}
 
-		if ev, err := typingEvent(d, room.RoomID); err != nil {
-			return nil, err
-		} else if ev != nil {
-			ephemeral = append(ephemeral, ev)
+		// Synapse asks the typing source from position 0 on an initial sync,
+		// which yields every room whose serial it knows -- and nothing for
+		// rooms that have never had a typist. Asking unconditionally instead
+		// would attach an empty m.typing to all 654 rooms of a large account.
+		if typingChanged {
+			if ev, err := typingEvent(d, room.RoomID); err != nil {
+				return nil, err
+			} else if ev != nil {
+				ephemeral = append(ephemeral, ev)
+			}
 		}
 		// The filter sees the room_id, which is stripped only afterwards:
 		// Synapse filters the dict it built and removes the key on the way out.

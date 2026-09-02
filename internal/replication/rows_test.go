@@ -211,3 +211,22 @@ func TestTypingSerialsBoundWhatASyncReports(t *testing.T) {
 		t.Errorf("TypingChangedSince while not live = %v, want nothing", rooms)
 	}
 }
+
+// TestTypingStoppingIsStillAChange: a room whose typists went to zero has
+// still changed, and must be reported. Its serial moves like any other, and
+// the empty m.typing event that results is the only thing that clears the
+// indicator on a client -- there is no timeout at the other end.
+func TestTypingStoppingIsStillAChange(t *testing.T) {
+	s := newTestSub()
+	s.setLive(true)
+
+	s.updateTyping(`["!r:e",["@a:e"]]`, 5)
+	s.updateTyping(`["!r:e",[]]`, 6)
+
+	if got := s.TypingIn("!r:e"); got != nil {
+		t.Errorf("TypingIn = %v, want nobody", got)
+	}
+	if rooms := s.TypingChangedSince(5); len(rooms) != 1 || rooms[0] != "!r:e" {
+		t.Errorf("TypingChangedSince(5) = %v, want the room -- stopping is a change", rooms)
+	}
+}
