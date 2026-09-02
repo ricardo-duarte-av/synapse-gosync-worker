@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/auth"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/filter"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/matrixerr"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/metrics"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/server"
@@ -197,4 +198,51 @@ func memberIsJoined(ev store.StateEvent) bool {
 		return false
 	}
 	return parsed.Content.Membership == "join"
+}
+
+// applyUnreadCounts writes a room's notification counts into its entry.
+//
+// The client's filter decides whether threads are reported at all, and it is
+// not a presentation choice: without `unread_thread_notifications` every
+// thread's counts are ADDED to the room's single figure, and with it they are
+// pulled out into their own section and the room's figure drops to the main
+// timeline alone. Same query either way, two different answers, and a client
+// that asks for the split and is given the folded totals sees numbers that are
+// simply too high.
+//
+// The section is omitted entirely when there are no threads, as Synapse's
+// `if room.unread_thread_notifications:` gives, and mirrored under the MSC3773
+// name when that flag is on -- both keys, not one or the other.
+func applyUnreadCounts(entry map[string]any, notifs store.RoomNotifCounts,
+	f *filter.Collection, msc3773 bool) {
+
+	counts := notifs.Main
+	if !f.UnreadThreadNotifications() {
+		counts = notifs.Total()
+	}
+	entry["unread_notifications"] = map[string]any{
+		"notification_count": counts.NotifyCount,
+		"highlight_count":    counts.HighlightCount,
+	}
+	// MSC2654, enabled on this deployment. Note it carries the `unread` count,
+	// which is a different number from the notification count: a muted room
+	// accumulates unread events and no notifications.
+	entry["org.matrix.msc2654.unread_count"] = counts.UnreadCount
+
+	if !f.UnreadThreadNotifications() || len(notifs.Threads) == 0 {
+		return
+	}
+	threads := make(map[string]any, len(notifs.Threads))
+	for id, c := range notifs.Threads {
+		// No unread_count here: MSC3773 reports only the two counts a client
+		// shows on a thread, and the room's unread_count stays whole.
+		threads[id] = map[string]any{
+			"notification_count": c.NotifyCount,
+			"highlight_count":    c.HighlightCount,
+		}
+	}
+	entry["unread_thread_notifications"] = threads
+	if msc3773 {
+		entry["org.matrix.msc3773.unread_thread_notifications"] = threads
+	}
 }

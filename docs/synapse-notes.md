@@ -751,3 +751,70 @@ being topped up with events the client already has.
 backwards, because "tokens are positions between events" — and it carries the
 topological ordering only when the walk was topological, so the two paths
 produce different token FORMS as well as different events.
+
+## Thread notification counts, and sticky events (2026-09-02, M7)
+
+**The same query answers two different questions, and the filter picks which.**
+`_generate_sync_entry_for_rooms` reads one `RoomNotifCounts` per room and then
+either reports `main_timeline` alone with the threads in their own section, or
+adds every thread into the room's single figure. There is no third option and no
+"both": a client that asks for `unread_thread_notifications` must see the room
+count DROP to the main timeline, and one that does not must see the threads
+folded in. Reporting the section without dropping the room count is the failure
+mode that looks right and is not.
+
+`org.matrix.msc2654.unread_count` follows the same rule, but only the folded
+branch adds thread unread counts to it — the split branch leaves it at the main
+timeline's, and MSC3773's per-thread entries carry only `notification_count` and
+`highlight_count`, never an unread count.
+
+**A thread with all-zero counts is still reported.** Synapse's `_get_thread()`
+creates the entry as a side effect of seeing any row for that thread, and the
+per-thread action query groups by thread without requiring a non-zero count, so
+a thread whose events neither notify nor count as unread appears as a pair of
+zeroes. Filtering those out is wrong.
+
+**`main` is a thread id, not a NULL.** MAIN_TIMELINE is the literal string
+"main" in `event_push_actions` and `event_push_summary` alike. Receipts are the
+exception: `receipts_linearized.thread_id` really is NULL for an unthreaded
+receipt, which is why Synapse's `USING (thread_id)` join never matches one — a
+NULL joins to nothing, and the unthreaded receipt is applied as the fallback
+bound instead.
+
+**An upstream bug, worth knowing before it is mistaken for ours.** In the loop
+that adds post-rotation counts for summarised threads:
+
+```python
+for notif_count, unread_count, thread_id in unread_counts:
+    if thread_id not in summarised_threads:
+        continue
+    if thread_id == MAIN_TIMELINE:
+        counts.notify_count += notif_count      # `counts` is left over
+```
+
+`counts` was last assigned in the summary loop above, so main-timeline counts
+are added to whichever thread that loop saw last. The totals are unaffected,
+which is why it is invisible until per-thread counts are reported, and the
+result set has no ORDER BY, so there is nothing to agree with.
+
+### Sticky events (MSC4354)
+
+**`sticky_events_by_room` runs before any room entry is built, and moves the now
+token.** It reassigns `sync_result_builder.now_token` to the last sticky row
+returned, so the wound-back position reaches every `prev_batch` in the response
+as well as `next_batch`. The same shape as the to-device wind-back, and the same
+trap: compute the section after the rooms and the tokens disagree.
+
+**An event already in the timeline is removed from the section**, per the MSC:
+the client learns of it either way, and sticky events are spammable. This is
+what hides an unimplemented section — it appears only once an event ages out of
+the timeline, or the moment a filter excludes it.
+
+**"History visibility checks MUST NOT be applied" is implemented by RUNNING the
+visibility pass**, with every sticky event id in `always_include_ids`. That is
+not the same as skipping it: the pass is also what stamps `unsigned.membership`
+(MSC4115) onto each event. Skip it and the events come out visibly different.
+
+The query filters on `expires_at` and on soft-failed events, so the answer
+depends on the wall clock as well as the stream position — and the cap is 100
+events per sync across all rooms, because anyone may send one.

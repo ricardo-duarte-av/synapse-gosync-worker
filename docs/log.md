@@ -630,3 +630,62 @@ a `types` filter; never trusting the window is named only by the unlimited-plus-
 types filter, because the two prev_batch rules agree whenever nothing was
 filtered out of the front of the window. The default filter catches neither, and
 that is the whole reason this survived from M3 to M8.
+
+## M7, and the sticky section (2026-09-02)
+
+Receipts, typing and presence were already done, so M7 came down to per-thread
+notification counts — a wrong number rather than a missing feature. A client
+asking for `unread_thread_notifications` was being handed every thread's counts
+folded into the room's single figure, on the one endpoint whose job is to say
+how much has been missed.
+
+The filter chooses between two answers to one query: the split pulls threads out
+and drops the room's figure to the main timeline alone, and anything else folds
+them back in. `org.matrix.msc2654.unread_count` follows the same rule, while the
+per-thread entries carry only the notification and highlight counts.
+
+Three rooms on the second account carry a thread section, so the comparison is
+not vacuous, and one of them has a threaded receipt ahead of the unthreaded one
+— which is what makes the per-thread bounds worth having.
+
+**An upstream bug found while porting it, and deliberately not reproduced.**
+`_get_unread_counts_by_pos_txn` adds a room's post-rotation main-timeline counts
+to a variable left over from an earlier loop, so they land on whichever thread
+was last in an unordered result set. Invisible while everything is summed into
+one figure, which is why it survived this long, and not reproducible in
+principle: there is no ORDER BY to agree with. Recorded in synapse-notes.md and
+README.md.
+
+### The sticky section
+
+Named as a gap at M6 and closed here. It moves the now token — Synapse rewrites
+the sticky field of its own `now_token` to the last row it returns — so the
+section is loaded once for every joined room BEFORE any room entry is built,
+exactly where Synapse does it, and the wound-back position reaches every
+prev_batch as well as next_batch. The same shape as M8's to-device wind-back;
+having done that one first made this one obvious.
+
+The first comparison caught the detail that reading the MSC would not: "history
+visibility MUST NOT be applied" is implemented by *running* the visibility pass
+with every sticky event in the always-include set, because that pass is also
+what stamps `unsigned.membership`. Skipping it left the events visibly different
+from Synapse's.
+
+A live RTC bot on this server posts sticky events every four minutes, so there
+is real data for it. The section only shows up when a filter pushes those events
+out of the timeline, which is the filter now in the regression set.
+
+### Verified
+
+Both accounts, everything green, with two filter shapes added:
+`unread_thread_notifications`, and a timeline restricted to `m.room.member`.
+Non-vacuity checked twice — folding thread counts regardless of the filter is
+named on three rooms at once, and returning no sticky section is named as a
+missing key.
+
+The comparator lost a known gap and gained a tolerance. `.msc4354_sticky` is no
+longer expected to differ. `m.typing` is now recognised in BOTH directions: it
+is the one field neither side reads from the database, so whoever is asked while
+someone is mid-keystroke reports it and the other does not — which had been
+showing up as an unexplained extra entry, and cost a few minutes of staring
+before the asymmetry in the tolerance became obvious.

@@ -209,11 +209,42 @@ type UnreadCounts struct {
 	UnreadCount int
 }
 
-// UnreadNotifications reads a user's unread counts for a room.
+// MainTimeline is the thread id Synapse gives events that are not in a thread.
 //
-// A port of _get_unread_counts_by_receipt_txn plus the aggregation
-// _generate_sync_entry_for_rooms does on top of it. Four things make this more
-// than a SELECT SUM:
+// A real value rather than a NULL, in event_push_actions and
+// event_push_summary alike, so "the main timeline" is just another thread as
+// far as the counting is concerned -- and is separated out again only when the
+// response is built. See synapse/api/constants.py MAIN_TIMELINE.
+const MainTimeline = "main"
+
+// RoomNotifCounts is a room's unread counts, split the way Synapse splits them.
+//
+// Whether the split is visible to the client is the client's choice: a filter
+// asking for `unread_thread_notifications` gets Threads reported separately and
+// Main on its own, and any other filter gets them added together. Both need the
+// same query, so the split is made here and folded later.
+type RoomNotifCounts struct {
+	Main UnreadCounts
+	// Threads is keyed by thread root event id. Never contains MainTimeline.
+	Threads map[string]UnreadCounts
+}
+
+// Total returns the counts as a client that did not ask for the thread split
+// sees them: everything added together.
+func (r RoomNotifCounts) Total() UnreadCounts {
+	out := r.Main
+	for _, t := range r.Threads {
+		out.NotifyCount += t.NotifyCount
+		out.HighlightCount += t.HighlightCount
+		out.UnreadCount += t.UnreadCount
+	}
+	return out
+}
+
+// UnreadNotifications reads a user's unread counts for a room, per thread.
+//
+// A port of _get_unread_counts_by_receipt_txn. Four things make this more than
+// a SELECT SUM:
 //
 //   - Counts are relative to the user's latest READ RECEIPT, not the start of
 //     the room. Without that bound every count is the room's whole history --
@@ -225,14 +256,14 @@ type UnreadCounts struct {
 //     row does not count as a summary at all; treating it as one makes the
 //     thread look already-counted and undercounts everything between the
 //     receipt and the last rotation.
-//   - With the default filter, threads are NOT reported separately: their
-//     counts are folded into the room's single figure
-//     (handlers/sync.py:3326). Counting only the main timeline is the other
-//     way to come out low.
+//   - A thread is reported even when every one of its counts is zero. Synapse
+//     creates the entry as a side effect of seeing any row for that thread, so
+//     a thread whose only events neither notify nor count as unread still
+//     appears in the response as a pair of zeroes.
 //
 // Highlights are never summarised, so they are always counted from
 // event_push_actions and never bounded by the rotation point.
-func (s *Store) UnreadNotifications(ctx context.Context, roomID, userID string) (UnreadCounts, error) {
+func (s *Store) UnreadNotifications(ctx context.Context, roomID, userID string) (RoomNotifCounts, error) {
 	const q = `
 		WITH receipt AS (
 			-- The user's latest unthreaded read receipt, or failing that their
@@ -259,8 +290,9 @@ func (s *Store) UnreadNotifications(ctx context.Context, roomID, userID string) 
 			 GROUP BY r.thread_id
 		),
 		summary AS (
-			SELECT s.thread_id, s.notif_count,
-			       COALESCE(s.unread_count, 0) AS unread_count
+			SELECT COALESCE(s.thread_id, 'main') AS thread_id,
+			       SUM(s.notif_count) AS notif_count,
+			       SUM(COALESCE(s.unread_count, 0)) AS unread_count
 			  FROM event_push_summary s
 			  LEFT JOIN thread_receipts tr ON tr.thread_id = s.thread_id
 			  CROSS JOIN receipt
@@ -269,40 +301,75 @@ func (s *Store) UnreadNotifications(ctx context.Context, roomID, userID string) 
 			         AND s.stream_ordering > COALESCE(tr.pos, receipt.pos))
 			        OR s.last_receipt_stream_ordering = COALESCE(tr.pos, receipt.pos))
 			   AND (s.notif_count != 0 OR COALESCE(s.unread_count, 0) != 0)
+			 GROUP BY COALESCE(s.thread_id, 'main')
 		),
 		actions AS (
 			-- A summarised thread is already counted up to the last rotation,
 			-- so only what came after it is added. An unsummarised one is
 			-- counted from its receipt.
-			SELECT
-				COUNT(*) FILTER (WHERE a.notif = 1) AS notif,
-				COUNT(*) FILTER (WHERE a.unread = 1) AS unread
+			SELECT COALESCE(a.thread_id, 'main') AS thread_id,
+			       COUNT(*) FILTER (WHERE a.notif = 1) AS notif,
+			       COUNT(*) FILTER (WHERE a.unread = 1) AS unread
 			  FROM event_push_actions a
 			  LEFT JOIN thread_receipts tr ON tr.thread_id = a.thread_id
-			  LEFT JOIN summary su ON su.thread_id = a.thread_id
+			  LEFT JOIN summary su ON su.thread_id = COALESCE(a.thread_id, 'main')
 			  CROSS JOIN receipt CROSS JOIN rotated
 			 WHERE a.room_id = $1 AND a.user_id = $2
 			   AND a.stream_ordering > COALESCE(tr.pos, receipt.pos)
 			   AND (su.thread_id IS NULL OR a.stream_ordering > rotated.pos)
+			 GROUP BY COALESCE(a.thread_id, 'main')
 		),
 		highlights AS (
-			SELECT COUNT(*) AS n
+			SELECT COALESCE(a.thread_id, 'main') AS thread_id, COUNT(*) AS n
 			  FROM event_push_actions a
 			  LEFT JOIN thread_receipts tr ON tr.thread_id = a.thread_id
 			  CROSS JOIN receipt
 			 WHERE a.room_id = $1 AND a.user_id = $2 AND a.highlight = 1
 			   AND a.stream_ordering > COALESCE(tr.pos, receipt.pos)
+			 GROUP BY COALESCE(a.thread_id, 'main')
+		),
+		threads AS (
+			SELECT thread_id FROM summary
+			UNION SELECT thread_id FROM actions
+			UNION SELECT thread_id FROM highlights
 		)
-		SELECT
-			(SELECT COALESCE(SUM(notif_count), 0) FROM summary) + (SELECT notif FROM actions),
-			(SELECT n FROM highlights),
-			(SELECT COALESCE(SUM(unread_count), 0) FROM summary) + (SELECT unread FROM actions)`
-	var c UnreadCounts
-	if err := s.pool.QueryRow(ctx, q, roomID, userID).Scan(
-		&c.NotifyCount, &c.HighlightCount, &c.UnreadCount); err != nil {
-		return UnreadCounts{}, fmt.Errorf("store: unread notifications: %w", err)
+		SELECT t.thread_id,
+		       COALESCE(s.notif_count, 0) + COALESCE(ac.notif, 0),
+		       COALESCE(h.n, 0),
+		       COALESCE(s.unread_count, 0) + COALESCE(ac.unread, 0)
+		  FROM threads t
+		  LEFT JOIN summary s ON s.thread_id = t.thread_id
+		  LEFT JOIN actions ac ON ac.thread_id = t.thread_id
+		  LEFT JOIN highlights h ON h.thread_id = t.thread_id`
+
+	rows, err := s.pool.Query(ctx, q, roomID, userID)
+	if err != nil {
+		return RoomNotifCounts{}, fmt.Errorf("store: unread notifications: %w", err)
 	}
-	return c, nil
+	defer rows.Close()
+
+	out := RoomNotifCounts{}
+	for rows.Next() {
+		var (
+			threadID string
+			c        UnreadCounts
+		)
+		if err := rows.Scan(&threadID, &c.NotifyCount, &c.HighlightCount, &c.UnreadCount); err != nil {
+			return RoomNotifCounts{}, fmt.Errorf("store: unread notifications: %w", err)
+		}
+		if threadID == MainTimeline {
+			out.Main = c
+			continue
+		}
+		if out.Threads == nil {
+			out.Threads = map[string]UnreadCounts{}
+		}
+		out.Threads[threadID] = c
+	}
+	if err := rows.Err(); err != nil {
+		return RoomNotifCounts{}, fmt.Errorf("store: unread notifications: %w", err)
+	}
+	return out, nil
 }
 
 // DeviceKeyCounts is the end-to-end key inventory a sync reports.

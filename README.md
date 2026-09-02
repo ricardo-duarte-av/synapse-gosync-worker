@@ -51,24 +51,13 @@ that narrow — refusing to run if it can delete from `events` or insert into
 `device_inbox` — and keeps the main pool on the read-only role. Every query in
 `internal/store` is still a `SELECT`.
 
-**`unread_thread_notifications` is not implemented.** A filter may set it
-(`msc3773_enabled` is on for this deployment, so both the stable and unstable
-spellings are live), and we parse it, but we do not act on it: thread
-notification counts are still folded into the room's `notification_count` and
-`highlight_count`, exactly as they are when the flag is absent, and the
-`unread_thread_notifications` key is not emitted. The counts are therefore
-*higher* than Synapse's for a client that asked for the split. Per-thread counts
-belong with the rest of the notification work in M7; parsing the flag without
-honouring it is recorded here rather than left to be discovered.
-
-**The `msc4354_sticky` room section is not implemented.** MSC4354 sticky events
-are served in the timeline like any other event, and the per-event
-`unsigned.msc4354_sticky_duration_ttl_ms` is emitted, but the separate `sticky`
-section a room carries is not built. Synapse removes from that section any
-sticky event already in the room's timeline, so the omission is invisible while
-the event is recent and appears once it ages out of the timeline — or as soon
-as a filter excludes it. Implementing it will also move `next_batch`: Synapse
-rewrites the sticky field of its own now_token to the last row it returns.
+**One upstream bug is deliberately not reproduced.** Synapse's
+`_get_unread_counts_by_pos_txn` adds a room's post-rotation main-timeline counts
+to a leftover loop variable rather than to the main timeline, so they land on
+whichever thread came last in an unordered result set. It is invisible unless a
+client asks for per-thread counts, and it is not reproducible even in principle
+— there is no ORDER BY to agree with. We attribute main-timeline counts to the
+main timeline.
 
 Filter **validation** is looser than Synapse's. Synapse runs the filter through
 a JSON schema and `parse_and_validate_server_name`; we check the shapes and the

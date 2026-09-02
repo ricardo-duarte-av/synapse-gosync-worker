@@ -135,6 +135,24 @@ func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter 
 		}
 	}
 
+	joinedIDs := make([]string, 0, len(rooms))
+	for _, room := range rooms {
+		if room.Membership == "join" {
+			joinedIDs = append(joinedIDs, room.RoomID)
+		}
+	}
+	// Before any room entry is built, because it moves the now token and every
+	// prev_batch in the response carries that token. An initial sync asks from
+	// position 0: the client has seen nothing, so every unexpired sticky event
+	// is news.
+	sticky, err := stickyByRoom(ctx, d, joinedIDs, 0, &now, timeNow)
+	if err != nil {
+		return nil, http.StatusInternalServerError, internalError(d, "sticky events", err)
+	}
+	if ann != nil {
+		ann.NextBatch = now.String()
+	}
+
 	joinedRooms := map[string]any{}
 	invitedRooms := map[string]any{}
 
@@ -161,7 +179,7 @@ func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter 
 
 		entry, err := syncRoomEntry(ctx, d, room, verdict.UserID, now.Room, timeNow, cfg,
 			accountDataByRoom[room.RoomID], now, useStateAfter, f, verdict.DeviceID, true,
-			timelineSource{upto: now})
+			timelineSource{upto: now}, sticky[room.RoomID])
 		if err != nil {
 			return nil, http.StatusInternalServerError, internalError(d, "room entry", err)
 		}
@@ -312,7 +330,7 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 	endKey streamtoken.RoomKey, timeNow int64, cfg clientevent.Config,
 	accountData []store.AccountDataEntry, now streamtoken.Token,
 	useStateAfter bool, f *filter.Collection, deviceID string, initial bool,
-	src timelineSource) (map[string]any, error) {
+	src timelineSource, stickyIDs []string) (map[string]any, error) {
 
 	// No `since` in either case: a newly joined room is paginated as history,
 	// exactly as an initial sync is, because the client has none of it.
@@ -506,7 +524,7 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 		return nil, err
 	}
 
-	return map[string]any{
+	entry := map[string]any{
 		"timeline": map[string]any{
 			"events":     timeline,
 			"prev_batch": prevBatch.String(),
@@ -515,18 +533,21 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 		stateKeyName(useStateAfter): map[string]any{"events": stateJSON},
 		"account_data":              map[string]any{"events": adEvents},
 		"ephemeral":                 map[string]any{"events": ephemeral},
-		"unread_notifications": map[string]any{
-			"notification_count": unread.NotifyCount,
-			"highlight_count":    unread.HighlightCount,
-		},
 		// A summary is computed only when the filter enables lazy-loading of
 		// members, because that is when a client lacks the memberships to name
 		// the room itself. Otherwise the key is present and empty -- not
 		// populated, and not missing.
 		"summary": summaryValue,
-		// MSC2654, enabled on this deployment.
-		"org.matrix.msc2654.unread_count": unread.UnreadCount,
-	}, nil
+	}
+	applyUnreadCounts(entry, unread, f, d.MSC3773Enabled)
+	stickyBlock, err := stickySection(ctx, d, room, userID, stickyIDs, messages, timeNow, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if stickyBlock != nil {
+		entry["msc4354_sticky"] = stickyBlock
+	}
+	return entry, nil
 }
 
 // syncStateBlock works out the `state` block for an initial sync.

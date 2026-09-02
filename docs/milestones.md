@@ -15,8 +15,9 @@ Status is recorded here; what actually happened is in [log.md](log.md).
 | M5 | Long-polling and Redis replication | **done** |
 | M6 | Filters and lazy-loading | **done** |
 | — | MSC4222 `state_after` | **done** |
-| M7 | Ephemeral: receipts, typing, presence | not started |
+| M7 | Ephemeral: receipts, typing, presence | **done** |
 | M8 | To-device and device lists | **done** |
+| — | MSC4354 sticky events | **done** |
 | M9 | Soak, then possibly the promotion ladder | not started |
 
 ## M1 and M2 — done, no gaps
@@ -213,3 +214,66 @@ concrete form: whoever is asked second sees an inbox the first has already been
 through. Ask us first and we delete the very messages Synapse is about to be
 asked for, turning "we skipped the rest of the backlog" into two identical empty
 answers. Synapse is always asked first.
+
+## M7 — done, and the sticky section with it
+
+Receipts, typing and presence had been delivered by M1–M5, so what M7 actually
+owed was **per-thread notification counts**, and it is a wrong number rather
+than a missing feature: without it, a client that asks for
+`unread_thread_notifications` is given every thread's counts ADDED INTO the
+room's single figure. Too high, on the one endpoint whose whole job is to tell a
+client how much it has missed.
+
+The filter decides which of two answers the same query produces. Asking for the
+split pulls threads into their own section and drops the room's figure to the
+main timeline alone; any other filter folds them back in. Both are now built
+from one `RoomNotifCounts`, and the section is emitted under the stable name and
+the MSC3773 one together, as Synapse does — and only when there is at least one
+thread.
+
+**One upstream bug is NOT reproduced.** In `_get_unread_counts_by_pos_txn`, the
+loop that adds post-rotation counts for summarised threads writes main-timeline
+counts into `counts`, a variable left over from the previous loop — so they land
+on whichever thread happened to be last in an unordered result set. It is
+invisible while everything is summed into one figure, which is why it never
+showed before, and it is not reproducible even in principle: there is no ORDER
+BY to agree with. We attribute main-timeline counts to the main timeline. If a
+comparison ever lands on it, that is the cause.
+
+**The `msc4354_sticky` section**, named as a gap since M6, is also done. Three
+details carried across:
+
+- The section is loaded ONCE for all rooms, before any room entry is built,
+  because it moves the now token — Synapse rewrites the sticky field of its own
+  `now_token` to the last row returned, and that reaches every `prev_batch` in
+  the response as well as `next_batch`. Same shape as the to-device wind-back
+  from M8.
+- An event already in the timeline is REMOVED from the section. That is what
+  made the gap invisible: it only appears once an event ages out of the
+  timeline, or the moment a filter excludes it.
+- History visibility is not applied — but that means running the ordinary
+  visibility pass with every sticky event in the always-include set, not
+  skipping it. Skipping it loses `unsigned.membership`, which the first
+  comparison caught.
+
+Expired and soft-failed events are excluded, so the answer depends on the wall
+clock as well as the stream position. The comparator's `_gosync_time_now` pin
+covers that; without it the two sides disagree by the milliseconds between them.
+
+### Verified
+
+Both accounts, everything green, including two filter shapes added for this
+work: `unread_thread_notifications`, and a timeline restricted to
+`m.room.member` — which is what pushes the live RTC sticky events out of the
+timeline and into their own section. Three rooms carry a thread section and one
+carries sticky events, so neither comparison is vacuous.
+
+Non-vacuity checked twice, as ever. Folding thread counts regardless of the
+filter is named on three rooms at once, counts and `unread_count` alike;
+returning no sticky section is named as a missing key.
+
+The comparator lost a known gap and gained a tolerance: `.msc4354_sticky` is no
+longer expected to differ, and `m.typing` is now recognised in BOTH directions.
+It is the one field neither side reads from the database, so whoever is asked
+while someone is mid-keystroke reports it and the other does not — which had
+been reported as an unexplained extra entry.

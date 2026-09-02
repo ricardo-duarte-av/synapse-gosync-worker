@@ -121,6 +121,16 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 		}
 	}
 
+	// Before any room entry is built: this moves the now token, and every
+	// prev_batch in the response carries it.
+	sticky, err := stickyByRoom(ctx, d, joinedIDs, since.StickyEvents, &now, timeNow)
+	if err != nil {
+		return nil, http.StatusInternalServerError, internalError(d, "sticky events", err)
+	}
+	if ann != nil {
+		ann.NextBatch = now.String()
+	}
+
 	joinedRooms := map[string]any{}
 	var newlyJoined []string
 	for _, room := range rooms {
@@ -154,7 +164,7 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 			}
 			entry, err := syncRoomEntry(ctx, d, room, verdict.UserID, now.Room, timeNow, cfg,
 				accountDataByRoom[room.RoomID], now, useStateAfter, f, verdict.DeviceID, false,
-				src)
+				src, sticky[room.RoomID])
 			if err != nil {
 				return nil, http.StatusInternalServerError, internalError(d, "room entry", err)
 			}
@@ -180,7 +190,7 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 		entry, err := incrementalRoomEntry(ctx, d, room, verdict.UserID, since, now,
 			timeNow, cfg, timelines[room.RoomID],
 			accountDataByRoom[room.RoomID], receiptsByRoom[room.RoomID],
-			useStateAfter, f, verdict.DeviceID)
+			useStateAfter, f, verdict.DeviceID, sticky[room.RoomID])
 		if err != nil {
 			return nil, http.StatusInternalServerError, internalError(d, "room entry", err)
 		}
@@ -468,7 +478,7 @@ func incrementalRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, u
 	since, now streamtoken.Token, timeNow int64, cfg clientevent.Config,
 	raw []store.TimelineEvent, accountData []store.AccountDataEntry,
 	receipts []store.ReceiptRow, useStateAfter bool,
-	f *filter.Collection, deviceID string) (map[string]any, error) {
+	f *filter.Collection, deviceID string, stickyIDs []string) (map[string]any, error) {
 
 	// Where the loaded chunk begins, which is Synapse's per-room `upto_token`
 	// and the prev_batch of an untrimmed timeline. For a room whose events all
@@ -521,7 +531,7 @@ func incrementalRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, u
 	// its own. Checking afterwards, and counting state, emits rooms Synapse
 	// omits; that only shows once a filter can empty the timeline while
 	// leaving a state delta behind.
-	if len(messages) == 0 && len(adEvents) == 0 && len(ephemeral) == 0 {
+	if len(messages) == 0 && len(adEvents) == 0 && len(ephemeral) == 0 && len(stickyIDs) == 0 {
 		return nil, nil
 	}
 
@@ -678,7 +688,7 @@ func incrementalRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, u
 		return nil, err
 	}
 
-	return map[string]any{
+	entry := map[string]any{
 		"timeline": map[string]any{
 			"events":     timeline,
 			"prev_batch": prevBatch.String(),
@@ -687,13 +697,17 @@ func incrementalRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, u
 		stateKeyName(useStateAfter): map[string]any{"events": stateJSON},
 		"account_data":              map[string]any{"events": adEvents},
 		"ephemeral":                 map[string]any{"events": ephemeral},
-		"unread_notifications": map[string]any{
-			"notification_count": unread.NotifyCount,
-			"highlight_count":    unread.HighlightCount,
-		},
-		"summary":                         summaryValue,
-		"org.matrix.msc2654.unread_count": unread.UnreadCount,
-	}, nil
+		"summary":                   summaryValue,
+	}
+	applyUnreadCounts(entry, unread, f, d.MSC3773Enabled)
+	stickyBlock, err := stickySection(ctx, d, room, userID, stickyIDs, messages, timeNow, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if stickyBlock != nil {
+		entry["msc4354_sticky"] = stickyBlock
+	}
+	return entry, nil
 }
 
 // incrementalStateDelta works out the `state` block for an incremental sync.
