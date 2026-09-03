@@ -365,7 +365,16 @@ func (s *Subscriber) session(ctx context.Context) (subscribed bool, err error) {
 }
 
 // abort ends the running session so Run reconnects and resyncs from scratch.
+//
+// Both halves matter. Clearing the liveness flag is what stops us serving from
+// caches we can no longer keep current, and it has to happen now rather than
+// whenever the session goroutine unwinds. Cancelling is what makes the flag
+// recoverable: setLive(true) runs only when a new session subscribes, so
+// clearing it without ending the session leaves the subscriber wedged for the
+// life of the process -- which is exactly the bug this function was extracted
+// to fix. Neither half is correct alone.
 func (s *Subscriber) abort() {
+	s.setLive(false)
 	s.mu.Lock()
 	cancel := s.abortSession
 	s.mu.Unlock()
