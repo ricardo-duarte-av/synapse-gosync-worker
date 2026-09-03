@@ -198,3 +198,40 @@ unsound. The replay comparator comes first; the ladder is retrofitted at M9, and
 its shadow mode is then cheap because pinned comparison already exists.
 
 ---
+
+## A source of false confidence: a live test that skips itself
+
+Not a reason two answers differ — a reason nobody notices that they do.
+
+The two tests that compare list ORDER (`TestLiveListParityOnAPartialRange`,
+`TestLiveListParityOnTheFullSet`) read `GOSYNC_PARITY_USER` and skipped when it
+was unset. Nothing else in the live suite needs it, so the documented
+invocation in `.claude/deployment-notes.md` does not set it, and every run made
+while building sliding sync skipped them — while printing `ok` for the package.
+The sort was the only thing they covered.
+
+They now take the account from `refWhoami`, which the token already answers, so
+they cannot skip while the rest of the suite runs. `GOSYNC_PARITY_USER` is still
+read, but only to assert the token belongs to the account the caller meant; a
+mismatch fails instead of skipping.
+
+The general rule this is an instance of: **a live test whose gate is not the
+same as the suite's gate will eventually be the one test that is not running.**
+Gate on what the suite gates on, or derive it.
+
+### And the noise floor has to be measured, not assumed
+
+Once it ran, the partial-range comparison failed on the 654-room account at
+positions 0-2 — the three busiest rooms — because our answer is computed at a
+pinned token and the reference's is not, so the top of an activity-ordered list
+reorders between the two requests. Widening the tolerance would have thrown away
+the sort.
+
+Instead the reference is asked the same question twice, and any room it places
+differently across its own two reads is excluded: the reference disagreeing with
+itself is the definition of noise here. Everything else is compared, and a run
+that manages to compare fewer than half the positions fails rather than passing
+on an empty comparison.
+
+It bites: making the sort use `bump_stamp` instead of the last event's stream
+ordering is caught at **649 of 652 positions**.

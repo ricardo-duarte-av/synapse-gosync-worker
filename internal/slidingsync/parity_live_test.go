@@ -145,10 +145,7 @@ func TestLiveListParityOnAPartialRange(t *testing.T) {
 	d, _, now, ctx := liveDeps(t)
 	c, token := refClient(t)
 
-	userID := os.Getenv("GOSYNC_PARITY_USER")
-	if userID == "" {
-		t.Skip("GOSYNC_PARITY_USER not set")
-	}
+	userID := parityUser(t)
 
 	// Establish how many rooms there are, so the range can be kept strictly
 	// inside the list and the sort therefore actually runs.
@@ -162,11 +159,23 @@ func TestLiveListParityOnAPartialRange(t *testing.T) {
 	}
 	end := total - 2
 
-	refCount, refRooms := refList(t, c, token, map[string]any{
+	window := map[string]any{
 		"lists": map[string]any{"all": map[string]any{
 			"ranges": [][2]int{{0, end}}, "required_state": [][2]string{}, "timeline_limit": 1,
 		}},
-	})
+	}
+	refCount, refRooms := refList(t, c, token, window)
+
+	// Ask the reference a second time to establish the noise floor.
+	//
+	// The sort key is the stream ordering of each room's last event, so on a
+	// busy account the top of the list genuinely reorders between two requests
+	// a second apart -- and our answer is computed at a pinned token that the
+	// reference's is not. Any room the reference itself places differently
+	// across its own two reads was moving while we looked, and a disagreement
+	// about it means nothing. Everything else is the sort, and is compared.
+	_, refAgain := refList(t, c, token, window)
+	churning := churningRooms(refRooms, refAgain)
 
 	req := &Request{Lists: map[string]List{"all": {
 		CommonRoomParameters: CommonRoomParameters{TimelineLimit: 1},
@@ -185,14 +194,50 @@ func TestLiveListParityOnAPartialRange(t *testing.T) {
 	if len(oursRooms) != len(refRooms) {
 		t.Fatalf("window holds %d rooms, reference holds %d", len(oursRooms), len(refRooms))
 	}
+	compared := 0
 	for i := range refRooms {
+		if churning[refRooms[i]] || churning[oursRooms[i]] {
+			continue
+		}
+		compared++
 		if oursRooms[i] != refRooms[i] {
 			t.Errorf("position %d: we say %s, reference says %s", i, oursRooms[i], refRooms[i])
 		}
 	}
-	if !t.Failed() {
-		t.Logf("%d rooms in the same order as the reference", len(refRooms))
+	// A run where everything churned has compared nothing and must not pass
+	// quietly: that is the shape of a comparator that always says ok.
+	if compared < len(refRooms)/2 {
+		t.Errorf("only %d of %d positions were stable enough to compare; "+
+			"the account is too busy for this test to mean anything",
+			compared, len(refRooms))
 	}
+	if !t.Failed() {
+		t.Logf("%d of %d rooms in the same order as the reference (%d moving)",
+			compared, len(refRooms), len(churning))
+	}
+}
+
+// churningRooms names the rooms the reference placed differently across two
+// reads of the same window, and is therefore the set about which a
+// disagreement carries no information.
+func churningRooms(first, second []string) map[string]bool {
+	at := make(map[string]int, len(second))
+	for i, roomID := range second {
+		at[roomID] = i
+	}
+	moving := map[string]bool{}
+	for i, roomID := range first {
+		if j, ok := at[roomID]; !ok || i != j {
+			moving[roomID] = true
+		}
+	}
+	for _, roomID := range second {
+		if _, ok := at[roomID]; ok {
+			continue
+		}
+		moving[roomID] = true
+	}
+	return moving
 }
 
 // The room SET must match even where the order does not, which is what makes
@@ -201,10 +246,7 @@ func TestLiveListParityOnTheFullSet(t *testing.T) {
 	d, _, now, ctx := liveDeps(t)
 	c, token := refClient(t)
 
-	userID := os.Getenv("GOSYNC_PARITY_USER")
-	if userID == "" {
-		t.Skip("GOSYNC_PARITY_USER not set")
-	}
+	userID := parityUser(t)
 
 	refCount, refRooms := refList(t, c, token, map[string]any{
 		"lists": map[string]any{"all": map[string]any{
@@ -314,4 +356,24 @@ func refRawTo(t *testing.T, sock, token string, body map[string]any, pos string)
 		t.Fatal(err)
 	}
 	return raw
+}
+
+// parityUser is the account the reference token belongs to.
+//
+// This used to read GOSYNC_PARITY_USER and skip when it was unset, which meant
+// the two tests that compare list ORDER skipped in every run that did not name
+// the variable -- including the runs whose output was read as "sliding sync is
+// at parity". The sort was the one thing they covered and the one thing nobody
+// was checking.
+//
+// The token already identifies its owner, so ask it. GOSYNC_PARITY_USER is
+// still honoured, but only as an assertion that the token is the account the
+// caller meant: a mismatch is now a failure rather than a silent skip.
+func parityUser(t *testing.T) string {
+	t.Helper()
+	userID, _ := refWhoami(t)
+	if want := os.Getenv("GOSYNC_PARITY_USER"); want != "" && want != userID {
+		t.Fatalf("the token belongs to %s, not %s", userID, want)
+	}
+	return userID
 }

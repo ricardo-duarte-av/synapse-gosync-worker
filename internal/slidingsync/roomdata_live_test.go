@@ -259,10 +259,7 @@ func TestLiveRoomDataParity(t *testing.T) {
 func TestLiveRoomDataParityWithLazyMembers(t *testing.T) {
 	d, _, now, ctx := liveDeps(t)
 	nowMS := time.Now().UnixMilli()
-	userID := os.Getenv("GOSYNC_PARITY_USER")
-	if userID == "" {
-		t.Skip("GOSYNC_PARITY_USER not set")
-	}
+	userID := parityUser(t)
 
 	required := [][2]string{{"m.room.member", "$LAZY"}, {"m.room.name", ""}}
 	body := map[string]any{
