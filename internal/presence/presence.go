@@ -1,0 +1,297 @@
+// Package presence tells Synapse's presence writer that a user is syncing.
+//
+// This worker reads. Presence is the one thing a /sync cannot answer without
+// also SAYING something: Synapse's own sync handler calls user_syncing(), which
+// marks the account online and refreshes the timers that keep it there. A
+// worker that serves /sync and stays quiet leaves every account it serves
+// looking permanently offline -- to other users and over federation -- and no
+// amount of correctness in the response fixes that, because the fact is
+// recorded elsewhere.
+//
+// It is NOT a database write. Presence has a single writer instance
+// (`stream_writers.presence`, `av-edu-worker` on this deployment) and every
+// other process reaches it over Synapse's HTTP replication API. So this package
+// is an HTTP client and nothing else: internal/store stays 100% SELECT, and the
+// only new privilege is the shared replication secret.
+//
+// Three properties of the writer make this safe to speak to, all verified
+// against v1.159.0 and against the live deployment:
+//
+//   - It authorises on the bearer secret alone. There is no registration step,
+//     no instance_map entry, and nothing ever calls back, so a pure client with
+//     no replication listener is a supported shape.
+//   - Sync-driven updates are idempotent and self-limiting. The writer's timers
+//     are coarser than a sync loop, so relaying one update per interval per
+//     device is enough; more is wasted work, not wrong data.
+//   - A process that goes quiet expires. EXTERNAL_PROCESS_EXPIRY is five
+//     minutes, after which the writer drops what we told it and times the users
+//     out. If this worker dies, its users go offline on their own rather than
+//     being pinned online forever.
+package presence
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/rs/zerolog"
+
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/metrics"
+)
+
+// State is a presence value the writer will accept.
+//
+// Synapse's VALID_PRESENCE, minus `busy`: that one is gated on MSC3026, and
+// sending a state the writer rejects turns a sync into a 500.
+const (
+	StateOnline      = "online"
+	StateUnavailable = "unavailable"
+	StateOffline     = "offline"
+)
+
+// ValidState reports whether the writer will accept this state.
+func ValidState(s string) bool {
+	switch s {
+	case StateOnline, StateUnavailable, StateOffline:
+		return true
+	}
+	return false
+}
+
+// DefaultRelayInterval is how often an UNCHANGED sync-driven state is relayed.
+//
+// Synapse derives it as min(presence.sync_online_timeout,
+// presence.last_active_granularity) * 5/6, which at the defaults of 30s and 60s
+// is 25s. The 5/6 is what stops a user flapping offline between relays: the
+// refresh has to arrive comfortably before the timer it is refreshing. Deriving
+// it the same way rather than picking a round number keeps that margin if the
+// homeserver's timers are ever retuned.
+const DefaultRelayInterval = 25 * time.Second
+
+// DeriveRelayInterval reproduces Synapse's calculation.
+func DeriveRelayInterval(syncOnlineTimeout, lastActiveGranularity time.Duration) time.Duration {
+	shorter := syncOnlineTimeout
+	if lastActiveGranularity < shorter {
+		shorter = lastActiveGranularity
+	}
+	if shorter <= 0 {
+		return DefaultRelayInterval
+	}
+	return shorter * 5 / 6
+}
+
+// Config describes how to reach the presence writer.
+type Config struct {
+	// Socket is the writer's unix socket, from Synapse's instance_map entry
+	// for whichever instance holds stream_writers.presence.
+	Socket string
+	// URL is the alternative to Socket, for a writer reached over TCP.
+	URL string
+	// Secret is Synapse's worker_replication_secret. Without it the writer
+	// answers 500 and every sync that tries to relay presence fails.
+	Secret string
+	// RelayInterval throttles unchanged sync-driven updates. Zero means
+	// DefaultRelayInterval.
+	RelayInterval time.Duration
+	// Timeout bounds one call to the writer. Zero means five seconds.
+	Timeout time.Duration
+}
+
+type key struct {
+	userID   string
+	deviceID string
+}
+
+type sent struct {
+	state string
+	when  time.Time
+}
+
+// Client relays presence to the writer.
+type Client struct {
+	http    *http.Client
+	baseURL string
+	secret  string
+	relay   time.Duration
+	log     zerolog.Logger
+
+	mu   sync.Mutex
+	last map[key]sent
+
+	// now is overridable for tests.
+	now func() time.Time
+}
+
+// New builds a client, or returns an error the caller should refuse to start on.
+func New(cfg Config, log zerolog.Logger) (*Client, error) {
+	if cfg.Socket == "" && cfg.URL == "" {
+		return nil, fmt.Errorf("presence: needs the writer's socket or url")
+	}
+	if cfg.Socket != "" && cfg.URL != "" {
+		return nil, fmt.Errorf("presence: set exactly one of socket and url")
+	}
+	// A missing secret is refused rather than tried. The writer's answer to an
+	// unauthenticated call is a 500, which would surface as this worker failing
+	// syncs rather than as a configuration mistake.
+	if cfg.Secret == "" {
+		return nil, fmt.Errorf("presence: needs Synapse's worker_replication_secret")
+	}
+
+	timeout := cfg.Timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	relay := cfg.RelayInterval
+	if relay <= 0 {
+		relay = DefaultRelayInterval
+	}
+
+	c := &Client{
+		secret: cfg.Secret,
+		relay:  relay,
+		log:    log,
+		last:   map[key]sent{},
+		now:    time.Now,
+	}
+
+	transport := &http.Transport{}
+	if cfg.Socket != "" {
+		socket := cfg.Socket
+		transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "unix", socket)
+		}
+		// The host is ignored for a unix socket but has to be syntactically
+		// present for net/http to build a request at all.
+		c.baseURL = "http://synapse-replication"
+	} else {
+		c.baseURL = strings.TrimSuffix(cfg.URL, "/")
+	}
+	c.http = &http.Client{Transport: transport, Timeout: timeout}
+	return c, nil
+}
+
+// SetState relays a presence state for one device.
+//
+// isSync marks the update as sync-driven, which is what makes the writer
+// refresh last_user_sync_ts and leave a BUSY state alone. Sync-driven updates
+// are throttled per device while the state is unchanged; an explicit change
+// always goes through immediately, and clears the throttle so the next
+// sync-driven one does too. That mirrors WorkerPresenceHandler.set_state.
+func (c *Client) SetState(ctx context.Context, userID, deviceID, state string, isSync bool) error {
+	if c == nil {
+		return nil
+	}
+	if !ValidState(state) {
+		return fmt.Errorf("presence: invalid state %q", state)
+	}
+
+	k := key{userID, deviceID}
+	now := c.now()
+
+	c.mu.Lock()
+	if isSync {
+		if prev, ok := c.last[k]; ok &&
+			prev.state == state && now.Sub(prev.when) < c.relay {
+			c.mu.Unlock()
+			metrics.PresenceRelaysSuppressed.Inc()
+			return nil
+		}
+		c.last[k] = sent{state: state, when: now}
+	} else {
+		// An explicit update does not refresh the writer's last_user_sync_ts,
+		// so it must not count as a recent relay.
+		delete(c.last, k)
+	}
+	c.mu.Unlock()
+
+	if err := c.post(ctx, userID, deviceID, state, isSync); err != nil {
+		// A failed relay must not be remembered as sent, or the throttle would
+		// suppress retries for a whole interval and the user would look offline
+		// until it expired.
+		c.mu.Lock()
+		delete(c.last, k)
+		c.mu.Unlock()
+		metrics.PresenceRelayFailures.Inc()
+		return err
+	}
+	metrics.PresenceRelays.Inc()
+	return nil
+}
+
+// Forget drops a device's throttle entry.
+func (c *Client) Forget(userID, deviceID string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	delete(c.last, key{userID, deviceID})
+	c.mu.Unlock()
+}
+
+// Tracked reports how many devices the throttle is holding, for metrics.
+func (c *Client) Tracked() int {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.last)
+}
+
+type setStateBody struct {
+	DeviceID    *string         `json:"device_id"`
+	State       json.RawMessage `json:"state"`
+	ForceNotify bool            `json:"force_notify"`
+	IsSync      bool            `json:"is_sync"`
+}
+
+func (c *Client) post(ctx context.Context, userID, deviceID, state string, isSync bool) error {
+	var dev *string
+	if deviceID != "" {
+		dev = &deviceID
+	}
+	body, err := json.Marshal(setStateBody{
+		DeviceID:    dev,
+		State:       json.RawMessage(`{"presence":` + quote(state) + `}`),
+		ForceNotify: false,
+		IsSync:      isSync,
+	})
+	if err != nil {
+		return fmt.Errorf("presence: encode: %w", err)
+	}
+
+	// The user ID goes in the path and contains a colon and an @, both legal
+	// in a path segment; Synapse's own client does not escape them and its
+	// route regex expects them raw.
+	url := c.baseURL + "/_synapse/replication/presence_set_state/" + userID
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("presence: request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.secret)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("presence: set state: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("presence: writer answered %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func quote(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}

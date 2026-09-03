@@ -159,3 +159,29 @@ var (
 		Help: "Build information.",
 	}, []string{"version"})
 )
+
+// Presence relays. This worker's only outbound call to another Synapse worker,
+// and the only thing it tells the homeserver rather than asks it.
+var (
+	// PresenceRelays counts state updates delivered to the presence writer.
+	PresenceRelays = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "gosync_presence_relays_total",
+		Help: "Presence state updates delivered to Synapse's presence writer.",
+	})
+	// PresenceRelaysSuppressed counts the ones the throttle skipped.
+	//
+	// Expected to dwarf the delivered count: a client syncs in a loop and the
+	// writer's timers are far coarser. If it does NOT dwarf it, the throttle
+	// has stopped working and every sync is making an HTTP call.
+	PresenceRelaysSuppressed = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "gosync_presence_relays_suppressed_total",
+		Help: "Sync-driven presence updates skipped because the state was unchanged.",
+	})
+	// PresenceRelayFailures counts calls the writer refused or that never
+	// arrived. Sustained non-zero means users this worker serves are drifting
+	// offline while looking served.
+	PresenceRelayFailures = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "gosync_presence_relay_failures_total",
+		Help: "Presence relays that failed.",
+	})
+)
