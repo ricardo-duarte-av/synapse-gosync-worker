@@ -92,3 +92,17 @@ var roomVersions = map[string]RoomVersion{
 func LookupRoomVersion(id string) RoomVersion {
 	return roomVersions[id]
 }
+
+// IsKnownRoomVersion reports whether a room version is one we have rules for.
+//
+// Distinct from LookupRoomVersion, which deliberately answers for anything:
+// serialising an event in an unfamiliar room with pre-v11 rules is far better
+// than refusing to serialise it. Sliding sync needs the other question, because
+// it filters such rooms out of a room list entirely
+// (get_sliding_sync_rooms_for_user_from_membership_snapshots: "their metadata
+// may be in a broken state"), and "not in the list" is a much cheaper failure
+// than "every request 500s".
+func IsKnownRoomVersion(id string) bool {
+	_, ok := roomVersions[id]
+	return ok
+}

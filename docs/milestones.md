@@ -21,7 +21,7 @@ Status is recorded here; what actually happened is in [log.md](log.md).
 | M9 | Soak, then possibly the promotion ladder | not started |
 | M10 | Stream-change caches (`internal/streamcache`) | **done** |
 | M11 | Sliding sync: the connection store | **done** |
-| M12 | Sliding sync: the endpoint, lists and rooms | not started |
+| M12 | Sliding sync: the endpoint, lists and rooms | **in progress** — room lists done, per-room results and the endpoint next |
 | M13 | Sliding sync: extensions | not started |
 
 M10 onwards exist because sliding sync came into scope on 2026-09-03; the plan
@@ -479,3 +479,76 @@ implementation behind it — `PurgeCaches()` had no callers for three milestones
 `DeleteOldConnections` must not repeat that: without it the six tables grow
 without bound, because reading a position prunes only its own connection's
 forks and nothing prunes a connection whose client simply went away.
+
+
+## M12 — in progress
+
+Room lists are done and validated against the real Synapse. The endpoint itself
+is not registered yet: the per-room result is what remains, and half a response
+body is worse than none.
+
+### Done
+
+`internal/slidingsync` holds the request model, `required_state` normalisation,
+and the room-list computation — the new-tables path of
+`_compute_interested_rooms_new_tables`, plus `filter_rooms_using_tables` and
+`sort_rooms`. `internal/store/slidingsync.go` reads the three materialised
+tables Synapse's event persister maintains, which is what makes a 654-room list
+computable without a state resolution per room.
+
+On the main account: **653 rooms, ordered stably by activity**, and the boolean
+filters partition it exactly — 81 encrypted + 572 unencrypted, 66 spaces + 587
+non-spaces, 158 DMs.
+
+The materialised tables were checked against the truth they derive from before
+anything was built on them: 653 joined rooms agree with `local_current_membership`,
+and 100 of 100 room names agree with the `m.room.name` state event.
+
+### The order is right, and finding that out took a detour
+
+Compared against `av-sync-worker-2`, our list came back with the same 9 rooms in
+a **different order** — which looked like a straightforward bug and was not.
+Synapse skips sorting entirely when one range covers the whole list:
+
+```python
+# Optimization: If we are asking for the full range, we don't
+# need to sort the list.
+```
+
+…and then returns the rooms in Python dict order, matching neither
+`event_stream_ordering` nor `bump_stamp`. Asked for a **partial** range —
+`[[0,4]]` against those 9 rooms — Synapse sorts, and its order is **identical to
+ours**. `[[0,8]]` and `[[0,99]]` are not.
+
+So the sort is verified, and there is a new entry in
+[comparability.md](comparability.md): compare the room SET for a full-range
+list and the room ORDER only for a partial one.
+`internal/slidingsync/parity_live_test.go` makes that split, and it is the first
+test in this project that checks a sliding sync answer against Synapse's.
+
+We sort unconditionally, which is a deliberate deviation. Skipping it would buy
+nothing — the metadata is already fetched, so it is an in-memory sort of a few
+hundred entries — and would make our own answers irreproducible, which costs us
+more than it costs a client that has the whole list and `bump_stamp` to sort by.
+
+### Not done, and none of it silently
+
+- **The per-room result**: timeline, `required_state` resolution,
+  `prev_batch`, `bump_stamp`, membership counts, notification counts, heroes,
+  `invite_state`, `num_live`, `unstable_expanded_timeline`. This is
+  `get_room_sync_data`, ~950 lines upstream and the largest single piece.
+- **`_required_state_changes`**, the ~380-line pure function that decides what
+  has to be re-sent when a room's required state changes. Ported next, and
+  unit-tested exhaustively before it is wired to anything.
+- **The membership rewind** (`_get_rewind_changes_to_current_membership_to_token`)
+  and **newly-joined/newly-left rooms**. Without them the room list is computed
+  from CURRENT membership rather than membership as of the token. That is
+  correct whenever the token is current, which it almost always is, and wrong
+  for a client syncing from an old `pos` — so `membershipIsRelevant` currently
+  drops a self-leave that Synapse would keep as `newly_left`.
+- **Partial-state room exclusion** (`must_await_full_state`).
+- **The endpoint, the long poll, and the `slidingstore` pool, config and reaper
+  wiring.** The reaper still has no caller; see the M11 note.
+- **The `spaces` list filter** is refused rather than ignored, matching
+  Synapse's `NotImplementedError`. Silently returning unfiltered rooms would
+  show a client rooms it asked not to see.

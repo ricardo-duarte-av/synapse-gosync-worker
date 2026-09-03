@@ -128,6 +128,36 @@ Nine independent sources of divergence:
    now_token mid-response — `prev_batch` is the other case, already tolerated.
    Anything derived from a token we supplied cannot be tested by supplying it.
 
+10. **A sliding sync list's ORDER is undefined when one range covers the whole
+    list.** `SlidingSyncRoomLists._compute_interested_rooms_new_tables` carries
+    an explicit shortcut:
+
+    ```python
+    # Optimization: If we are asking for the full range, we don't
+    # need to sort the list.
+    if (len(list_config.ranges) == 1 and ranges[0][0] == 0
+        and ranges[0][1] >= len(filtered_sync_room_map) - 1):
+        sorted_room_info = list(filtered_sync_room_map.values())
+    ```
+
+    So a full-range request comes back in Python dict order — matching neither
+    `event_stream_ordering` nor `bump_stamp`, and not reproducible by any other
+    implementation. Measured against `av-sync-worker-2` on a 9-room account,
+    2026-09-03: `[[0,4]]` came back sorted and **identical to ours**, while
+    `[[0,8]]` and `[[0,99]]` came back in an order that matches neither column.
+
+    We sort unconditionally, which is a deliberate deviation: skipping the sort
+    would buy us nothing (the metadata is already fetched, so it is an in-memory
+    sort of a few hundred entries) and would make our own answers
+    irreproducible, which costs us more than it costs a client — the client has
+    every room in the list and `bump_stamp` to sort them by.
+
+    **Consequence for the comparator: compare the room SET for a full-range
+    list, and the room ORDER only for a partial one.** A partial range is the
+    only case where Synapse's order is defined, and it is the case that
+    validates the sort — `internal/slidingsync/parity_live_test.go` does exactly
+    this split.
+
 **Consequence.** The proxy/shadow/canary ladder is *not* built first: it depends
 on comparing two answers to the same live request, which sources 1–4 make
 unsound. The replay comparator comes first; the ladder is retrofitted at M9, and
