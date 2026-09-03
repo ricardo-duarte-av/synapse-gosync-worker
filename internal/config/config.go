@@ -202,6 +202,9 @@ type Experimental struct {
 	// per-user row in `per_user_experimental_features` overrides in either
 	// direction. Synapse defaults it to TRUE, unlike the flags around it.
 	MSC3575Enabled bool `yaml:"msc3575_enabled"`
+	// MSC4308Enabled gates the thread-subscriptions sliding sync extension.
+	// Synapse defaults it to false; this deployment sets it true.
+	MSC4308Enabled bool `yaml:"msc4308_enabled"`
 
 	// The following gate individual base push rules. Each one adds or removes
 	// a rule from every user's reported ruleset, so a wrong value here is

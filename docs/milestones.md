@@ -22,7 +22,7 @@ Status is recorded here; what actually happened is in [log.md](log.md).
 | M10 | Stream-change caches (`internal/streamcache`) | **done** |
 | M11 | Sliding sync: the connection store | **done** |
 | M12 | Sliding sync: the endpoint, lists and rooms | **done** — served on both paths |
-| M13 | Sliding sync: extensions | not started |
+| M13 | Sliding sync: extensions | **done** — all seven |
 
 M10 onwards exist because sliding sync came into scope on 2026-09-03; the plan
 is in `.claude/plans/`. M10 was pulled out of it as its own milestone because
@@ -761,12 +761,46 @@ three onwards.
   show a client rooms it asked not to see.
 
 
-## M13 — extensions, not started
+## M13 — done, all seven extensions
 
-The seven extensions Synapse implements — `to_device`, `e2ee`, `account_data`,
-`receipts`, `typing`, `io.element.msc4308.thread_subscriptions` and
-`org.matrix.msc4354.sticky_events` — are the remaining sliding sync work. The
-response currently carries an empty `extensions` object.
+`to_device` (MSC3885), `e2ee` (MSC3884), `account_data` (MSC3959), `receipts`
+(MSC3960), `typing` (MSC3961), `io.element.msc4308.thread_subscriptions`
+(MSC4308) and `org.matrix.msc4354.sticky_events` (MSC4354) — every one Synapse
+implements. `docs/decisions.md` records why MSC4262 (profiles) and MSC4360
+(threads) are not among them.
 
-`docs/decisions.md` records why MSC4262 (profiles) and MSC4360 (threads) are not
-among them.
+Every extension is off unless the request enables it, which is what keeps the
+endpoint cheap: a client that only wants a room list pays for nothing else.
+
+Three of them track per-connection state exactly as rooms do — a room the client
+has never been given gets all of its account data or receipts, one it has gets
+only the difference. Sending everything every time is what makes an account-data
+extension expensive on a 654-room account.
+
+### Compared against Synapse, and it took five corrections
+
+Both sides driven twice with the position fed back, on all three accounts.
+Everything matched on the second attempt except five things, each a real
+difference and none guessable from the source:
+
+| What was wrong | What Synapse does |
+|---|---|
+| Room account data omitted when empty | An initial room gets an entry **always**, even `[]`; a merely-updated one is omitted |
+| Initial receipts sent for the whole room | Only receipts for events **in the timeline**, plus the user's own — the spec's rule, and the reason is that a busy room's receipt list grows with its membership |
+| `sticky_events` sent empty | Omitted entirely when there is nothing; Synapse's encoder tests it for truthiness |
+| Sticky `next_batch` was `s<n>` | `sticky_<n>` — prefixed so it cannot be swapped with the room key or the thread-subscriptions token |
+| Sticky events lost `unsigned.membership` | They bypass the visibility DECISION (MSC4354 says history visibility must not apply) but still go THROUGH the filter, because that is what computes MSC4115's membership |
+
+That last one is the shape worth remembering: "this data skips the visibility
+rules" is not the same as "this data skips the visibility code".
+
+### Two more comparability sources
+
+- **An account-data list has no defined order.** Twenty entries, identical as
+  sets, sharing not one position: Synapse iterates a dict, we sort. Compare as
+  a set.
+- **The typing view is only as old as the worker.** Which rooms appear is a
+  question about the typing stream, and a room whose typists were cleared
+  reports `user_ids: []`. That stream is memory-only, so a freshly started
+  worker has not seen clears Synapse remembers from hours ago. A room both
+  sides report must match; one only the reference reports is counted.

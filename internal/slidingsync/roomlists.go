@@ -7,6 +7,9 @@ import (
 	"strings"
 
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/clientevent"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/deviceinbox"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/pushrules"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/replication"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/slidingstore"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/store"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/streamtoken"
@@ -82,6 +85,22 @@ type Deps struct {
 	// Sliding is the per-connection state store. Nil means sliding sync is not
 	// configured, and Build refuses rather than inventing a position.
 	Sliding *slidingstore.Store
+
+	// The extensions need what classic sync needs for the same sections.
+	//
+	// Inbox is nil unless to_device is configured, in which case that
+	// extension answers empty rather than serving messages it will never
+	// delete -- serving and deleting are one decision, as they are for /sync.
+	Inbox *deviceinbox.Deleter
+	// Replication supplies typing, which exists nowhere else. Nil means the
+	// typing extension is always empty.
+	Replication *replication.Subscriber
+
+	MSC3391Enabled bool
+	MSC4308Enabled bool
+	// PushRuleFeatures gates individual base push rules, for the synthesised
+	// m.push_rules account data event.
+	PushRuleFeatures pushrules.Features
 }
 
 // EventConfig builds the serialisation config for one requester.

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -719,4 +720,153 @@ func (s *Store) ExperimentalFeatureEnabled(
 		return false, fmt.Errorf("store: experimental feature: %w", err)
 	}
 	return enabled, nil
+}
+
+// ThreadSubscriptionUpdate is one change to whether a user follows a thread.
+type ThreadSubscriptionUpdate struct {
+	StreamID   int64
+	RoomID     string
+	ThreadRoot string
+	Subscribed bool
+	// Automatic is true when the server subscribed the user rather than the
+	// user asking -- replying to a thread, say.
+	Automatic bool
+}
+
+// ThreadSubscriptionsSince returns a user's thread subscription changes in
+// (from, to], oldest first, at most limit of them.
+//
+// MSC4308. Only the LATEST state per thread is wanted: a user who subscribes
+// and unsubscribes twice in one window should be told the outcome, not the
+// history, so DISTINCT ON keeps the newest row per (room, thread).
+func (s *Store) ThreadSubscriptionsSince(
+	ctx context.Context, userID string, from, to int64, limit int,
+) ([]ThreadSubscriptionUpdate, error) {
+
+	if from >= to || limit <= 0 {
+		return nil, nil
+	}
+	const q = `
+		SELECT stream_id, room_id, event_id, subscribed, automatic FROM (
+			SELECT DISTINCT ON (room_id, event_id)
+			       stream_id, room_id, event_id, subscribed, automatic
+			  FROM thread_subscriptions
+			 WHERE user_id = $1 AND stream_id > $2 AND stream_id <= $3
+			 ORDER BY room_id, event_id, stream_id DESC
+		) latest
+		 ORDER BY stream_id ASC
+		 LIMIT $4`
+	rows, err := s.query(ctx, "ThreadSubscriptionsSince", q, userID, from, to, limit)
+	if err != nil {
+		return nil, fmt.Errorf("store: thread subscriptions: %w", err)
+	}
+	defer rows.Close()
+
+	var out []ThreadSubscriptionUpdate
+	for rows.Next() {
+		var u ThreadSubscriptionUpdate
+		if err := rows.Scan(&u.StreamID, &u.RoomID, &u.ThreadRoot, &u.Subscribed, &u.Automatic); err != nil {
+			return nil, fmt.Errorf("store: thread subscriptions: %w", err)
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+// TagsForRoom returns a user's tags on one room.
+func (s *Store) TagsForRoom(ctx context.Context, userID, roomID string) (json.RawMessage, error) {
+	return s.roomTags(ctx, userID, roomID)
+}
+
+// ReceiptsForEvents returns the receipts pointing at specific events.
+//
+// A room being sent to a client for the first time gets receipts only for the
+// events actually in its timeline, not every receipt in the room. Synapse notes
+// this is in the spec, and the reason is size: a busy room's receipt list grows
+// with its membership, and sending all of it with a three-event timeline is
+// most of the response for none of the value.
+func (s *Store) ReceiptsForEvents(
+	ctx context.Context, roomAndEventIDs map[string][]string,
+) (map[string][]ReceiptRow, error) {
+
+	if len(roomAndEventIDs) == 0 {
+		return map[string][]ReceiptRow{}, nil
+	}
+	rooms := make([]string, 0, len(roomAndEventIDs))
+	var events []string
+	for roomID, ids := range roomAndEventIDs {
+		rooms = append(rooms, roomID)
+		events = append(events, ids...)
+	}
+	if len(events) == 0 {
+		return map[string][]ReceiptRow{}, nil
+	}
+
+	const q = `
+		SELECT room_id, receipt_type, user_id, event_id,
+		       COALESCE(instance_name, ''), stream_id, COALESCE(thread_id, ''), data
+		  FROM receipts_linearized
+		 WHERE room_id = ANY($1) AND event_id = ANY($2)`
+	rows, err := s.query(ctx, "ReceiptsForEvents", q, rooms, events)
+	if err != nil {
+		return nil, fmt.Errorf("store: receipts for events: %w", err)
+	}
+	defer rows.Close()
+
+	// The query pairs every room with every event, so a receipt is only kept
+	// when its event really belongs to its room.
+	wanted := map[[2]string]bool{}
+	for roomID, ids := range roomAndEventIDs {
+		for _, id := range ids {
+			wanted[[2]string{roomID, id}] = true
+		}
+	}
+	out := map[string][]ReceiptRow{}
+	for rows.Next() {
+		var roomID string
+		var r ReceiptRow
+		if err := rows.Scan(&roomID, &r.ReceiptType, &r.UserID, &r.EventID,
+			&r.InstanceName, &r.StreamID, &r.ThreadID, &r.Data); err != nil {
+			return nil, fmt.Errorf("store: receipts for events: %w", err)
+		}
+		if wanted[[2]string{roomID, r.EventID}] {
+			out[roomID] = append(out[roomID], r)
+		}
+	}
+	return out, rows.Err()
+}
+
+// ReceiptsForUserInRooms returns one user's own receipts in the given rooms.
+//
+// Sent alongside the timeline receipts on an initial room: a client needs its
+// OWN read position even when the event it points at is older than anything in
+// the timeline, or it cannot draw its unread marker.
+func (s *Store) ReceiptsForUserInRooms(
+	ctx context.Context, userID string, roomIDs []string, toMax int64,
+) (map[string][]ReceiptRow, error) {
+
+	if len(roomIDs) == 0 {
+		return map[string][]ReceiptRow{}, nil
+	}
+	const q = `
+		SELECT room_id, receipt_type, user_id, event_id,
+		       COALESCE(instance_name, ''), stream_id, COALESCE(thread_id, ''), data
+		  FROM receipts_linearized
+		 WHERE room_id = ANY($1) AND user_id = $2 AND stream_id <= $3`
+	rows, err := s.query(ctx, "ReceiptsForUserInRooms", q, roomIDs, userID, toMax)
+	if err != nil {
+		return nil, fmt.Errorf("store: receipts for user in rooms: %w", err)
+	}
+	defer rows.Close()
+	out := map[string][]ReceiptRow{}
+	for rows.Next() {
+		var roomID string
+		var r ReceiptRow
+		if err := rows.Scan(&roomID, &r.ReceiptType, &r.UserID, &r.EventID,
+			&r.InstanceName, &r.StreamID, &r.ThreadID, &r.Data); err != nil {
+			return nil, fmt.Errorf("store: receipts for user in rooms: %w", err)
+		}
+		out[roomID] = append(out[roomID], r)
+	}
+	return out, rows.Err()
 }

@@ -267,10 +267,15 @@ func slidingSyncIsEmpty(body []byte) bool {
 
 func (d Deps) slidingDeps() slidingsync.Deps {
 	return slidingsync.Deps{
-		Store:          d.Store,
-		Sliding:        d.Sliding,
-		ExcludedRooms:  d.ExcludedRooms,
-		MSC4354Enabled: d.MSC4354Enabled,
-		ServerName:     d.ServerName,
+		Store:            d.Store,
+		Sliding:          d.Sliding,
+		Inbox:            d.Inbox,
+		Replication:      d.Replication,
+		ExcludedRooms:    d.ExcludedRooms,
+		ServerName:       d.ServerName,
+		MSC4354Enabled:   d.MSC4354Enabled,
+		MSC3391Enabled:   d.MSC3391Enabled,
+		MSC4308Enabled:   d.MSC4308Enabled,
+		PushRuleFeatures: d.PushRuleFeatures,
 	}
 }

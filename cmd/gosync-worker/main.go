@@ -297,6 +297,7 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 		Store:          db,
 		Sliding:        sliding,
 		MSC3575Enabled: cfg.Experimental.MSC3575Enabled,
+		MSC4308Enabled: cfg.Experimental.MSC4308Enabled,
 		ServerName:     cfg.ServerName,
 		Auth:           authenticator,
 		Log:            log,

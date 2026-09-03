@@ -234,6 +234,33 @@ func Build(ctx context.Context, d Deps, req BuildRequest) (*Response, error) {
 		}
 	}
 
+	// Extensions run after the rooms, because two of them depend on what the
+	// room section actually contains: receipts re-send for a room sent from
+	// scratch, and sticky events drop anything already in a timeline.
+	subscribed := make(map[string]bool, len(req.Request.RoomSubscriptions))
+	for roomID := range req.Request.RoomSubscriptions {
+		if _, ok := lists.Membership[roomID]; ok {
+			subscribed[roomID] = true
+		}
+	}
+	roomResults := make(map[string]*RoomResult, len(roomIDs))
+	for i, roomID := range roomIDs {
+		if results[i] != nil {
+			roomResults[roomID] = results[i]
+		}
+	}
+
+	extensions, err := buildExtensions(ctx, d, extensionInputs{
+		UserID: req.UserID, DeviceID: req.DeviceID, Request: req.Request,
+		From: req.From, Now: req.Now, NowMS: req.NowMS,
+		Lists: lists.Lists, Subscribed: subscribed, AllRooms: lists.AllRooms,
+		Rooms: roomResults, Membership: lists.Membership,
+		Previous: prev, New: next,
+	})
+	if err != nil {
+		return nil, err
+	}
+
 	position := req.ConnectionPos
 	if len(req.Request.Lists) > 0 || len(req.Request.RoomSubscriptions) > 0 {
 		position, err = d.Sliding.Persist(ctx, req.UserID, req.DeviceID, connID, req.ConnectionPos, next)
@@ -246,7 +273,7 @@ func Build(ctx context.Context, d Deps, req BuildRequest) (*Response, error) {
 		Pos:        Pos{ConnectionPosition: position, StreamToken: req.Now}.String(),
 		Lists:      make(map[string]listJSON, len(lists.Lists)),
 		Rooms:      rooms,
-		Extensions: map[string]json.RawMessage{},
+		Extensions: extensions,
 	}
 	for key, l := range lists.Lists {
 		ops := make([]opJSON, 0, len(l.Ops))

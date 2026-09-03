@@ -57,3 +57,10 @@ func attachAggregations(body json.RawMessage, agg eventfilter.Aggregation,
 	timeNow int64, cfg clientevent.Config) (json.RawMessage, error) {
 	return eventfilter.AttachAggregations(body, agg, extra, events, timeNow, cfg)
 }
+
+// receiptEvent renders one room's receipts as the single m.receipt event the
+// legacy endpoints emit, or nil when there are none.
+func receiptEvent(roomID string, rows []store.ReceiptRow, userID string,
+	withThreads bool) (json.RawMessage, error) {
+	return eventfilter.ReceiptEvent(roomID, rows, userID, withThreads)
+}

@@ -172,6 +172,26 @@ Nine independent sources of divergence:
 
     **Strip clock-derived fields recursively, not at the top level.**
 
+12. **An account-data list has no defined order.** The `global` section of the
+    sliding sync account-data extension is built by iterating a dict in Synapse
+    and by a sorted query here, so the same twenty entries come back in two
+    different orders. Measured on the second test account, 2026-09-03: the two
+    lists were identical as SETS and shared not one position.
+
+    **Compare it as a set.** The same applies to the per-room lists beside it.
+
+13. **The typing view is only as old as the worker.** Which rooms appear in the
+    typing extension is a question about the typing STREAM, not about who is
+    typing now: a room whose typists were cleared is a change, and reports
+    `user_ids: []`. That stream exists only in memory, so a worker started a
+    minute ago has not seen the clears Synapse's typing worker remembers from
+    hours back, and an initial request legitimately reports fewer rooms.
+
+    This is the warm-up gap classic sync already has (syncdiff counts it as
+    "known gaps (m.typing before the replication view fills in)"), showing up
+    in a new place. **A room BOTH sides report must match**; a room only the
+    reference reports is counted, not failed.
+
 **Consequence.** The proxy/shadow/canary ladder is *not* built first: it depends
 on comparing two answers to the same live request, which sources 1–4 make
 unsound. The replay comparator comes first; the ladder is retrofitted at M9, and

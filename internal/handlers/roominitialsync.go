@@ -65,6 +65,8 @@ type Deps struct {
 	// MSC3575Enabled mirrors Synapse's experimental.msc3575_enabled, the
 	// homeserver-wide default a per-user override can flip either way.
 	MSC3575Enabled bool
+	// MSC4308Enabled gates the thread-subscriptions extension.
+	MSC4308Enabled bool
 	// ServerName is this homeserver's name, for deciding which user IDs are
 	// local.
 	ServerName string

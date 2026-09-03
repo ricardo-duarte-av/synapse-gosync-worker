@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"strings"
 	"testing"
@@ -274,4 +275,43 @@ func refWhoami(t *testing.T) (userID, deviceID string) {
 		t.Fatal(err)
 	}
 	return parsed.UserID, parsed.DeviceID
+}
+
+// refRawTo posts a sliding sync request to an arbitrary socket.
+func refRawTo(t *testing.T, sock, token string, body map[string]any, pos string) []byte {
+	t.Helper()
+	enc, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	url := "http://localhost/_matrix/client/unstable/org.matrix.simplified_msc3575/sync?timeout=0"
+	if pos != "" {
+		url += "&pos=" + neturl.QueryEscape(pos)
+	}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(enc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	c := &http.Client{Timeout: 60 * time.Second, Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", sock)
+		},
+	}}
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatalf("%s: %v", sock, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("%s returned %d: %s", sock, resp.StatusCode, string(raw))
+	}
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }
