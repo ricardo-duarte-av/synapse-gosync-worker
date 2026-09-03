@@ -162,6 +162,16 @@ carry an empty `rooms` object, and a room entry can carry nothing but a
 and it took reading an nginx access log to notice. With this panel it is one
 glance.
 
+**`client_gone` is not a failure, and it is 4% of this endpoint's traffic.**
+A long poll exists to be abandoned: the nginx log for the reference worker shows
+1,102 `499`s out of 27,465 requests, and every one of them is a client that
+closed the connection while we were still building its answer. Those land on the
+outcome axis as `client_gone`, separate from `error`. Read them as the client
+population's behaviour, not as our health — a phone that backgrounds mid-poll
+produces one. Only a *change* in the ratio is interesting, and a spike alongside
+a latency rise means we became slow enough that clients time out before we
+answer.
+
 **`Connection-store writes` is the other one to learn.** Sliding sync is the
 only endpoint here that writes, and the write is proportional to the
 connection's *room count* rather than to what changed — each new position copies

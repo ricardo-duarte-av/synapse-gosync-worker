@@ -11,8 +11,11 @@ var (
 	//
 	// The outcomes are `immediate` (there was news without waiting), `woken`
 	// (parked, then woken by it), `empty` (nothing to say, either because the
-	// client asked for no timeout or because the timeout was still running)
-	// `timed_out` (parked to the deadline with nothing) and `unknown_pos`.
+	// client asked for no timeout or because the timeout was still running),
+	// `timed_out` (parked to the deadline with nothing), `unknown_pos`, and
+	// `client_gone` -- the caller hung up mid-request, which for a long poll is
+	// ordinary rather than a fault and is why abandoned requests must not be
+	// counted as 5xx.
 	//
 	// **A worker answering `immediate` on nearly every request has a broken
 	// emptiness rule**, not a busy server. That is not hypothetical: on

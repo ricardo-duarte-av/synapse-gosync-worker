@@ -868,3 +868,32 @@ extension covers whatever is in the response's window, and on the 654-room
 account the activity-ordered list reorders between the two requests. It now
 compares the rooms both sides described and reports a differing scope
 separately.
+
+### The error log was the third thing the real client fixed
+
+Deploying the emptiness fix quietened the request rate and left something the
+rate had been hiding: a steady trickle of `ERR request failed` with
+`context canceled`, from four different queries. Every one was a client walking
+away from its long poll — the same 4% of requests nginx counts as `499`.
+
+Nothing was broken, but the log was: an abandoned poll was indistinguishable
+from a failing query, on the one endpoint where abandonment is normal. So a
+cancelled request is now `client_gone` — logged at debug with "request abandoned
+by the client", counted under its own outcome, and the request line demoted to
+debug too. The 500 still goes out, because there is nobody left to read it.
+
+Two details are deliberate and both are load-bearing:
+
+**Only `context.Canceled`, never `context.DeadlineExceeded`.** The caller's
+cancellation is the caller's business; a deadline is *ours*, and the timeouts on
+this worker are all ours. Folding the two together would silence a worker that
+had become too slow to answer — exactly the failure this endpoint is most likely
+to have — and it would look like healthy client churn while doing it. The unit
+test asserts a deadline is *not* `client_gone`, so widening the predicate fails
+it.
+
+**`refuse` no longer overwrites an outcome that is already set.** It used to
+stamp `refused` unconditionally, which meant the handler could classify a
+request and then have the classification discarded on the way out. Both
+severities were mutation-tested from both directions: removing the `client_gone`
+case makes an abandoned request log at error again, and the test catches it.

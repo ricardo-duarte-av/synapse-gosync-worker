@@ -126,6 +126,14 @@ func WithRequestLog(log zerolog.Logger, next http.Handler) http.Handler {
 
 		ev := log.Info()
 		switch {
+		case outcome == "client_gone":
+			// The caller walked away, so the status is whatever we had no
+			// chance to deliver -- usually 500, because a cancelled query
+			// fails like any other. That is not a server fault and must not be
+			// logged as one: a long poll exists to be abandoned, and 4% of
+			// real sliding sync traffic ends this way. Reported at debug so
+			// the line is still there when somebody goes looking.
+			ev = log.Debug()
 		case status >= 500:
 			ev = log.Error()
 		case status >= 400 && status != http.StatusNotFound:

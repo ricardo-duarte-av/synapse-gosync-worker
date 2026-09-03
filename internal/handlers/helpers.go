@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/auth"
@@ -66,7 +67,14 @@ func authenticate(w http.ResponseWriter, r *http.Request, d Deps, ann *server.An
 
 func refuse(w http.ResponseWriter, ann *server.Annotation, status int, e matrixerr.Error) {
 	if ann != nil {
-		ann.Outcome = "refused"
+		// An outcome already set is more specific than "refused" and wins.
+		// `client_gone` is the case that matters: a long poll the caller
+		// abandoned would otherwise be counted as a refusal with a 500,
+		// which is how 4% of ordinary sliding sync traffic ends up looking
+		// like a server fault on the dashboard.
+		if ann.Outcome == "" {
+			ann.Outcome = "refused"
+		}
 		if ann.Reason == "" {
 			ann.Reason = e.ErrCode
 		}
@@ -75,9 +83,33 @@ func refuse(w http.ResponseWriter, ann *server.Annotation, status int, e matrixe
 }
 
 // internalError logs the cause and returns a body that does not leak it.
+//
+// A CANCELLED request is not a failure, and is logged at debug. A long poll
+// exists to be abandoned: 1,102 of 27,465 sliding sync requests in the measured
+// window ended in a 499, and every one of those cancels whatever query was in
+// flight. Reporting them at error level buries the failures that matter -- the
+// first thing real clients produced on this endpoint was four such lines a
+// second, none of which were bugs.
+//
+// The status is still 500, because there is nothing else to write and nobody
+// left to read it; what stops it polluting the metrics is the `client_gone`
+// outcome the caller sets. See clientGone.
 func internalError(d Deps, what string, err error) *matrixerr.Error {
-	d.Log.Error().Err(err).Str("during", what).Msg("request failed")
+	if clientGone(err) {
+		d.Log.Debug().Err(err).Str("during", what).Msg("request abandoned by the client")
+	} else {
+		d.Log.Error().Err(err).Str("during", what).Msg("request failed")
+	}
 	return &matrixerr.Error{ErrCode: matrixerr.CodeUnknown, Error: "Internal server error"}
+}
+
+// clientGone reports whether an error is the caller having walked away.
+//
+// context.Canceled only: a DEADLINE that passed is ours, not theirs -- the
+// statement timeout or a context we bounded -- and that is a real failure worth
+// an error line.
+func clientGone(err error) bool {
+	return errors.Is(err, context.Canceled)
 }
 
 // roomReceipts renders one room's receipts for the single-room endpoint.
