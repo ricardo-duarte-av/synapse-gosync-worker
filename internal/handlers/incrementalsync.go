@@ -23,11 +23,19 @@ import (
 // drops a room whose timeline, state, account data and ephemeral are all empty
 // (`_generate_room_entry`), and a response where nothing at all happened has no
 // `rooms` key whatsoever.
+// rooms, when non-nil, is the caller's already-fetched membership list. The
+// long poll computes one per pass to decide which rooms to wait on, and that
+// answer is the same one this function would go and ask for; passing it down
+// halves a query that runs on every sync of every client. Nil means fetch it,
+// which is what the non-polling callers do.
 func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw string,
-	useStateAfter bool, f *filter.Collection) (
+	useStateAfter bool, f *filter.Collection, rooms []store.RoomForUser) (
 	[]byte, int, *matrixerr.Error) {
 
-	ctx := r.Context()
+	// A fresh memo per pass, not per request: a long poll runs this function
+	// many times on one request context, and an answer cached at the start of
+	// a five-minute poll is not an answer by the end of it.
+	ctx := store.WithRequestCache(r.Context())
 	ann := server.Annotate(ctx)
 
 	since, err := streamtoken.Parse(sinceRaw)
@@ -56,9 +64,12 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 	sincePos := since.Room.MaxStreamPos()
 	nowPos := now.Room.MaxStreamPos()
 
-	rooms, err := d.Store.RoomsForUser(ctx, verdict.UserID, []string{"invite", "join"})
-	if err != nil {
-		return nil, http.StatusInternalServerError, internalError(d, "rooms for user", err)
+	if rooms == nil {
+		var err error
+		rooms, err = d.Store.RoomsForUser(ctx, verdict.UserID, []string{"invite", "join"})
+		if err != nil {
+			return nil, http.StatusInternalServerError, internalError(d, "rooms for user", err)
+		}
 	}
 	roomVersions := map[string]string{}
 	joinedIDs := make([]string, 0, len(rooms))
@@ -147,6 +158,35 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 		ann.NextBatch = now.String()
 	}
 
+	// One query for every membership change of this user in the window, used
+	// twice: to decide which rooms are newly joined, and further down to
+	// report invites.
+	//
+	// This is what makes the loop below cheap. A room can only have become
+	// newly joined if the user's membership event for it lands in (since, now]
+	// -- so a room with no membership change needs no probe at all, and on a
+	// real account that is all but a handful of them. Synapse works the same
+	// way: `_get_room_changes_for_incremental_sync` iterates
+	// `mem_change_events_by_room_id` and never looks at the rest.
+	changes, err := d.Store.MembershipChangesForUser(ctx, verdict.UserID, sincePos, nowPos)
+	if err != nil {
+		return nil, http.StatusInternalServerError, internalError(d, "membership changes", err)
+	}
+	changesByRoom := map[string][]store.MembershipChange{}
+	for _, c := range changes {
+		changesByRoom[c.RoomID] = append(changesByRoom[c.RoomID], c)
+	}
+
+	// History gaps for every joined room in one query, on the same bounds the
+	// per-room path would have used. The single-room form asked once per room
+	// -- 653 round trips on this account for an answer that concerned two of
+	// them -- and it was by a wide margin the most-called query on the worker.
+	gapsByRoom, err := d.Store.TimelineGaps(ctx, joinedIDs, &since.Room, now.Room)
+	if err != nil {
+		return nil, http.StatusInternalServerError, internalError(d, "timeline gaps", err)
+	}
+	gaps := newGapSet(gapsByRoom, &since.Room, now.Room)
+
 	joinedRooms := map[string]any{}
 	var newlyJoined []string
 	for _, room := range rooms {
@@ -162,9 +202,38 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 		// paginated back from now rather than only the events since `since`,
 		// and `limited` set. The client has never seen this room, so sending
 		// it a delta against a state it does not have would be meaningless.
-		wasJoined, err := d.Store.MembershipAtPosition(ctx, room.RoomID, verdict.UserID, since.Room)
-		if err != nil {
-			return nil, http.StatusInternalServerError, internalError(d, "membership at since", err)
+		//
+		// Deciding that costs up to three queries, so it is worth not asking.
+		// Two gates, both Synapse's:
+		//
+		//  1. No membership event in the window means the membership at
+		//     `since` is the membership now, which is `join`. This is the one
+		//     that matters -- it is the difference between three queries per
+		//     room and three queries per room that changed.
+		//  2. A membership event that is not a join, in a room we are joined
+		//     to now, means we left and rejoined inside the window. Newly
+		//     joined by construction, and Synapse `continue`s before the state
+		//     lookup rather than confirming what it already knows.
+		roomChanges, changedHere := changesByRoom[room.RoomID]
+		rejoined := false
+		for _, c := range roomChanges {
+			if c.Membership != "join" {
+				rejoined = true
+				break
+			}
+		}
+		wasJoined := "join"
+		switch {
+		case !changedHere:
+			// Gate 1. Membership at `since` is membership now.
+		case rejoined:
+			// Gate 2. Left and came back inside the window.
+			wasJoined = ""
+		default:
+			wasJoined, err = d.Store.MembershipAtPosition(ctx, room.RoomID, verdict.UserID, since.Room)
+			if err != nil {
+				return nil, http.StatusInternalServerError, internalError(d, "membership at since", err)
+			}
 		}
 		if wasJoined != "join" {
 			newlyJoined = append(newlyJoined, room.RoomID)
@@ -180,7 +249,10 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 			}
 			entry, err := syncRoomEntry(ctx, d, room, verdict.UserID, now.Room, timeNow, cfg,
 				accountDataByRoom[room.RoomID], now, useStateAfter, f, verdict.DeviceID, false,
-				src, sticky[room.RoomID], typingRooms[room.RoomID])
+				// nil receipts: this path replaces the whole ephemeral block
+				// below, bounding it by `since` rather than by the now token,
+				// so anything built here would be discarded.
+				src, sticky[room.RoomID], typingRooms[room.RoomID], nil)
 			if err != nil {
 				return nil, http.StatusInternalServerError, internalError(d, "room entry", err)
 			}
@@ -207,7 +279,7 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 			timeNow, cfg, timelines[room.RoomID],
 			accountDataByRoom[room.RoomID], receiptsByRoom[room.RoomID],
 			useStateAfter, f, verdict.DeviceID, sticky[room.RoomID],
-			typingRooms[room.RoomID])
+			typingRooms[room.RoomID], gaps)
 		if err != nil {
 			return nil, http.StatusInternalServerError, internalError(d, "room entry", err)
 		}
@@ -225,11 +297,6 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 		return nil, http.StatusInternalServerError, internalError(d, "previous memberships", err)
 	}
 
-	// Invites are reported only when the membership event itself is new.
-	changes, err := d.Store.MembershipChangesForUser(ctx, verdict.UserID, sincePos, nowPos)
-	if err != nil {
-		return nil, http.StatusInternalServerError, internalError(d, "membership changes", err)
-	}
 	ignored, err := d.Store.IgnoredUsers(ctx, verdict.UserID)
 	if err != nil {
 		return nil, http.StatusInternalServerError, internalError(d, "ignored users", err)
@@ -507,7 +574,7 @@ func incrementalRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, u
 	raw []store.TimelineEvent, accountData []store.AccountDataEntry,
 	receipts []store.ReceiptRow, useStateAfter bool,
 	f *filter.Collection, deviceID string, stickyIDs []string,
-	typingChanged bool) (map[string]any, error) {
+	typingChanged bool, gaps *gapSet) (map[string]any, error) {
 
 	// Where the loaded chunk begins, which is Synapse's per-room `upto_token`
 	// and the prev_batch of an untrimmed timeline. For a room whose events all
@@ -521,7 +588,7 @@ func incrementalRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, u
 	sinceKey := since.Room
 
 	messages, memberships, prevBatch, limited, err := loadFilteredRecents(ctx, d, room, userID,
-		now, upto, &sinceKey, raw, true, false, timeNow, f)
+		now, upto, &sinceKey, raw, true, false, timeNow, f, gaps)
 	if err != nil {
 		return nil, err
 	}
@@ -1122,7 +1189,7 @@ func archivedRoomEntry(ctx context.Context, d Deps, roomID, userID string,
 	// is the whole timeline and there is nothing to paginate.
 	sinceKey := since.Room
 	messages, memberships, prevBatch, limited, err := loadFilteredRecents(ctx, d, room, userID,
-		now, endToken, &sinceKey, raw, hasPotential, false, timeNow, f)
+		now, endToken, &sinceKey, raw, hasPotential, false, timeNow, f, nil)
 	if err != nil {
 		return nil, err
 	}

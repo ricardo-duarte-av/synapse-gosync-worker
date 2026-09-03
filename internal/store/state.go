@@ -52,7 +52,7 @@ func (s *Store) StateGroupsForEvents(ctx context.Context, eventIDs []string) (ma
 	const q = `
 		SELECT event_id, state_group FROM event_to_state_groups
 		 WHERE event_id = ANY($1) AND state_group IS NOT NULL`
-	rows, err := s.pool.Query(ctx, q, missing)
+	rows, err := s.query(ctx, "StateGroupsForEvents", q, missing)
 	if err != nil {
 		return nil, fmt.Errorf("store: state groups for events: %w", err)
 	}
@@ -134,7 +134,7 @@ func (s *Store) FilteredStateForGroup(ctx context.Context, group int64, keys []S
 		return nil, fmt.Errorf("store: disable seqscan: %w", err)
 	}
 
-	rows, err := tx.Query(ctx, stateGroupFilteredQuery, group, types, stateKeys)
+	rows, err := txQuery(ctx, tx, "FilteredStateForGroup", stateGroupFilteredQuery, group, types, stateKeys)
 	if err != nil {
 		return nil, fmt.Errorf("store: filtered state for group: %w", err)
 	}

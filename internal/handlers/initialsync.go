@@ -49,7 +49,7 @@ func InitialSync(d Deps) http.Handler {
 }
 
 func initialSync(r *http.Request, d Deps, verdict auth.Verdict) ([]byte, int, *matrixerr.Error) {
-	ctx := r.Context()
+	ctx := store.WithRequestCache(r.Context())
 	ann := server.Annotate(ctx)
 
 	limit := intParam(r, "limit", defaultPaginationLimit)

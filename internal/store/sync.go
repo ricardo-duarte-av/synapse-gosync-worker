@@ -70,7 +70,7 @@ func (s *Store) LazyStateForGroup(ctx context.Context, group int64, members []st
 	if _, err := tx.Exec(ctx, `SET LOCAL enable_seqscan = off`); err != nil {
 		return nil, fmt.Errorf("store: disable seqscan: %w", err)
 	}
-	rows, err := tx.Query(ctx, lazyStateGroupQuery, group, members)
+	rows, err := txQuery(ctx, tx, "LazyStateForGroup", lazyStateGroupQuery, group, members)
 	if err != nil {
 		return nil, fmt.Errorf("store: lazy state for group: %w", err)
 	}
@@ -102,7 +102,7 @@ func (s *Store) FullStateForGroup(ctx context.Context, group int64) (map[StateKe
 	if _, err := tx.Exec(ctx, `SET LOCAL enable_seqscan = off`); err != nil {
 		return nil, fmt.Errorf("store: disable seqscan: %w", err)
 	}
-	rows, err := tx.Query(ctx, fullStateGroupQuery, group)
+	rows, err := txQuery(ctx, tx, "FullStateForGroup", fullStateGroupQuery, group)
 	if err != nil {
 		return nil, fmt.Errorf("store: full state for group: %w", err)
 	}
@@ -128,7 +128,7 @@ func (s *Store) FullStateForGroup(ctx context.Context, group int64) (map[StateKe
 func (s *Store) CurrentStateIDs(ctx context.Context, roomID string) (map[StateKey]string, error) {
 	const q = `
 		SELECT type, state_key, event_id FROM current_state_events WHERE room_id = $1`
-	rows, err := s.pool.Query(ctx, q, roomID)
+	rows, err := s.query(ctx, "CurrentStateIDs", q, roomID)
 	if err != nil {
 		return nil, fmt.Errorf("store: current state ids: %w", err)
 	}
@@ -182,7 +182,7 @@ func (s *Store) RoomSummary(ctx context.Context, roomID string) (MemberSummary, 
 		SELECT membership, COUNT(*) FROM current_state_events
 		 WHERE type = 'm.room.member' AND room_id = $1 AND membership IS NOT NULL
 		 GROUP BY membership`
-	rows, err := s.pool.Query(ctx, countQ, roomID)
+	rows, err := s.query(ctx, "RoomSummary", countQ, roomID)
 	if err != nil {
 		return out, fmt.Errorf("store: room summary counts: %w", err)
 	}
@@ -210,7 +210,7 @@ func (s *Store) RoomSummary(ctx context.Context, roomID string) (MemberSummary, 
 		            ELSE 4 END ASC,
 		          event_stream_ordering ASC
 		 LIMIT 6`
-	mrows, err := s.pool.Query(ctx, memberQ, roomID)
+	mrows, err := s.query(ctx, "RoomSummary", memberQ, roomID)
 	if err != nil {
 		return out, fmt.Errorf("store: room summary members: %w", err)
 	}
@@ -405,7 +405,7 @@ func (s *Store) UnreadNotifications(ctx context.Context, roomID, userID string) 
 		  LEFT JOIN actions ac ON ac.thread_id = t.thread_id
 		  LEFT JOIN highlights h ON h.thread_id = t.thread_id`
 
-	rows, err := s.pool.Query(ctx, q, roomID, userID)
+	rows, err := s.query(ctx, "UnreadNotifications", q, roomID, userID)
 	if err != nil {
 		return RoomNotifCounts{}, fmt.Errorf("store: unread notifications: %w", err)
 	}
@@ -460,7 +460,7 @@ func (s *Store) DeviceKeyCounts(ctx context.Context, userID, deviceID string) (D
 		return out, nil
 	}
 
-	rows, err := s.pool.Query(ctx, `
+	rows, err := s.query(ctx, "DeviceKeyCounts", `
 		SELECT algorithm, COUNT(*) FROM e2e_one_time_keys_json
 		 WHERE user_id = $1 AND device_id = $2 GROUP BY algorithm`, userID, deviceID)
 	if err != nil {
@@ -480,7 +480,7 @@ func (s *Store) DeviceKeyCounts(ctx context.Context, userID, deviceID string) (D
 		return out, fmt.Errorf("store: one time keys: %w", err)
 	}
 
-	frows, err := s.pool.Query(ctx, `
+	frows, err := s.query(ctx, "DeviceKeyCounts", `
 		SELECT algorithm FROM e2e_fallback_keys_json
 		 WHERE user_id = $1 AND device_id = $2 AND used IS FALSE`, userID, deviceID)
 	if err != nil {
@@ -510,7 +510,7 @@ func (s *Store) EventsByID(ctx context.Context, eventIDs []string, roomVersion s
 		       ej.json, ej.internal_metadata
 		  FROM events e JOIN event_json ej USING (event_id)
 		 WHERE e.event_id = ANY($1)`
-	rows, err := s.pool.Query(ctx, q, eventIDs)
+	rows, err := s.query(ctx, "EventsByID", q, eventIDs)
 	if err != nil {
 		return nil, fmt.Errorf("store: events by id: %w", err)
 	}
@@ -591,7 +591,7 @@ func (s *Store) PaginateBackwards(ctx context.Context, roomID, roomVersion strin
 		args = []any{roomID, from.MaxStreamPos(), requested}
 	}
 
-	rows, err := s.pool.Query(ctx, sql, args...)
+	rows, err := s.query(ctx, "PaginateBackwards", sql, args...)
 	if err != nil {
 		return nil, from, false, fmt.Errorf("store: paginate backwards: %w", err)
 	}
@@ -689,7 +689,7 @@ func (s *Store) PaginateBackwardsStream(ctx context.Context, roomID, roomVersion
 		 ORDER BY e.stream_ordering DESC
 		 LIMIT $4`
 
-	rows, err := s.pool.Query(ctx, q, roomID, from.MaxStreamPos(), to.MaxStreamPos(), requested)
+	rows, err := s.query(ctx, "PaginateBackwardsStream", q, roomID, from.MaxStreamPos(), to.MaxStreamPos(), requested)
 	if err != nil {
 		return nil, from, false, fmt.Errorf("store: paginate backwards by stream: %w", err)
 	}
@@ -757,7 +757,7 @@ func (s *Store) EventsInCurrentState(ctx context.Context, eventIDs []string) (ma
 		return nil, nil
 	}
 	const q = `SELECT event_id FROM current_state_events WHERE event_id = ANY($1)`
-	rows, err := s.pool.Query(ctx, q, eventIDs)
+	rows, err := s.query(ctx, "EventsInCurrentState", q, eventIDs)
 	if err != nil {
 		return nil, fmt.Errorf("store: events in current state: %w", err)
 	}
@@ -786,7 +786,7 @@ func (s *Store) PushRules(ctx context.Context, userID string) ([]pushrules.UserR
 		SELECT rule_id, priority_class, priority, conditions, actions
 		  FROM push_rules WHERE user_name = $1
 		 ORDER BY priority_class DESC, priority DESC`
-	rows, err := s.pool.Query(ctx, q, userID)
+	rows, err := s.query(ctx, "PushRules", q, userID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("store: push rules: %w", err)
 	}
@@ -804,7 +804,7 @@ func (s *Store) PushRules(ctx context.Context, userID string) ([]pushrules.UserR
 		return nil, nil, fmt.Errorf("store: push rules: %w", err)
 	}
 
-	erows, err := s.pool.Query(ctx,
+	erows, err := s.query(ctx, "PushRules",
 		`SELECT rule_id, enabled FROM push_rules_enable WHERE user_name = $1`, userID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("store: push rules enabled: %w", err)
@@ -882,7 +882,7 @@ func (s *Store) stateGroupAt(ctx context.Context, roomID string, key streamtoken
 		   AND rejection_reason IS NULL
 		 ORDER BY stream_ordering DESC LIMIT 1`
 	var eventID string
-	err := s.pool.QueryRow(ctx, lastQ, roomID, key.MaxStreamPos()).Scan(&eventID)
+	err := s.queryRow(ctx, "stateGroupAt", lastQ, roomID, key.MaxStreamPos()).Scan(&eventID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, false, nil
 	}
@@ -904,7 +904,7 @@ func (s *Store) StateIDsAt(ctx context.Context, roomID string, key streamtoken.R
 		   AND rejection_reason IS NULL
 		 ORDER BY stream_ordering DESC LIMIT 1`
 	var eventID string
-	err := s.pool.QueryRow(ctx, lastQ, roomID, key.MaxStreamPos()).Scan(&eventID)
+	err := s.queryRow(ctx, "StateIDsAt", lastQ, roomID, key.MaxStreamPos()).Scan(&eventID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return map[StateKey]string{}, nil
 	}

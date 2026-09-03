@@ -28,7 +28,7 @@ func (s *Store) UserFilter(ctx context.Context, userID string, filterID int64) (
 		  FROM user_filters
 		 WHERE full_user_id = $1 AND filter_id = $2`
 	var raw []byte
-	err := s.pool.QueryRow(ctx, q, userID, filterID).Scan(&raw)
+	err := s.queryRow(ctx, "UserFilter", q, userID, filterID).Scan(&raw)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNoSuchFilter
 	}
@@ -71,7 +71,7 @@ func (s *Store) EventsWithRelations(ctx context.Context, parentIDs, senders, rel
 		q += fmt.Sprintf(" AND relation_type = ANY($%d)", len(args))
 	}
 
-	rows, err := s.pool.Query(ctx, q, args...)
+	rows, err := s.query(ctx, "EventsWithRelations", q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("store: events with relations: %w", err)
 	}
@@ -100,7 +100,7 @@ func (s *Store) InstanceIDs(ctx context.Context) (map[string]int, error) {
 	if s.instanceIDs != nil {
 		return s.instanceIDs, nil
 	}
-	rows, err := s.pool.Query(ctx, `SELECT instance_name, instance_id FROM instance_map`)
+	rows, err := s.query(ctx, "InstanceIDs", `SELECT instance_name, instance_id FROM instance_map`)
 	if err != nil {
 		return nil, fmt.Errorf("store: instance map: %w", err)
 	}
@@ -139,21 +139,51 @@ func (s *Store) InstanceIDs(ctx context.Context) (map[string]int, error) {
 // This deployment has 99,053 gap rows across 1,392 rooms, so it is not an edge
 // case -- it is merely invisible whenever the timeline was long enough to be
 // trimmed, which with the default filter is nearly always.
+// TimelineGap reports whether a room has a hole in its history inside the
+// window, and where.
+//
+// A thin wrapper over TimelineGaps: the single-room form is what the legacy
+// endpoints and the archived-room path want, and there is no reason for two
+// copies of the per-writer arithmetic below.
 func (s *Store) TimelineGap(ctx context.Context, roomID string,
 	from *streamtoken.RoomKey, to streamtoken.RoomKey) (int64, bool, error) {
 
+	gaps, err := s.TimelineGaps(ctx, []string{roomID}, from, to)
+	if err != nil {
+		return 0, false, err
+	}
+	stream, ok := gaps[roomID]
+	return stream, ok, nil
+}
+
+// TimelineGaps reports history holes for several rooms in one query.
+//
+// The map holds only rooms that have a gap; absent means none. The value is
+// already the token position a caller should rewind to, not the raw gap.
+//
+// One query rather than one per room. This is the most-called query on the
+// worker -- an incremental sync asks it about every room the user is in,
+// whether or not anything happened there, which on a 654-room account was 653
+// round trips for a response that mentioned two rooms. Nothing about the
+// answer changes: same rows, same arithmetic, same bounds.
+func (s *Store) TimelineGaps(ctx context.Context, roomIDs []string,
+	from *streamtoken.RoomKey, to streamtoken.RoomKey) (map[string]int64, error) {
+
+	if len(roomIDs) == 0 {
+		return nil, nil
+	}
 	fromStream := int64(0)
 	if from != nil {
 		fromStream = from.Stream
 	}
 	const q = `
-		SELECT COALESCE(instance_name, ''), stream_ordering
+		SELECT room_id, COALESCE(instance_name, ''), stream_ordering
 		  FROM timeline_gaps
-		 WHERE room_id = $1 AND stream_ordering > $2 AND stream_ordering <= $3
+		 WHERE room_id = ANY($1) AND stream_ordering > $2 AND stream_ordering <= $3
 		 ORDER BY stream_ordering`
-	rows, err := s.pool.Query(ctx, q, roomID, fromStream, to.MaxStreamPos())
+	rows, err := s.query(ctx, "TimelineGaps", q, roomIDs, fromStream, to.MaxStreamPos())
 	if err != nil {
-		return 0, false, fmt.Errorf("store: timeline gaps: %w", err)
+		return nil, fmt.Errorf("store: timeline gaps: %w", err)
 	}
 	defer rows.Close()
 
@@ -161,50 +191,60 @@ func (s *Store) TimelineGap(ctx context.Context, roomID string,
 		instance string
 		stream   int64
 	}
-	var gaps []gap
+	byRoom := map[string][]gap{}
 	for rows.Next() {
+		var roomID string
 		var g gap
-		if err := rows.Scan(&g.instance, &g.stream); err != nil {
-			return 0, false, fmt.Errorf("store: timeline gaps: %w", err)
+		if err := rows.Scan(&roomID, &g.instance, &g.stream); err != nil {
+			return nil, fmt.Errorf("store: timeline gaps: %w", err)
 		}
-		gaps = append(gaps, g)
+		byRoom[roomID] = append(byRoom[roomID], g)
 	}
 	if err := rows.Err(); err != nil {
-		return 0, false, fmt.Errorf("store: timeline gaps: %w", err)
+		return nil, fmt.Errorf("store: timeline gaps: %w", err)
 	}
-	if len(gaps) == 0 {
-		return 0, false, nil
+	if len(byRoom) == 0 {
+		return nil, nil
 	}
 
+	// Only fetched when a gap actually exists, which is the rare case. The
+	// instance map is read once per process, so this is not a round trip after
+	// the first, but it is still work worth not doing 653 times.
 	ids, err := s.InstanceIDs(ctx)
 	if err != nil {
-		return 0, false, err
+		return nil, err
 	}
-	// persisted_after(token) is per writer: a gap counts only if the token's
-	// position FOR THE WRITER THAT RECORDED IT is behind it. With a sharded
-	// event persister the plain stream comparison in the query above is only an
-	// approximation, and both bounds have to be re-checked here.
-	last := int64(0)
-	found := false
-	for _, g := range gaps {
-		id, ok := ids[g.instance]
-		if !ok {
-			// An unknown writer cannot be placed per instance; fall back to the
-			// agreed minimum, which is what a token without that writer means.
-			id = -1
+
+	out := map[string]int64{}
+	for roomID, gaps := range byRoom {
+		// persisted_after(token) is per writer: a gap counts only if the
+		// token's position FOR THE WRITER THAT RECORDED IT is behind it. With
+		// a sharded event persister the plain stream comparison in the query
+		// above is only an approximation, and both bounds have to be
+		// re-checked here.
+		last := int64(0)
+		found := false
+		for _, g := range gaps {
+			id, ok := ids[g.instance]
+			if !ok {
+				// An unknown writer cannot be placed per instance; fall back
+				// to the agreed minimum, which is what a token without that
+				// writer means.
+				id = -1
+			}
+			if from != nil && !(from.StreamPosForInstance(id) < g.stream) {
+				continue
+			}
+			if to.StreamPosForInstance(id) < g.stream {
+				continue
+			}
+			last, found = g.stream, true
 		}
-		if from != nil && !(from.StreamPosForInstance(id) < g.stream) {
-			continue
+		if found {
+			// The gap sits *before* the event at this position, so the token
+			// has to be one below it for that event to be included.
+			out[roomID] = last - 1
 		}
-		if to.StreamPosForInstance(id) < g.stream {
-			continue
-		}
-		last, found = g.stream, true
 	}
-	if !found {
-		return 0, false, nil
-	}
-	// The gap sits *before* the event at this position, so the token has to be
-	// one below it for that event to be included.
-	return last - 1, true, nil
+	return out, nil
 }

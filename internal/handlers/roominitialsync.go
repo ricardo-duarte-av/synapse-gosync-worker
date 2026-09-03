@@ -95,7 +95,7 @@ func RoomInitialSync(d Deps) http.Handler {
 func roomInitialSync(r *http.Request, d Deps, verdict auth.Verdict, roomID string, limit int) (
 	[]byte, int, *matrixerr.Error) {
 
-	ctx := r.Context()
+	ctx := store.WithRequestCache(r.Context())
 	ann := server.Annotate(ctx)
 
 	info, err := d.Store.RoomInfo(ctx, roomID)

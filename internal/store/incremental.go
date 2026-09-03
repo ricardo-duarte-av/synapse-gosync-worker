@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 
@@ -43,7 +44,7 @@ func (s *Store) MembershipChangesForUser(ctx context.Context, userID string,
 		 WHERE e.type = 'm.room.member' AND e.state_key = $1
 		   AND e.stream_ordering > $2 AND e.stream_ordering <= $3
 		 ORDER BY e.stream_ordering`
-	rows, err := s.pool.Query(ctx, q, userID, since, now)
+	rows, err := s.query(ctx, "MembershipChangesForUser", q, userID, since, now)
 	if err != nil {
 		return nil, fmt.Errorf("store: membership changes: %w", err)
 	}
@@ -94,7 +95,7 @@ func (s *Store) RoomTimelineSince(ctx context.Context, roomIDs []string, roomVer
 			 WHERE e.outlier = FALSE AND e.room_id = ANY($1)
 			   AND e.stream_ordering > $2 AND e.stream_ordering <= $3
 		) x WHERE rn <= $4`
-	rows, err := s.pool.Query(ctx, q, roomIDs, since, now, limit)
+	rows, err := s.query(ctx, "RoomTimelineSince", q, roomIDs, since, now, limit)
 	if err != nil {
 		return nil, fmt.Errorf("store: room timeline since: %w", err)
 	}
@@ -142,13 +143,22 @@ func (s *Store) RoomTimelineSince(ctx context.Context, roomIDs []string, roomVer
 // an unbroken chain from the caller's last sync needs no `state` block at all,
 // because the timeline itself carries every change.
 func (s *Store) LastEventBefore(ctx context.Context, roomID string, key streamtoken.RoomKey) (string, error) {
+	// Memoised: asked once for prev_batch, once for the lazy-loaded state
+	// lookup and once by the newly-joined probe, per room, with the same
+	// arguments each time. It is the most-called query on the worker.
+	return memo(ctx, "LastEventBefore\x00"+roomID+"\x00"+key.String(), func() (string, error) {
+		return s.lastEventBefore(ctx, roomID, key)
+	})
+}
+
+func (s *Store) lastEventBefore(ctx context.Context, roomID string, key streamtoken.RoomKey) (string, error) {
 	const q = `
 		SELECT event_id FROM events
 		 WHERE room_id = $1 AND stream_ordering <= $2 AND outlier = FALSE
 		   AND rejection_reason IS NULL
 		 ORDER BY stream_ordering DESC LIMIT 1`
 	var id string
-	err := s.pool.QueryRow(ctx, q, roomID, key.MaxStreamPos()).Scan(&id)
+	err := s.queryRow(ctx, "LastEventBefore", q, roomID, key.MaxStreamPos()).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", nil
 	}
@@ -169,7 +179,7 @@ func (s *Store) GlobalAccountDataSince(ctx context.Context, userID string,
 		q += ` AND content != '{}'`
 	}
 	q += ` ORDER BY account_data_type`
-	rows, err := s.pool.Query(ctx, q, userID, since, now)
+	rows, err := s.query(ctx, "GlobalAccountDataSince", q, userID, since, now)
 	if err != nil {
 		return nil, fmt.Errorf("store: global account data since: %w", err)
 	}
@@ -195,6 +205,20 @@ func (s *Store) GlobalAccountDataSince(ctx context.Context, userID string,
 func (s *Store) RoomAccountDataSince(ctx context.Context, userID string,
 	since, now int64, msc3391 bool) (map[string][]AccountDataEntry, error) {
 
+	// Memoised: this returns every room's account data in one query, and the
+	// archived-room path then calls it once per archived room and reads a
+	// single key out of the result. Readers index the map and hand the slice
+	// to filterAccountDataEntries, which builds a new slice, so nothing
+	// written here is written through.
+	key := fmt.Sprintf("RoomAccountDataSince\x00%s\x00%d\x00%d\x00%t", userID, since, now, msc3391)
+	return memo(ctx, key, func() (map[string][]AccountDataEntry, error) {
+		return s.roomAccountDataSince(ctx, userID, since, now, msc3391)
+	})
+}
+
+func (s *Store) roomAccountDataSince(ctx context.Context, userID string,
+	since, now int64, msc3391 bool) (map[string][]AccountDataEntry, error) {
+
 	q := `
 		SELECT room_id, account_data_type, content FROM room_account_data
 		 WHERE user_id = $1 AND stream_id > $2 AND stream_id <= $3`
@@ -202,7 +226,7 @@ func (s *Store) RoomAccountDataSince(ctx context.Context, userID string,
 		q += ` AND content != '{}'`
 	}
 	q += ` ORDER BY room_id, account_data_type`
-	rows, err := s.pool.Query(ctx, q, userID, since, now)
+	rows, err := s.query(ctx, "RoomAccountDataSince", q, userID, since, now)
 	if err != nil {
 		return nil, fmt.Errorf("store: room account data since: %w", err)
 	}
@@ -231,7 +255,7 @@ func (s *Store) ReceiptsSince(ctx context.Context, roomIDs []string, since, now 
 		       user_id, event_id, COALESCE(thread_id, ''), data
 		  FROM receipts_linearized
 		 WHERE room_id = ANY($1) AND stream_id > $2 AND stream_id <= $3`
-	rows, err := s.pool.Query(ctx, q, roomIDs, since, now)
+	rows, err := s.query(ctx, "ReceiptsSince", q, roomIDs, since, now)
 	if err != nil {
 		return nil, fmt.Errorf("store: receipts since: %w", err)
 	}
@@ -267,7 +291,7 @@ func (s *Store) PresenceSince(ctx context.Context, userID string, since, now int
 				   AND cse.room_id IN (
 						SELECT room_id FROM local_current_membership
 						 WHERE user_id = $1 AND membership = 'join')))`
-	rows, err := s.pool.Query(ctx, q, userID, since, now)
+	rows, err := s.query(ctx, "PresenceSince", q, userID, since, now)
 	if err != nil {
 		return nil, fmt.Errorf("store: presence since: %w", err)
 	}
@@ -318,10 +342,19 @@ func (s *Store) JoinedMembersOf(ctx context.Context, roomIDs []string) ([]string
 	if len(roomIDs) == 0 {
 		return nil, nil
 	}
+	// Memoised: the presence and device-list sections ask this the same way,
+	// for the same newly-joined rooms, in the same pass. Callers only ever
+	// append the result elsewhere, never write into it.
+	return memo(ctx, "JoinedMembersOf\x00"+strings.Join(roomIDs, "\x01"), func() ([]string, error) {
+		return s.joinedMembersOf(ctx, roomIDs)
+	})
+}
+
+func (s *Store) joinedMembersOf(ctx context.Context, roomIDs []string) ([]string, error) {
 	const q = `
 		SELECT DISTINCT state_key FROM current_state_events
 		 WHERE room_id = ANY($1) AND type = 'm.room.member' AND membership = 'join'`
-	rows, err := s.pool.Query(ctx, q, roomIDs)
+	rows, err := s.query(ctx, "JoinedMembersOf", q, roomIDs)
 	if err != nil {
 		return nil, fmt.Errorf("store: joined members: %w", err)
 	}
@@ -346,7 +379,7 @@ func (s *Store) PresenceForUsers(ctx context.Context, userIDs []string) ([]Prese
 	const q = `
 		SELECT user_id, state, last_active_ts, status_msg, currently_active
 		  FROM presence_stream WHERE user_id = ANY($1)`
-	rows, err := s.pool.Query(ctx, q, userIDs)
+	rows, err := s.query(ctx, "PresenceForUsers", q, userIDs)
 	if err != nil {
 		return nil, fmt.Errorf("store: presence for users: %w", err)
 	}
@@ -376,7 +409,7 @@ func (s *Store) DeviceListChanges(ctx context.Context, userID string, roomIDs []
 		const q = `
 			SELECT DISTINCT user_id FROM device_lists_changes_in_room
 			 WHERE room_id = ANY($1) AND stream_id > $2 AND stream_id <= $3`
-		rows, err := s.pool.Query(ctx, q, roomIDs, since, now)
+		rows, err := s.query(ctx, "DeviceListChanges", q, roomIDs, since, now)
 		if err != nil {
 			return nil, fmt.Errorf("store: device list changes: %w", err)
 		}
@@ -396,7 +429,7 @@ func (s *Store) DeviceListChanges(ctx context.Context, userID string, roomIDs []
 
 	// The caller's own devices.
 	var own int
-	if err := s.pool.QueryRow(ctx, `
+	if err := s.queryRow(ctx, "DeviceListChanges", `
 		SELECT COUNT(*) FROM device_lists_stream
 		 WHERE user_id = $1 AND stream_id > $2 AND stream_id <= $3`,
 		userID, since, now).Scan(&own); err != nil {
@@ -407,7 +440,7 @@ func (s *Store) DeviceListChanges(ctx context.Context, userID string, roomIDs []
 	}
 
 	// Cross-signing signatures the caller made on other users.
-	sigRows, err := s.pool.Query(ctx, `
+	sigRows, err := s.query(ctx, "DeviceListChanges", `
 		SELECT DISTINCT user_ids FROM user_signature_stream
 		 WHERE from_user_id = $1 AND stream_id > $2 AND stream_id <= $3`,
 		userID, since, now)
@@ -451,7 +484,7 @@ func (s *Store) UsersSharingAnyRoom(ctx context.Context, userID string) (map[str
 		   AND cse.room_id IN (
 				SELECT room_id FROM local_current_membership
 				 WHERE user_id = $1 AND membership = 'join')`
-	rows, err := s.pool.Query(ctx, q, userID)
+	rows, err := s.query(ctx, "UsersSharingAnyRoom", q, userID)
 	if err != nil {
 		return nil, fmt.Errorf("store: users sharing rooms: %w", err)
 	}
@@ -480,7 +513,7 @@ func (s *Store) MembershipOfEvents(ctx context.Context, eventIDs []string) (map[
 		return nil, nil
 	}
 	const q = `SELECT event_id, membership FROM room_memberships WHERE event_id = ANY($1)`
-	rows, err := s.pool.Query(ctx, q, eventIDs)
+	rows, err := s.query(ctx, "MembershipOfEvents", q, eventIDs)
 	if err != nil {
 		return nil, fmt.Errorf("store: membership of events: %w", err)
 	}
@@ -513,7 +546,7 @@ func (s *Store) CurrentStateDeltas(ctx context.Context, roomID string,
 		SELECT type, state_key, event_id FROM current_state_delta_stream
 		 WHERE room_id = $1 AND stream_id > $2 AND stream_id <= $3
 		 ORDER BY stream_id ASC`
-	rows, err := s.pool.Query(ctx, q, roomID, since, now)
+	rows, err := s.query(ctx, "CurrentStateDeltas", q, roomID, since, now)
 	if err != nil {
 		return nil, fmt.Errorf("store: current state deltas: %w", err)
 	}

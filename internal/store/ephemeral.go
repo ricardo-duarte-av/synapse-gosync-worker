@@ -34,7 +34,7 @@ func (s *Store) RoomReceipts(ctx context.Context, roomID string, to streamtoken.
 		SELECT stream_id, COALESCE(instance_name, ''), receipt_type, user_id, event_id, data
 		  FROM receipts_linearized
 		 WHERE room_id = $1 AND stream_id <= $2`
-	rows, err := s.pool.Query(ctx, q, roomID, to.MaxStreamPos())
+	rows, err := s.query(ctx, "RoomReceipts", q, roomID, to.MaxStreamPos())
 	if err != nil {
 		return nil, fmt.Errorf("store: room receipts: %w", err)
 	}
@@ -91,7 +91,7 @@ func (s *Store) RoomAccountData(ctx context.Context, userID, roomID string) ([]A
 		  FROM room_account_data
 		 WHERE user_id = $1 AND room_id = $2
 		 ORDER BY account_data_type`
-	rows, err := s.pool.Query(ctx, q, userID, roomID)
+	rows, err := s.query(ctx, "RoomAccountData", q, userID, roomID)
 	if err != nil {
 		return nil, fmt.Errorf("store: room account data: %w", err)
 	}
@@ -114,7 +114,7 @@ func (s *Store) RoomAccountData(ctx context.Context, userID, roomID string) ([]A
 // roomTags returns `{"tags": {tag: content}}`, or nil when the user has none.
 func (s *Store) roomTags(ctx context.Context, userID, roomID string) (json.RawMessage, error) {
 	const q = `SELECT tag, content FROM room_tags WHERE user_id = $1 AND room_id = $2`
-	rows, err := s.pool.Query(ctx, q, userID, roomID)
+	rows, err := s.query(ctx, "roomTags", q, userID, roomID)
 	if err != nil {
 		return nil, fmt.Errorf("store: room tags: %w", err)
 	}
@@ -165,7 +165,7 @@ func (s *Store) Presence(ctx context.Context, userIDs []string) ([]PresenceState
 		SELECT user_id, state, last_active_ts, status_msg, currently_active
 		  FROM presence_stream
 		 WHERE user_id = ANY($1)`
-	rows, err := s.pool.Query(ctx, q, userIDs)
+	rows, err := s.query(ctx, "Presence", q, userIDs)
 	if err != nil {
 		return nil, fmt.Errorf("store: presence: %w", err)
 	}
@@ -218,7 +218,7 @@ func scanPresence(rows pgx.Rows) ([]PresenceState, error) {
 func (s *Store) AccessTokenID(ctx context.Context, token string) (int64, error) {
 	const q = `SELECT id FROM access_tokens WHERE token = $1`
 	var id int64
-	if err := s.pool.QueryRow(ctx, q, token).Scan(&id); err != nil {
+	if err := s.queryRow(ctx, "AccessTokenID", q, token).Scan(&id); err != nil {
 		return 0, nil
 	}
 	return id, nil

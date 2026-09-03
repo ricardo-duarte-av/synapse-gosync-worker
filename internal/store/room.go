@@ -34,7 +34,7 @@ func (s *Store) RoomInfo(ctx context.Context, roomID string) (RoomInfo, error) {
 		  FROM rooms r
 		 WHERE r.room_id = $1`
 	var info RoomInfo
-	err := s.pool.QueryRow(ctx, q, roomID).Scan(&info.RoomVersion, &info.Blocked)
+	err := s.queryRow(ctx, "RoomInfo", q, roomID).Scan(&info.RoomVersion, &info.Blocked)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return RoomInfo{}, ErrNotFound
 	}
@@ -63,7 +63,7 @@ func (s *Store) HistoryVisibility(ctx context.Context, roomID string) (string, e
 		 WHERE cse.room_id = $1 AND cse.type = 'm.room.history_visibility'
 		   AND cse.state_key = ''`
 	var body []byte
-	err := s.pool.QueryRow(ctx, q, roomID).Scan(&body)
+	err := s.queryRow(ctx, "HistoryVisibility", q, roomID).Scan(&body)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", nil
 	}
@@ -94,7 +94,7 @@ func (s *Store) CurrentMembership(ctx context.Context, roomID, userID string) (M
 		  FROM current_state_events
 		 WHERE room_id = $1 AND type = 'm.room.member' AND state_key = $2`
 	var m Membership
-	err := s.pool.QueryRow(ctx, q, roomID, userID).Scan(&m.Membership, &m.EventID)
+	err := s.queryRow(ctx, "CurrentMembership", q, roomID, userID).Scan(&m.Membership, &m.EventID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Membership{}, nil
 	}
@@ -128,7 +128,7 @@ func (s *Store) CurrentState(ctx context.Context, roomID, roomVersion string) ([
 		  JOIN event_json ej USING (event_id)
 		 WHERE cse.room_id = $1
 		 ORDER BY cse.type, cse.state_key`
-	rows, err := s.pool.Query(ctx, q, roomID)
+	rows, err := s.query(ctx, "CurrentState", q, roomID)
 	if err != nil {
 		return nil, fmt.Errorf("store: current state: %w", err)
 	}
@@ -222,7 +222,7 @@ func (s *Store) RecentEvents(ctx context.Context, roomID, roomVersion string, li
 		args = []any{roomID, end.MaxStreamPos(), limit * 2}
 	}
 
-	rows, err := s.pool.Query(ctx, sql, args...)
+	rows, err := s.query(ctx, "RecentEvents", sql, args...)
 	if err != nil {
 		return nil, end, fmt.Errorf("store: recent events: %w", err)
 	}
@@ -287,7 +287,7 @@ func (s *Store) IgnoredUsers(ctx context.Context, userID string) (map[string]boo
 		SELECT content FROM account_data
 		 WHERE user_id = $1 AND account_data_type = 'm.ignored_user_list'`
 	var raw *string
-	err := s.pool.QueryRow(ctx, q, userID).Scan(&raw)
+	err := s.queryRow(ctx, "IgnoredUsers", q, userID).Scan(&raw)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -342,7 +342,7 @@ func (s *Store) VisibilityExtras(ctx context.Context, roomID, userID string,
 		erased      []string
 		maxLifetime *int64
 	)
-	if err := s.pool.QueryRow(ctx, q, userID, senders, roomID).Scan(
+	if err := s.queryRow(ctx, "VisibilityExtras", q, userID, senders, roomID).Scan(
 		&ignoredRaw, &erased, &maxLifetime); err != nil {
 		return VisibilityExtras{}, fmt.Errorf("store: visibility extras: %w", err)
 	}
@@ -420,7 +420,7 @@ func (s *Store) AttachPrevContent(ctx context.Context, events []*clientevent.Sto
 		SELECT e.event_id, e.sender, ej.json
 		  FROM events e JOIN event_json ej USING (event_id)
 		 WHERE e.event_id = ANY($1)`
-	rows, err := s.pool.Query(ctx, q, ids)
+	rows, err := s.query(ctx, "AttachPrevContent", q, ids)
 	if err != nil {
 		return fmt.Errorf("store: prev content: %w", err)
 	}

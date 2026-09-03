@@ -51,6 +51,32 @@ var (
 		Help: "Cached access token verdicts.",
 	})
 
+	// DBQueries counts queries issued to Synapse's database, by store method.
+	//
+	// The label is the Go method name, not the SQL: the SQL is long, and two
+	// methods that happen to share a query shape are still two different
+	// reasons to have gone to the database.
+	//
+	// This exists because the cost that matters on this worker is round trips,
+	// not database seconds, and round trips are invisible from the database
+	// side -- pg_stat_statements sees a query shape shared with the other
+	// workers on this server and cannot attribute it to us. Roughly sixty
+	// label values, which is what "low cardinality" was reserved for.
+	DBQueries = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "gosync_db_queries_total",
+		Help: "Queries issued to Synapse's database, by store method.",
+	}, []string{"query"})
+
+	// StateCacheEntries reports how full the two state caches are.
+	//
+	// Worth a panel: a cache pinned at its ceiling is evicting, and on this
+	// worker eviction means the 17GB state_groups_state table gets walked
+	// again. Sized against the configured maximum, not read alone.
+	StateCacheEntries = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "gosync_state_cache_entries",
+		Help: "Entries held in the immutable state caches.",
+	}, []string{"cache"})
+
 	// DatabaseReadOnly is 1 when the connected role cannot write.
 	//
 	// A gauge rather than a startup check alone, so that a role changed

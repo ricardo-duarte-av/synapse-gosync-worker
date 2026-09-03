@@ -196,7 +196,13 @@ type Experimental struct {
 	MSC3874Enabled bool `yaml:"msc3874_enabled"`
 }
 
-// Caches configures the one cache whose size is visible in responses.
+// Caches configures the worker's caches.
+//
+// LazyLoadMembersCacheSize is the one whose size is visible in responses -- it
+// changes how many member events a lazy-loading sync repeats, so it must match
+// the reference server. The state caches below are invisible to a client:
+// everything in them is immutable, so their size trades memory for round trips
+// and nothing else.
 type Caches struct {
 	// LazyLoadMembersCacheSize is how many member events one device's
 	// lazy-loading cache remembers.
@@ -209,6 +215,13 @@ type Caches struct {
 	// LazyLoadMembersCacheTTL is how long a device's cache lives, measured
 	// from creation rather than last use, as Synapse's ExpiringCache does.
 	LazyLoadMembersCacheTTL time.Duration `yaml:"lazy_load_members_cache_ttl"`
+
+	// StateGroupCacheSize and FilteredStateCacheSize bound the two state
+	// caches, in entries. Zero takes the store's default; negative disables
+	// the cache, which is what makes "is the cache hiding this bug?" a
+	// question that can be answered rather than argued about.
+	StateGroupCacheSize    int `yaml:"state_group_cache_size"`
+	FilteredStateCacheSize int `yaml:"filtered_state_cache_size"`
 }
 
 // Testing gates behaviour that exists only to make the comparator possible.

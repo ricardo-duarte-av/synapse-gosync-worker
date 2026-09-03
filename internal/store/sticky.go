@@ -47,7 +47,7 @@ func (s *Store) StickyEvents(ctx context.Context, roomIDs []string,
 		 ORDER BY se.stream_id ASC
 		 LIMIT $5`
 
-	rows, err := s.pool.Query(ctx, q, nowMS, from, to, roomIDs, limit)
+	rows, err := s.query(ctx, "StickyEvents", q, nowMS, from, to, roomIDs, limit)
 	if err != nil {
 		return 0, nil, fmt.Errorf("store: sticky events: %w", err)
 	}

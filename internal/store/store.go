@@ -120,7 +120,7 @@ func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 // runs against a production Synapse database.
 func (s *Store) IsReadOnly(ctx context.Context) (bool, error) {
 	var setting string
-	if err := s.pool.QueryRow(ctx, `SHOW default_transaction_read_only`).Scan(&setting); err != nil {
+	if err := s.queryRow(ctx, "IsReadOnly", `SHOW default_transaction_read_only`).Scan(&setting); err != nil {
 		return false, fmt.Errorf("store: check read-only: %w", err)
 	}
 	return setting == "on", nil

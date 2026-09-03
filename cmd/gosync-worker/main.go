@@ -93,9 +93,11 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 	defer openCancel()
 
 	db, err := store.Open(openCtx, store.Config{
-		DSN:            cfg.Database.DSN,
-		MaxConns:       cfg.Database.Conns(),
-		ConnectTimeout: cfg.Database.ConnectTimeout(),
+		DSN:                         cfg.Database.DSN,
+		MaxConns:                    cfg.Database.Conns(),
+		ConnectTimeout:              cfg.Database.ConnectTimeout(),
+		EventStateGroupCacheEntries: cfg.Caches.StateGroupCacheSize,
+		FilteredStateCacheEntries:   cfg.Caches.FilteredStateCacheSize,
 	})
 	if err != nil {
 		return err
@@ -174,6 +176,17 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 		Password: cfg.Replication.Password,
 		DB:       cfg.Replication.DB,
 	}, log, notif)
+
+	// The state caches hold data that is immutable but not permanent: a purged
+	// room's state groups stay valid right up until they stop existing. While
+	// we follow the stream that deletion is visible; while we do not, it is
+	// not -- so a lost connection discards them.
+	sub.SetOnDrop(func() {
+		groups, filtered := db.CacheLen()
+		db.PurgeCaches()
+		log.Warn().Int("state_groups", groups).Int("filtered_state", filtered).
+			Msg("replication dropped; discarded state caches")
+	})
 
 	// Seed from the database so the worker has an answer before any traffic
 	// arrives. Every seeded value is a lower bound that the first row on that

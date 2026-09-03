@@ -42,7 +42,7 @@ func (s *Store) MessagesForDevice(ctx context.Context, userID, deviceID string,
 		ORDER BY stream_id ASC
 		LIMIT $5`
 
-	rows, err := s.pool.Query(ctx, q, userID, deviceID, from, to, limit)
+	rows, err := s.query(ctx, "MessagesForDevice", q, userID, deviceID, from, to, limit)
 	if err != nil {
 		return nil, 0, fmt.Errorf("store: to-device messages: %w", err)
 	}

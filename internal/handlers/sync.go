@@ -82,7 +82,7 @@ func Sync(d Deps) http.Handler {
 
 func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter bool,
 	f *filter.Collection) ([]byte, int, *matrixerr.Error) {
-	ctx := r.Context()
+	ctx := store.WithRequestCache(r.Context())
 	ann := server.Annotate(ctx)
 
 	now, _, mxErr := nowToken(r, d)
@@ -208,6 +208,25 @@ func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter 
 		toBuild = append(toBuild, room)
 	}
 
+	// Receipts for every room in one query rather than one per room.
+	//
+	// The per-room form cost 654 round trips on a large account's initial
+	// sync, for a query whose batched shape was already sitting in
+	// initialsync.go. Bounded by the same now token either way, so a room sees
+	// exactly the receipts it saw before.
+	var receiptsByRoom map[string][]store.ReceiptRow
+	if !f.BlocksAllRoomEphemeral() {
+		ids := make([]string, 0, len(toBuild))
+		for _, room := range toBuild {
+			ids = append(ids, room.RoomID)
+		}
+		var err error
+		receiptsByRoom, err = d.Store.MultiRoomReceipts(ctx, ids, now.Receipt.MaxStreamPos())
+		if err != nil {
+			return nil, http.StatusInternalServerError, internalError(d, "receipts", err)
+		}
+	}
+
 	// Rooms are built ten at a time, which is what Synapse does --
 	// `concurrently_execute(handle_room_entries, room_entries, 10)`,
 	// handlers/sync.py:2700 -- and not a liberty taken for speed.
@@ -224,7 +243,8 @@ func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter 
 		group.Go(func() error {
 			entry, err := syncRoomEntry(gctx, d, room, verdict.UserID, now.Room, timeNow, cfg,
 				accountDataByRoom[room.RoomID], now, useStateAfter, f, verdict.DeviceID, true,
-				timelineSource{upto: now}, sticky[room.RoomID], typingRooms[room.RoomID])
+				timelineSource{upto: now}, sticky[room.RoomID], typingRooms[room.RoomID],
+				receiptsByRoom[room.RoomID])
 			if err != nil {
 				return err
 			}
@@ -382,12 +402,13 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 	endKey streamtoken.RoomKey, timeNow int64, cfg clientevent.Config,
 	accountData []store.AccountDataEntry, now streamtoken.Token,
 	useStateAfter bool, f *filter.Collection, deviceID string, initial bool,
-	src timelineSource, stickyIDs []string, typingChanged bool) (map[string]any, error) {
+	src timelineSource, stickyIDs []string, typingChanged bool,
+	receiptRows []store.ReceiptRow) (map[string]any, error) {
 
 	// No `since` in either case: a newly joined room is paginated as history,
 	// exactly as an initial sync is, because the client has none of it.
 	messages, memberships, prevBatch, limited, err := loadFilteredRecents(ctx, d, room, userID,
-		now, src.upto, nil, src.potential, src.hasPotential, src.newlyJoined, timeNow, f)
+		now, src.upto, nil, src.potential, src.hasPotential, src.newlyJoined, timeNow, f, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -553,11 +574,6 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 
 	ephemeral := []json.RawMessage{}
 	if !f.BlocksAllRoomEphemeral() {
-		receiptsByRoom, err := d.Store.MultiRoomReceipts(ctx, []string{room.RoomID}, now.Receipt.MaxStreamPos())
-		if err != nil {
-			return nil, err
-		}
-		receiptRows := receiptsByRoom[room.RoomID]
 		// withThreads: /sync uses the multi-room receipt path, which selects
 		// thread_id and applies MSC4102 -- unlike /rooms/{id}/initialSync.
 		if ev, err := receiptEvent(room.RoomID, receiptRows, userID, true); err != nil {
@@ -799,7 +815,7 @@ func longPoll(r *http.Request, d Deps, verdict auth.Verdict, since string,
 	// A pinned request is a comparison, not a client: waiting would only make
 	// the comparator slow, and the window is fixed anyway.
 	if timeout <= 0 || r.URL.Query().Get("_gosync_now") != "" || d.Notifier == nil {
-		return incrementalSync(r, d, verdict, since, useStateAfter, f)
+		return incrementalSync(r, d, verdict, since, useStateAfter, f, nil)
 	}
 	if timeout > maxSyncTimeout {
 		timeout = maxSyncTimeout
@@ -829,7 +845,7 @@ func longPoll(r *http.Request, d Deps, verdict auth.Verdict, since string,
 
 		handle := d.Notifier.Register(roomIDs, []string{verdict.UserID})
 
-		body, status, mxErr := incrementalSync(r, d, verdict, since, useStateAfter, f)
+		body, status, mxErr := incrementalSync(r, d, verdict, since, useStateAfter, f, rooms)
 		if mxErr != nil || !isEmptySync(body) {
 			handle.Close()
 			if ann != nil {

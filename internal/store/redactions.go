@@ -56,7 +56,7 @@ func (s *Store) Redactions(ctx context.Context, eventIDs []string) (map[string]R
 		   AND re.rejection_reason IS NULL
 		   AND target.type <> 'm.room.create'
 		 ORDER BY re.stream_ordering`
-	rows, err := s.pool.Query(ctx, q, eventIDs)
+	rows, err := s.query(ctx, "Redactions", q, eventIDs)
 	if err != nil {
 		return nil, fmt.Errorf("store: redactions: %w", err)
 	}

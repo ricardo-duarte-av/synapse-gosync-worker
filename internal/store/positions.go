@@ -51,7 +51,7 @@ func (s *Store) CurrentToken(ctx context.Context) (streamtoken.Token, error) {
 		deviceLists, unPartialStated, threadSubs, sticky, quarantined int64
 		profileUpdates                                                int64
 	)
-	if err := s.pool.QueryRow(ctx, q).Scan(
+	if err := s.queryRow(ctx, "CurrentToken", q).Scan(
 		&events, &presence, &receipts, &accountData, &pushRules, &toDevice,
 		&deviceLists, &unPartialStated, &threadSubs, &sticky, &quarantined,
 		&profileUpdates,

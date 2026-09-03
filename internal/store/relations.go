@@ -23,7 +23,7 @@ func (s *Store) RelationTypesOf(ctx context.Context, eventIDs []string) (map[str
 		return nil, nil
 	}
 	const q = `SELECT event_id, relation_type FROM event_relations WHERE event_id = ANY($1)`
-	rows, err := s.pool.Query(ctx, q, eventIDs)
+	rows, err := s.query(ctx, "RelationTypesOf", q, eventIDs)
 	if err != nil {
 		return nil, fmt.Errorf("store: relation types: %w", err)
 	}
@@ -57,7 +57,7 @@ func (s *Store) ThreadSummaries(ctx context.Context, eventIDs []string) (map[str
 		     ON parent.event_id = relates_to_id AND parent.room_id = child.room_id
 		 WHERE relates_to_id = ANY($1) AND relation_type = 'm.thread'
 		 ORDER BY parent.event_id, child.topological_ordering DESC, child.stream_ordering DESC`
-	rows, err := s.pool.Query(ctx, latestQ, eventIDs)
+	rows, err := s.query(ctx, "ThreadSummaries", latestQ, eventIDs)
 	if err != nil {
 		return nil, fmt.Errorf("store: thread latest: %w", err)
 	}
@@ -90,7 +90,7 @@ func (s *Store) ThreadSummaries(ctx context.Context, eventIDs []string) (map[str
 		     ON parent.event_id = relates_to_id AND parent.room_id = child.room_id
 		 WHERE relates_to_id = ANY($1) AND relation_type = 'm.thread'
 		 GROUP BY parent.event_id`
-	crows, err := s.pool.Query(ctx, countQ, roots)
+	crows, err := s.query(ctx, "ThreadSummaries", countQ, roots)
 	if err != nil {
 		return nil, fmt.Errorf("store: thread counts: %w", err)
 	}
@@ -119,7 +119,7 @@ func (s *Store) ThreadsParticipated(ctx context.Context, eventIDs []string, user
 		  FROM events AS child INNER JOIN event_relations USING (event_id)
 		 WHERE relates_to_id = ANY($1) AND relation_type = 'm.thread'
 		   AND child.sender = $2`
-	rows, err := s.pool.Query(ctx, q, eventIDs, userID)
+	rows, err := s.query(ctx, "ThreadsParticipated", q, eventIDs, userID)
 	if err != nil {
 		return nil, fmt.Errorf("store: threads participated: %w", err)
 	}
@@ -147,7 +147,7 @@ func (s *Store) ThreadRepliesBySender(ctx context.Context, eventIDs, senders []s
 		 WHERE relates_to_id = ANY($1) AND relation_type = 'm.thread'
 		   AND child.sender = ANY($2)
 		 GROUP BY relates_to_id`
-	rows, err := s.pool.Query(ctx, q, eventIDs, senders)
+	rows, err := s.query(ctx, "ThreadRepliesBySender", q, eventIDs, senders)
 	if err != nil {
 		return nil, fmt.Errorf("store: ignored thread replies: %w", err)
 	}
@@ -185,7 +185,7 @@ func (s *Store) ApplicableEdits(ctx context.Context, eventIDs []string) (map[str
 		    AND edit.room_id = original.room_id
 		 WHERE relates_to_id = ANY($1) AND relation_type = 'm.replace'
 		 ORDER BY original.event_id DESC, edit.origin_server_ts DESC, edit.event_id DESC`
-	rows, err := s.pool.Query(ctx, q, eventIDs)
+	rows, err := s.query(ctx, "ApplicableEdits", q, eventIDs)
 	if err != nil {
 		return nil, fmt.Errorf("store: applicable edits: %w", err)
 	}
@@ -215,7 +215,7 @@ func (s *Store) References(ctx context.Context, eventIDs []string, ignored map[s
 		     ON parent.event_id = relates_to_id AND parent.room_id = ref.room_id
 		 WHERE relates_to_id = ANY($1) AND relation_type = 'm.reference'
 		 ORDER BY ref.topological_ordering, ref.stream_ordering`
-	rows, err := s.pool.Query(ctx, q, eventIDs)
+	rows, err := s.query(ctx, "References", q, eventIDs)
 	if err != nil {
 		return nil, fmt.Errorf("store: references: %w", err)
 	}

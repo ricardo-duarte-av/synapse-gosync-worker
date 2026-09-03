@@ -37,7 +37,7 @@ func (s *Store) RoomsForUser(ctx context.Context, userID string, memberships []s
 		  JOIN rooms r USING (room_id)
 		 WHERE c.user_id = $1 AND c.membership = ANY($2)
 		 ORDER BY c.room_id`
-	rows, err := s.pool.Query(ctx, q, userID, memberships)
+	rows, err := s.query(ctx, "RoomsForUser", q, userID, memberships)
 	if err != nil {
 		return nil, fmt.Errorf("store: rooms for user: %w", err)
 	}
@@ -73,7 +73,7 @@ func (s *Store) GlobalAccountData(ctx context.Context, userID string, msc3391 bo
 		q += ` AND content != '{}'`
 	}
 	q += ` ORDER BY account_data_type`
-	rows, err := s.pool.Query(ctx, q, userID)
+	rows, err := s.query(ctx, "GlobalAccountData", q, userID)
 	if err != nil {
 		return nil, fmt.Errorf("store: global account data: %w", err)
 	}
@@ -105,7 +105,7 @@ func (s *Store) AllRoomAccountData(ctx context.Context, userID string, msc3391 b
 
 	// Tags first: Synapse emits the synthetic m.tag event ahead of stored room
 	// account data.
-	tagRows, err := s.pool.Query(ctx,
+	tagRows, err := s.query(ctx, "AllRoomAccountData",
 		`SELECT room_id, tag, content FROM room_tags WHERE user_id = $1`, userID)
 	if err != nil {
 		return nil, fmt.Errorf("store: all room tags: %w", err)
@@ -142,7 +142,7 @@ func (s *Store) AllRoomAccountData(ctx context.Context, userID string, msc3391 b
 		roomQ += ` AND content != '{}'`
 	}
 	roomQ += ` ORDER BY room_id, account_data_type`
-	rows, err := s.pool.Query(ctx, roomQ, userID)
+	rows, err := s.query(ctx, "AllRoomAccountData", roomQ, userID)
 	if err != nil {
 		return nil, fmt.Errorf("store: all room account data: %w", err)
 	}
@@ -185,7 +185,7 @@ func (s *Store) SharedRoomPresence(ctx context.Context, userID string) ([]Presen
 				   AND cse.room_id IN (
 						SELECT room_id FROM local_current_membership
 						 WHERE user_id = $1 AND membership = 'join')))`
-	rows, err := s.pool.Query(ctx, q, userID)
+	rows, err := s.query(ctx, "SharedRoomPresence", q, userID)
 	if err != nil {
 		return nil, fmt.Errorf("store: shared room presence: %w", err)
 	}
@@ -203,7 +203,7 @@ func (s *Store) MultiRoomReceipts(ctx context.Context, roomIDs []string, toMax i
 		       user_id, event_id, COALESCE(thread_id, ''), data
 		  FROM receipts_linearized
 		 WHERE room_id = ANY($1) AND stream_id <= $2`
-	rows, err := s.pool.Query(ctx, q, roomIDs, toMax)
+	rows, err := s.query(ctx, "MultiRoomReceipts", q, roomIDs, toMax)
 	if err != nil {
 		return nil, fmt.Errorf("store: multi room receipts: %w", err)
 	}
@@ -234,7 +234,7 @@ func (s *Store) InviteEvent(ctx context.Context, eventID, roomID, roomVersion st
 		  FROM events e JOIN event_json ej USING (event_id)
 		 WHERE e.event_id = $1`
 	var ev StateEvent
-	if err := s.pool.QueryRow(ctx, q, eventID).Scan(
+	if err := s.queryRow(ctx, "InviteEvent", q, eventID).Scan(
 		&ev.Type, &ev.StateKey, &ev.Sender, &ev.JSON, &ev.InternalMetadata); err != nil {
 		return StateEvent{}, fmt.Errorf("store: invite event: %w", err)
 	}

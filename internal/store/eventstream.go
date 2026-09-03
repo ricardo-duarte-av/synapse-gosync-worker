@@ -39,7 +39,7 @@ func (s *Store) RoomEventsForward(ctx context.Context, roomIDs []string,
 		) x WHERE rn <= $4
 		ORDER BY stream_ordering ASC`
 
-	rows, err := s.pool.Query(ctx, q, roomIDs, from, to, limit)
+	rows, err := s.query(ctx, "RoomEventsForward", q, roomIDs, from, to, limit)
 	if err != nil {
 		return nil, fmt.Errorf("store: room events forward: %w", err)
 	}
@@ -96,7 +96,7 @@ func (s *Store) MembershipEventsForUser(ctx context.Context, userID string,
 		   AND e.stream_ordering > $2 AND e.stream_ordering <= $3
 		 ORDER BY e.stream_ordering ASC`
 
-	rows, err := s.pool.Query(ctx, q, userID, from, to)
+	rows, err := s.query(ctx, "MembershipEventsForUser", q, userID, from, to)
 	if err != nil {
 		return nil, fmt.Errorf("store: membership events for user: %w", err)
 	}
@@ -130,7 +130,7 @@ func (s *Store) UpdatedTags(ctx context.Context, userID string, since int64) (ma
 		 WHERE rev.user_id = $1 AND rev.stream_id > $2
 		 ORDER BY rev.room_id, t.tag`
 
-	rows, err := s.pool.Query(ctx, q, userID, since)
+	rows, err := s.query(ctx, "UpdatedTags", q, userID, since)
 	if err != nil {
 		return nil, fmt.Errorf("store: updated tags: %w", err)
 	}

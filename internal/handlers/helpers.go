@@ -53,6 +53,9 @@ func authenticate(w http.ResponseWriter, r *http.Request, d Deps, ann *server.An
 
 	metrics.AuthVerdictsTotal.WithLabelValues("accepted").Inc()
 	metrics.AuthCacheEntries.Set(float64(d.Auth.Len()))
+	groups, filtered := d.Store.CacheLen()
+	metrics.StateCacheEntries.WithLabelValues("event_state_group").Set(float64(groups))
+	metrics.StateCacheEntries.WithLabelValues("filtered_state").Set(float64(filtered))
 	if ann != nil {
 		ann.UserID = verdict.UserID
 		ann.DeviceID = verdict.DeviceID

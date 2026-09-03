@@ -85,7 +85,25 @@ type Subscriber struct {
 	// memory because that is the only place it exists anywhere: Synapse keeps
 	// it in a counter on the typing worker and never writes it down.
 	typing map[string][]string
+
+	// onDrop runs when the subscription goes from healthy to not. Set by the
+	// caller rather than called directly so this package need not know about
+	// the store.
+	onDrop func()
 }
+
+// SetOnDrop registers a callback for the moment the subscription is lost.
+//
+// While we are following the stream, a purged or deleted room arrives as a
+// `caches` invalidation we can act on. While we are not, rooms can be purged
+// underneath us unseen -- so anything cached on the strength of "this row is
+// immutable" has to be thrown away, because immutable is not the same as
+// still there.
+//
+// Not called on the initial transition to live: there is nothing to purge
+// before the first connection, and doing so would make startup log a discard
+// of an empty cache.
+func (s *Subscriber) SetOnDrop(f func()) { s.onDrop = f }
 
 // New builds a Subscriber.
 func New(cfg Config, log zerolog.Logger, listener Listener) *Subscriber {
@@ -209,7 +227,7 @@ func (s *Subscriber) setLive(live bool) {
 		metrics.ReplicationConnected.Set(0)
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	was := s.live
 	if !live {
 		// Typing exists only here, so a lost connection means we no longer
 		// know who is typing. Claiming otherwise would leave a room showing a
@@ -218,6 +236,18 @@ func (s *Subscriber) setLive(live bool) {
 		s.typingSerial = map[string]int64{}
 	}
 	s.live = live
+	s.mu.Unlock()
+
+	// Only on the edge: the reconnect loop calls setLive(false) on every
+	// attempt, and purging the caches once per second while a Redis outage
+	// lasts would turn a lost connection into a slow one.
+	//
+	// Outside the lock -- the callback reaches into the store, and holding a
+	// subscriber mutex across it invites a deadlock that would only show up
+	// under exactly the failure this exists to handle.
+	if was && !live && s.onDrop != nil {
+		s.onDrop()
+	}
 }
 
 // handle parses one replication command.

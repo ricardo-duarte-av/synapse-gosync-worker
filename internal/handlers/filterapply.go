@@ -57,7 +57,7 @@ const maxTimelineRepeats = 5
 func loadFilteredRecents(ctx context.Context, d Deps, room store.RoomForUser, userID string,
 	now, upto streamtoken.Token, sinceKey *streamtoken.RoomKey,
 	potential []store.TimelineEvent, hasPotential, newlyJoined bool,
-	timeNow int64, f *filter.Collection) (
+	timeNow int64, f *filter.Collection, gaps *gapSet) (
 	[]store.TimelineEvent, []string, streamtoken.Token, bool, error) {
 
 	timelineLimit := f.TimelineLimit()
@@ -73,7 +73,11 @@ func loadFilteredRecents(ctx context.Context, d Deps, room store.RoomForUser, us
 	// instead, and marks the timeline limited -- leaving the client to
 	// paginate across the hole rather than handing it two disjoint runs of
 	// events as though they were one.
-	gapStream, gap, err := d.Store.TimelineGap(ctx, room.RoomID, sinceKey, now.Room)
+	//
+	// The set is prefetched for every room at once where the caller can do
+	// that -- an incremental sync asks about all of them with the same bounds
+	// -- and looked up per room otherwise.
+	gapStream, gap, err := gaps.lookup(ctx, d, room.RoomID, sinceKey, now.Room)
 	if err != nil {
 		return nil, nil, upto, false, err
 	}
@@ -292,4 +296,56 @@ func filterStateBlock(f *filter.Collection, roomID string, ids []string,
 		}
 	}
 	return out
+}
+
+// gapSet is a prefetched answer to "does this room have a history gap in the
+// window", for a set of rooms sharing one pair of bounds.
+//
+// A nil gapSet is valid and means "ask the database per room", which is what
+// the paths that build a single room's entry do.
+type gapSet struct {
+	byRoom map[string]int64
+	// Bounds are held as their token strings because a RoomKey carries a
+	// slice of per-writer positions and so cannot be compared with ==. The
+	// string form is canonical for a parsed key, which is exactly the
+	// property needed here.
+	hasFrom bool
+	from    string
+	to      string
+}
+
+func newGapSet(byRoom map[string]int64, from *streamtoken.RoomKey, to streamtoken.RoomKey) *gapSet {
+	g := &gapSet{byRoom: byRoom, to: to.String()}
+	if from != nil {
+		g.hasFrom, g.from = true, from.String()
+	}
+	return g
+}
+
+// lookup answers from the prefetch when the bounds match the ones it was built
+// with, and falls back to a query otherwise.
+//
+// The bounds check is not defensive noise: the prefetch is built with the
+// caller's `since`, and a newly joined room is loaded with different bounds in
+// the same loop. Serving one from the other's answer would report a gap in the
+// wrong place, which a client sees as history it never gets told to paginate
+// for.
+func (g *gapSet) lookup(ctx context.Context, d Deps, roomID string,
+	from *streamtoken.RoomKey, to streamtoken.RoomKey) (int64, bool, error) {
+
+	if g == nil || !g.covers(from, to) {
+		return d.Store.TimelineGap(ctx, roomID, from, to)
+	}
+	stream, ok := g.byRoom[roomID]
+	return stream, ok, nil
+}
+
+func (g *gapSet) covers(from *streamtoken.RoomKey, to streamtoken.RoomKey) bool {
+	if g.to != to.String() {
+		return false
+	}
+	if from == nil {
+		return !g.hasFrom
+	}
+	return g.hasFrom && g.from == from.String()
 }
