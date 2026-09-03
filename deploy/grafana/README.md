@@ -170,6 +170,13 @@ not a metric label: this deployment sees a handful of clients, but a label whose
 values are chosen by callers is a cardinality incident waiting for one badly
 behaved bot. Group by it in the log, not in Prometheus.
 
+**A 5xx on this worker is `outcome="error"`, and only that.** Until
+2026-09-03 `refuse` stamped `refused` on everything it wrote, so the 26 real
+internal errors this endpoint served in a week were counted as refusals --
+sitting on the panel that means "we declined a bad request" rather than the one
+that means "we failed". Both numbers were wrong and the wrong one looked
+harmless. If you see `refused` with a 5xx status again, that regression is back.
+
 **`client_gone` is not a failure, and it is 4% of this endpoint's traffic.**
 A long poll exists to be abandoned: the nginx log for the reference worker shows
 1,102 `499`s out of 27,465 requests, and every one of them is a client that

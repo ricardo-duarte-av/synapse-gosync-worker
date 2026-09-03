@@ -73,7 +73,16 @@ func refuse(w http.ResponseWriter, ann *server.Annotation, status int, e matrixe
 		// which is how 4% of ordinary sliding sync traffic ends up looking
 		// like a server fault on the dashboard.
 		if ann.Outcome == "" {
-			ann.Outcome = "refused"
+			// "refused" means we declined something the caller asked for, and
+			// a 5xx is never that -- it is our fault, and the dashboard has to
+			// be able to tell the difference. All 26 of the 5xx this endpoint
+			// served in the week to 2026-09-03 were real internal errors
+			// counted as refusals, which reads as a client problem.
+			if status >= http.StatusInternalServerError {
+				ann.Outcome = "error"
+			} else {
+				ann.Outcome = "refused"
+			}
 		}
 		if ann.Reason == "" {
 			ann.Reason = e.ErrCode

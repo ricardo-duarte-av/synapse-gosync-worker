@@ -4,7 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/matrixerr"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/server"
 )
 
 // clientGone decides whether a failed request is logged as an error or shrugged
@@ -34,5 +39,41 @@ func TestClientGone(t *testing.T) {
 				t.Errorf("clientGone(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
+	}
+}
+
+// A refusal and a failure are different things, and the outcome label is the
+// only place the dashboard can tell them apart.
+func TestRefuseLabelsServerFaultsAsErrors(t *testing.T) {
+	cases := []struct {
+		status int
+		want   string
+	}{
+		{http.StatusBadRequest, "refused"},
+		{http.StatusNotFound, "refused"},
+		{http.StatusForbidden, "refused"},
+		{http.StatusInternalServerError, "error"},
+		{http.StatusBadGateway, "error"},
+	}
+	for _, tc := range cases {
+		ann := &server.Annotation{}
+		refuse(httptest.NewRecorder(), ann, tc.status,
+			matrixerr.Error{ErrCode: "M_TEST", Error: "test"})
+		if ann.Outcome != tc.want {
+			t.Errorf("status %d -> outcome %q, want %q", tc.status, ann.Outcome, tc.want)
+		}
+	}
+}
+
+// An outcome the handler already decided is more specific than anything refuse
+// can infer, and must survive. client_gone is the case that matters: those
+// requests carry a 500 nobody read, and relabelling them "error" would put 4%
+// of ordinary traffic back on the failure count.
+func TestRefuseKeepsAnOutcomeAlreadySet(t *testing.T) {
+	ann := &server.Annotation{Outcome: "client_gone"}
+	refuse(httptest.NewRecorder(), ann, http.StatusInternalServerError,
+		matrixerr.Error{ErrCode: "M_UNKNOWN", Error: "test"})
+	if ann.Outcome != "client_gone" {
+		t.Errorf("outcome = %q, want it left as client_gone", ann.Outcome)
 	}
 }
