@@ -74,6 +74,14 @@ type Deps struct {
 	// MSC4354Enabled mirrors the experimental flag; a sticky event carries its
 	// remaining lifetime when it is on.
 	MSC4354Enabled bool
+
+	// ServerName decides which user IDs are local, which is what tells a
+	// partially stated room apart from a useless one. See MustAwaitFullState.
+	ServerName string
+
+	// Sliding is the per-connection state store. Nil means sliding sync is not
+	// configured, and Build refuses rather than inventing a position.
+	Sliding *slidingstore.Store
 }
 
 // EventConfig builds the serialisation config for one requester.
@@ -248,6 +256,14 @@ func ComputeRoomLists(
 		}
 	}
 
+	// Rooms still backfilling after a faster join. Fetched once: the set is
+	// small server-wide, and a request asks about hundreds of rooms.
+	partial, err := d.Store.PartialStateRooms(ctx)
+	if err != nil {
+		return nil, err
+	}
+	isLocal := IsLocalUser(d.ServerName)
+
 	for listKey, list := range req.Lists {
 		filtered := rooms
 		if list.Filters != nil {
@@ -262,6 +278,20 @@ func ComputeRoomLists(
 		// Built once per list rather than once per room: normalising
 		// required_state is not free and every room in a list shares it.
 		listConfig := NewRoomSyncConfig(list.CommonRoomParameters)
+
+		// A partially stated room is hidden only if THIS list's required_state
+		// cannot be satisfied from partial state -- which means asking for a
+		// remote membership. Hiding it otherwise would keep a freshly joined
+		// room off the client's screen for as long as backfill takes.
+		if len(partial) > 0 && MustAwaitFullState(listConfig, isLocal) {
+			narrowed := make(map[string]store.SlidingRoom, len(filtered))
+			for roomID, r := range filtered {
+				if !partial[roomID] {
+					narrowed[roomID] = r
+				}
+			}
+			filtered = narrowed
+		}
 
 		ops, err := windowRooms(ctx, d, list, filtered, meta, now)
 		if err != nil {
@@ -283,8 +313,12 @@ func ComputeRoomLists(
 		if _, ok := rooms[roomID]; !ok {
 			continue
 		}
+		subConfig := NewRoomSyncConfig(sub.CommonRoomParameters)
+		if partial[roomID] && MustAwaitFullState(subConfig, isLocal) {
+			continue
+		}
 		out.AllRooms[roomID] = true
-		out.addRelevant(roomID, NewRoomSyncConfig(sub.CommonRoomParameters))
+		out.addRelevant(roomID, subConfig)
 	}
 
 	return out, nil
@@ -543,4 +577,153 @@ func sortRooms(
 		ids = ids[:limit]
 	}
 	return ids, nil
+}
+
+// NumRoomsThreshold and MinimumNotUsedAge are Synapse's, and the pair is the
+// whole point: a connection with a great many rooms to catch up on is better
+// told to start over than served a response that takes seconds to build, but
+// only if it has been idle long enough that starting over is not a loop.
+const (
+	NumRoomsThreshold = 100
+	MinimumNotUsedAge = int64(60 * 60 * 1000)
+)
+
+// filterRoomsToSend narrows the rooms a response will describe to those the
+// client actually needs.
+//
+// Without it every response re-sends every room in the window, which is the
+// difference between a sliding sync and a very expensive `/sync`. Measured
+// before this existed: a second request with nothing changed returned all five
+// rooms again.
+//
+// A room is sent when the client has not been given it, when it was given an
+// incomplete version, when its config has grown, or when something happened in
+// it. Everything else the client already has.
+func filterRoomsToSend(
+	ctx context.Context, d Deps,
+	relevant map[string]slidingstore.RoomSyncConfig,
+	meta map[string]store.SlidingJoinedRoom,
+	prev *slidingstore.PerConnectionState,
+	from *streamtoken.Token, nowMS int64,
+) (map[string]slidingstore.RoomSyncConfig, error) {
+
+	// An initial request has nothing to compare against.
+	if from == nil || len(relevant) == 0 || prev == nil {
+		return relevant, nil
+	}
+
+	should := map[string]bool{}
+	roomIDs := make([]string, 0, len(relevant))
+	for roomID := range relevant {
+		roomIDs = append(roomIDs, roomID)
+	}
+	sort.Strings(roomIDs)
+
+	for _, roomID := range roomIDs {
+		cfg := relevant[roomID]
+		if prevCfg, ok := prev.RoomConfigs[roomID]; ok {
+			// A config that has GROWN needs sending even with no new events:
+			// the client raised its timeline limit or asked for more state, and
+			// the extra is not something a delta can carry.
+			if !sameRoomSyncConfig(CombineRoomSyncConfig(prevCfg, cfg), prevCfg) {
+				should[roomID] = true
+				continue
+			}
+		}
+		switch prev.Rooms.HaveSentRoom(roomID).Status {
+		case slidingstore.FlagNever:
+			// Never sent, so the client needs it whatever has happened.
+			should[roomID] = true
+		case slidingstore.FlagPreviously:
+			// PREVIOUSLY means "sent, AND there are updates we withheld", so
+			// there is by definition something to send.
+			should[roomID] = true
+		case slidingstore.FlagLive:
+			// Everything up to `from` has been sent; only new events matter.
+		}
+	}
+
+	updated, err := roomsWithUpdates(ctx, d, roomIDs, meta, from)
+	if err != nil {
+		return nil, err
+	}
+
+	// A connection with a lot to catch up on is told to start over instead.
+	// Synapse's reasoning: the client chooses its own window, so it will come
+	// back with a small one, and that is faster than building a huge response.
+	// Guarded on the connection having been idle, or a client with a genuinely
+	// large window would be reset on every request.
+	if len(updated) > NumRoomsThreshold && prev.LastUsedMS != nil &&
+		nowMS-*prev.LastUsedMS > MinimumNotUsedAge {
+		return nil, slidingstore.ErrUnknownPosition
+	}
+
+	for _, roomID := range updated {
+		should[roomID] = true
+	}
+
+	out := make(map[string]slidingstore.RoomSyncConfig, len(should))
+	for roomID := range should {
+		if cfg, ok := relevant[roomID]; ok {
+			out[roomID] = cfg
+		}
+	}
+	return out, nil
+}
+
+// roomsWithUpdates returns the rooms that may have had an event since `from`.
+//
+// False positives are free -- they cost one room described that need not have
+// been -- and a false negative loses a client an event, so both sources here
+// err upwards. The stream cache answers without a query when it can; below its
+// horizon the precomputed per-room event position does, which is Synapse's
+// fallback too.
+func roomsWithUpdates(
+	ctx context.Context, d Deps, roomIDs []string,
+	meta map[string]store.SlidingJoinedRoom, from *streamtoken.Token,
+) ([]string, error) {
+
+	narrowed := d.Store.RoomsWithEventsSince(roomIDs, from.Room.Stream)
+	if len(narrowed) < len(roomIDs) {
+		// The cache answered.
+		return narrowed, nil
+	}
+
+	// Below the horizon, or disarmed. Use the materialised per-room position
+	// rather than accepting "every room", which would put us back where we
+	// started.
+	out := make([]string, 0, len(roomIDs))
+	for _, roomID := range roomIDs {
+		m, ok := meta[roomID]
+		if !ok {
+			// No metadata: cannot rule it out, so send it.
+			out = append(out, roomID)
+			continue
+		}
+		if m.EventStream > from.Room.Stream {
+			out = append(out, roomID)
+		}
+	}
+	return out, nil
+}
+
+func sameRoomSyncConfig(a, b slidingstore.RoomSyncConfig) bool {
+	if a.TimelineLimit != b.TimelineLimit {
+		return false
+	}
+	if len(a.RequiredState) != len(b.RequiredState) {
+		return false
+	}
+	for eventType, keys := range a.RequiredState {
+		other, ok := b.RequiredState[eventType]
+		if !ok || len(keys) != len(other) {
+			return false
+		}
+		for k := range keys {
+			if !other[k] {
+				return false
+			}
+		}
+	}
+	return true
 }

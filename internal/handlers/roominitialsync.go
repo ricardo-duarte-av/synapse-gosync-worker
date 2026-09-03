@@ -19,6 +19,7 @@ import (
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/pushrules"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/replication"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/server"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/slidingstore"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/store"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/streamtoken"
 )
@@ -57,6 +58,18 @@ type Deps struct {
 	// configured, in which case the section is omitted entirely rather than
 	// served without ever being cleared.
 	Inbox *deviceinbox.Deleter
+
+	// Sliding holds sliding sync's per-connection state. Nil when sliding sync
+	// is not configured, in which case the endpoint is not registered at all.
+	Sliding *slidingstore.Store
+	// MSC3575Enabled mirrors Synapse's experimental.msc3575_enabled, the
+	// homeserver-wide default a per-user override can flip either way.
+	MSC3575Enabled bool
+	// ServerName is this homeserver's name, for deciding which user IDs are
+	// local.
+	ServerName string
+	// ExcludedRooms are rooms configured never to appear in a sync.
+	ExcludedRooms map[string]bool
 }
 
 // defaultPaginationLimit is Synapse's PaginationConfig default for the legacy

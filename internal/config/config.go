@@ -37,6 +37,7 @@ type Config struct {
 	Listen       Listen       `yaml:"listen"`
 	Database     Database     `yaml:"database"`
 	ToDevice     ToDevice     `yaml:"to_device"`
+	SlidingSync  SlidingSync  `yaml:"sliding_sync"`
 	Replication  Replication  `yaml:"replication"`
 	Auth         Auth         `yaml:"auth"`
 	Reference    Reference    `yaml:"reference"`
@@ -98,6 +99,32 @@ type ToDevice struct {
 	MaxConns int `yaml:"max_conns"`
 	// ConnectTimeoutSeconds bounds the initial connection. Zero means 10.
 	ConnectTimeoutSeconds int `yaml:"connect_timeout_seconds"`
+}
+
+// SlidingSync configures MSC4186, which is the project's second write and the
+// only stateful endpoint it serves.
+//
+// Disabled by default. With it off the two endpoints are not registered at all
+// and probing either returns M_UNRECOGNIZED, which is what a client should see
+// from a server that does not implement them.
+type SlidingSync struct {
+	Enabled bool `yaml:"enabled"`
+	// DSN is a libpq connection string for the role from
+	// deploy/sliding-sync-role.sql: owner of the `gosync` schema, with nothing
+	// in `public`. The worker verifies that narrowness at startup and refuses
+	// a role that can read Synapse's tables.
+	DSN string `yaml:"dsn"`
+	// MaxConns bounds the writing pool. Zero means 8.
+	MaxConns int `yaml:"max_conns"`
+	// ConnectTimeoutSeconds bounds the initial connection. Zero means 10.
+	ConnectTimeoutSeconds int `yaml:"connect_timeout_seconds"`
+	// ReapIntervalMinutes is how often stale connections are collected. Zero
+	// means 60, matching Synapse's CONNECTION_EXPIRY_FREQUENCY.
+	//
+	// Not optional in effect: reading a position prunes only that connection's
+	// own forks, and nothing else prunes a connection whose client stopped
+	// coming back. Without the reaper the six tables grow without bound.
+	ReapIntervalMinutes int `yaml:"reap_interval_minutes"`
 }
 
 // Replication consumes Synapse's replication stream over Redis (KeyDB here).
@@ -171,6 +198,10 @@ type Experimental struct {
 	// MSC3391Enabled treats account data with empty content as deleted, and
 	// omits it. Synapse defaults this to false; this deployment sets it true.
 	MSC3391Enabled bool `yaml:"msc3391_enabled"`
+	// MSC3575Enabled is the homeserver-wide default for sliding sync, which a
+	// per-user row in `per_user_experimental_features` overrides in either
+	// direction. Synapse defaults it to TRUE, unlike the flags around it.
+	MSC3575Enabled bool `yaml:"msc3575_enabled"`
 
 	// The following gate individual base push rules. Each one adds or removes
 	// a rule from every user's reported ruleset, so a wrong value here is
@@ -311,6 +342,10 @@ func Parse(data []byte) (*Config, error) {
 		// rather than after, so an explicit `enabled: false` still wins: the
 		// decoder only writes fields the document actually contains.
 		Caches: Caches{Enabled: true},
+		// Synapse's msc3575_enabled defaults to TRUE, unlike the experimental
+		// flags around it. Set here for the same reason as Caches: an explicit
+		// `false` in the document must still win.
+		Experimental: Experimental{MSC3575Enabled: true},
 	}
 
 	dec := yaml.NewDecoder(strings.NewReader(string(data)))
@@ -381,6 +416,18 @@ func (c *Config) validate() error {
 	}
 	if c.Reference.Socket != "" && c.Reference.URL != "" {
 		return fmt.Errorf("reference: set at most one of socket or url")
+	}
+	if c.SlidingSync.Enabled {
+		if c.SlidingSync.DSN == "" {
+			return fmt.Errorf("sliding_sync.enabled is set but sliding_sync.dsn is empty; " +
+				"see deploy/sliding-sync-role.sql")
+		}
+		// The same guard to_device has, for the same reason: pointing this at
+		// the read-only role fails later, at the first write, on a request.
+		if c.SlidingSync.DSN == c.Database.DSN {
+			return fmt.Errorf("sliding_sync.dsn is the same as database.dsn; " +
+				"it must name the writing role from deploy/sliding-sync-role.sql")
+		}
 	}
 	return nil
 }

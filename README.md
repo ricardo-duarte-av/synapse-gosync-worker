@@ -3,7 +3,9 @@
 A Go reimplementation of Synapse's classic `/sync` worker. It reads Synapse's
 PostgreSQL directly and follows Synapse's replication stream over Redis.
 
-Sliding sync and simplified sliding sync are out of scope.
+Simplified sliding sync (MSC4186) is served, on both the unstable path every
+client uses today and the stable `/_matrix/client/v4/sync` the MSC defines. The
+older MSC3575 sliding sync is out of scope.
 
 Nothing is routed to this worker. It is driven deliberately by `cmd/syncdiff`
 and a test account, and compared against a real Synapse sync worker, until its

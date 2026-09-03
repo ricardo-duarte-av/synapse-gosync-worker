@@ -21,7 +21,7 @@ Status is recorded here; what actually happened is in [log.md](log.md).
 | M9 | Soak, then possibly the promotion ladder | not started |
 | M10 | Stream-change caches (`internal/streamcache`) | **done** |
 | M11 | Sliding sync: the connection store | **done** |
-| M12 | Sliding sync: the endpoint, lists and rooms | **in progress** — room lists done, per-room results and the endpoint next |
+| M12 | Sliding sync: the endpoint, lists and rooms | **done** — served on both paths |
 | M13 | Sliding sync: extensions | not started |
 
 M10 onwards exist because sliding sync came into scope on 2026-09-03; the plan
@@ -707,11 +707,66 @@ fires the connect callback that prefills and arms the caches, so its presence
 gate would have answered "nothing changed" forever. Caches now start disarmed
 and only `Arm` enables them.
 
+### The endpoint — done, and it answers
+
+Registered on both paths MSC4186 defines: the unstable one every client uses
+today and `/_matrix/client/v4/sync`. Both **POST**. Not registered at all when
+`sliding_sync.enabled` is false, so probing either returns `M_UNRECOGNIZED`
+rather than failing on the first request.
+
+Partial-state exclusion came with it. The question is narrower than "is this
+room partial": partial state is complete for everything except REMOTE
+memberships, so a request wanting none of those is served perfectly well from
+it. Answering "yes" too readily hides a freshly joined room for as long as
+backfill takes.
+
+#### Verified in lockstep, not one request at a time
+
+A sliding sync response is a delta against per-connection state, so a single
+request proves almost nothing. Six rounds against `av-sync-worker-2`, on each of
+the three accounts, feeding each side its own `pos` — including **widening the
+window mid-sequence** and **re-sending `pos=0/<token>`**:
+
+| Round | What it exercises | Rooms (ours / reference) |
+|---|---|---|
+| 1 | initial | 5 / 5 |
+| 2 | quiet poll | 0 / 0 |
+| 3 | window widened 0–4 → 0–7 | 3 / 3 |
+| 4 | quiet poll | 0 / 0 |
+| 5 | `pos=0/<token>` re-bootstrap | 8 / 8 |
+| 6 | quiet poll | 0 / 0 |
+
+Zero mismatches on all three, including the 654-room account. And the long poll:
+a 25-second request returned in **4,146 ms** carrying exactly the message sent
+at the four-second mark, with `num_live: 1`.
+
+#### Two bugs the round trip found that a single request could not
+
+**Every response re-sent every room in the window.** `_filter_relevant_rooms_to_send`
+was missing, so a quiet poll returned all five rooms again — the difference
+between a sliding sync and a very expensive `/sync`. The M10 events stream cache
+is what answers it without a query.
+
+**Then responses alternated between five rooms and none, for ever.** The
+`record_unsent_rooms` set must be the rooms OUTSIDE every list range that have
+had events — not every room this response did not describe. `PREVIOUSLY` means
+"there ARE updates we withheld", so marking a room that simply had nothing new
+made the next request dutifully re-send it. Both are visible only from round
+three onwards.
+
 ### Not done, and none of it silently
 
-- **Partial-state room exclusion** (`must_await_full_state`).
-- **The endpoint, the long poll, and the `slidingstore` pool, config and reaper
-  wiring.** The reaper still has no caller; see the M11 note.
 - **The `spaces` list filter** is refused rather than ignored, matching
   Synapse's `NotImplementedError`. Silently returning unfiltered rooms would
   show a client rooms it asked not to see.
+
+
+## M13 — extensions, not started
+
+The seven extensions Synapse implements — `to_device`, `e2ee`, `account_data`,
+`receipts`, `typing`, `io.element.msc4308.thread_subscriptions` and
+`org.matrix.msc4354.sticky_events` — are the remaining sliding sync work. The
+response currently carries an empty `extensions` object.
+
+`docs/decisions.md` records why MSC4262 (profiles) and MSC4360 (threads) are not
+among them.

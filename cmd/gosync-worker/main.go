@@ -32,6 +32,7 @@ import (
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/pushrules"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/replication"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/server"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/slidingstore"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/store"
 )
 
@@ -260,8 +261,43 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 	}
 	go sub.Run(ctx)
 
+	// Sliding sync's per-connection state: the project's second write, in its
+	// own schema behind its own role. Nil leaves both sliding sync paths
+	// unregistered, so probing either returns M_UNRECOGNIZED.
+	var sliding *slidingstore.Store
+	if cfg.SlidingSync.Enabled {
+		sliding, err = slidingstore.Open(openCtx, slidingstore.Config{
+			DSN:            cfg.SlidingSync.DSN,
+			MaxConns:       int32(cfg.SlidingSync.MaxConns),
+			ConnectTimeout: time.Duration(cfg.SlidingSync.ConnectTimeoutSeconds) * time.Second,
+		})
+		if err != nil {
+			return err
+		}
+		defer sliding.Close()
+
+		// The materialised tables sliding sync reads are maintained by
+		// Synapse's event persister. If its background updates have not
+		// finished, or a room is queued for recomputation, they are incomplete
+		// -- and a room silently missing from a client's list is the failure
+		// nobody reports as a bug. Synapse has a slow fallback path; we refuse.
+		ready, why, err := db.SlidingSyncTablesReady(openCtx)
+		if err != nil {
+			return err
+		}
+		if !ready {
+			return fmt.Errorf("sliding sync cannot be served yet: %s", why)
+		}
+
+		go reapSlidingConnections(ctx, sliding, cfg.SlidingSync.ReapIntervalMinutes, log)
+		log.Info().Msg("sliding sync enabled")
+	}
+
 	deps := handlers.Deps{
 		Store:          db,
+		Sliding:        sliding,
+		MSC3575Enabled: cfg.Experimental.MSC3575Enabled,
+		ServerName:     cfg.ServerName,
 		Auth:           authenticator,
 		Log:            log,
 		AllowPinNow:    cfg.Testing.AllowPinNow,
@@ -291,6 +327,7 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 		InitialSync:     handlers.InitialSync(deps),
 		Events:          handlers.Events(deps),
 		Sync:            handlers.Sync(deps),
+		SlidingSync:     slidingSyncRoute(deps, sliding),
 	})
 	// CORS inside the request log, so a preflight is still logged -- it is the
 	// first thing a browser client sends, and an unlogged 204 is invisible
@@ -405,4 +442,49 @@ func cacheSize(enabled bool, configured int) int {
 		return -1
 	}
 	return configured
+}
+
+// slidingSyncRoute returns the handler only when the connection store exists.
+//
+// A nil handler leaves both paths unregistered, so a probe gets
+// M_UNRECOGNIZED rather than a 500 on the first request -- which is what a
+// client should see from a server that does not implement the endpoint.
+func slidingSyncRoute(deps handlers.Deps, sliding *slidingstore.Store) http.Handler {
+	if sliding == nil {
+		return nil
+	}
+	return handlers.SlidingSync(deps)
+}
+
+// reapSlidingConnections collects connections nobody has used for a week.
+//
+// Not optional. Reading a position prunes that connection's own forks and
+// nothing else, so a client that simply stops coming back leaves its connection
+// and every row hanging off it behind for ever. Synapse runs the same job
+// hourly (CONNECTION_EXPIRY_FREQUENCY).
+func reapSlidingConnections(ctx context.Context, sliding *slidingstore.Store,
+	intervalMinutes int, log zerolog.Logger) {
+
+	if intervalMinutes <= 0 {
+		intervalMinutes = 60
+	}
+	ticker := time.NewTicker(time.Duration(intervalMinutes) * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			reapCtx, cancel := context.WithTimeout(ctx, time.Minute)
+			n, err := sliding.DeleteOldConnections(reapCtx)
+			cancel()
+			if err != nil {
+				log.Error().Err(err).Msg("could not reap sliding sync connections")
+				continue
+			}
+			if n > 0 {
+				log.Info().Int64("connections", n).Msg("reaped stale sliding sync connections")
+			}
+		}
+	}
 }

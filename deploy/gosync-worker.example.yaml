@@ -64,6 +64,45 @@ to_device:
   max_conns: 4
   connect_timeout_seconds: 10
 
+# Simplified sliding sync (MSC4186): the second endpoint this worker serves, and
+# the second thing it writes.
+#
+# Disabled by default. With it off neither sliding sync path is registered and
+# probing either returns M_UNRECOGNIZED, which is what a client should see from
+# a server that does not implement it.
+#
+# WHY IT WRITES, AND WHY THAT IS NOT LIKE to_device
+#
+# Sliding sync answers with a delta against what THIS CONNECTION has already
+# been told, and that is not derivable from a token. Even READING the state
+# writes: the read prunes forked positions and bumps a timestamp. The `pos` a
+# client carries is literally a sequence value.
+#
+# So the containment is a whole schema rather than one table. The role owns
+# `gosync` and has NOTHING in `public` -- it cannot read Synapse's tables, let
+# alone write them -- and the worker verifies that at startup and refuses a role
+# that can. internal/store keeps its read-only role and its check.
+#
+# Consequence worth knowing: our `pos` is NOT interchangeable with Synapse's.
+# A client that switches between this host and the real one mid-connection gets
+# M_UNKNOWN_POS and re-bootstraps. That is a supported path -- 9.3% of live
+# requests already start from no connection state -- and it is what keeps a bug
+# here from corrupting a real client's state on the real hostname.
+#
+# Run deploy/sliding-sync-role.sql as a superuser first.
+sliding_sync:
+  enabled: false
+  dsn: "host=/var/sockets user=gosync_ss dbname=synapse-db"
+  max_conns: 8
+  connect_timeout_seconds: 10
+  # How often stale connections are collected. Zero means 60, matching
+  # Synapse's CONNECTION_EXPIRY_FREQUENCY.
+  #
+  # Not optional in effect. Reading a position prunes that connection's own
+  # forks and nothing else, so a client that simply stops coming back leaves its
+  # connection and every row hanging off it behind for ever.
+  reap_interval_minutes: 60
+
 # Synapse's replication stream, over Redis (KeyDB here).
 #
 # Every long-poll wakeup comes from here. On a worker, Synapse's notifier is

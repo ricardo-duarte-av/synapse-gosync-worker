@@ -671,3 +671,52 @@ func inStreamRange(from, to streamtoken.RoomKey, instance string, pos int64, ins
 	}
 	return pos <= to.StreamPosForInstance(id)
 }
+
+// PartialStateRooms returns every room on the server still being backfilled
+// after a faster join.
+//
+// The whole set rather than a per-room check, and that is Synapse's reasoning:
+// the number of partially stated rooms at any moment is small, so one scan
+// beats looking up several hundred room ids -- and a sliding sync request asks
+// about several hundred.
+func (s *Store) PartialStateRooms(ctx context.Context) (map[string]bool, error) {
+	rows, err := s.query(ctx, "PartialStateRooms", `SELECT room_id FROM partial_state_rooms`)
+	if err != nil {
+		return nil, fmt.Errorf("store: partial state rooms: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var roomID string
+		if err := rows.Scan(&roomID); err != nil {
+			return nil, fmt.Errorf("store: partial state rooms: %w", err)
+		}
+		out[roomID] = true
+	}
+	return out, rows.Err()
+}
+
+// ExperimentalFeatureEnabled reports whether a per-user experimental feature is
+// on, falling back to the homeserver-wide default.
+//
+// Synapse gates sliding sync this way rather than through /versions
+// (`Auth.get_user_by_req_experimental_feature`), and a user it is disabled for
+// gets M_UNRECOGNIZED -- the endpoint is meant to look absent rather than
+// forbidden. The per-user row overrides the global setting in BOTH directions,
+// so it is read even when the default is on.
+func (s *Store) ExperimentalFeatureEnabled(
+	ctx context.Context, userID, feature string, globalDefault bool,
+) (bool, error) {
+	const q = `
+		SELECT enabled FROM per_user_experimental_features
+		 WHERE user_id = $1 AND feature = $2`
+	var enabled bool
+	err := s.queryRow(ctx, "ExperimentalFeatureEnabled", q, userID, feature).Scan(&enabled)
+	if isNoRows(err) {
+		return globalDefault, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("store: experimental feature: %w", err)
+	}
+	return enabled, nil
+}

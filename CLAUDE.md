@@ -27,7 +27,10 @@ Start with the ground rules below, then whichever of these the task touches.
 
 A Go reimplementation of Synapse's **classic** `/sync` worker, reading Synapse's
 PostgreSQL directly and following Synapse's replication stream over Redis.
-Sliding sync and simplified sliding sync are out of scope.
+**Simplified sliding sync (MSC4186) is in scope and served** — see
+§7 and docs/milestones.md. The older MSC3575 sliding sync is not: it shares a
+URL prefix and an `unstable_features` flag with the simplified one and almost
+nothing else.
 
 It is the third worker in this family and the one `synapse-gopro-worker`
 explicitly scoped out (its CLAUDE.md §12: *"the genuine remaining opportunity is
@@ -53,7 +56,7 @@ goes straight back to the real hostname. See §6.
 | Endpoint | Requests |
 |---|---|
 | `/_matrix/client/*/sync` | **558,398**, essentially all carrying `since=` |
-| `org.matrix.simplified_msc3575/sync` | 11,844 (out of scope) |
+| `org.matrix.simplified_msc3575/sync` | 11,844 — see §7 |
 | `/events`, `/initialSync`, `/rooms/{id}/initialSync` | **0** |
 
 All three legacy endpoints are nonetheless served and at parity: they were in
@@ -230,3 +233,37 @@ Two flags make a large account legible:
 `not_types: ["*"]` blocks presence, which is otherwise unpinnable noise that
 buries every real difference on an account with thousands of co-occupants. The
 timeline limit keeps the comparator from holding two 200MB documents as Go maps.
+
+## 7. Sliding sync (MSC4186)
+
+Served on both paths: `/_matrix/client/unstable/org.matrix.simplified_msc3575/sync`,
+which every client uses today, and `/_matrix/client/v4/sync`, which the MSC
+settles on. **POST**, unlike everything else here.
+
+Four things about it differ from the rest of the worker, and each is a trap.
+
+**It writes, and reading writes.** Per-connection state — what this connection
+has already been told — is not derivable from a token. Even loading it prunes
+forked positions and bumps a timestamp. `internal/slidingstore` is the only
+package that writes it, behind role `gosync_ss`, which owns the `gosync` schema
+and has **nothing in `public`**. Startup refuses a role that can read
+`public.events`. `internal/store` is still 100% `SELECT`.
+
+**Our `pos` is not Synapse's.** The tables are ours, so a client cannot move
+between `gosync.aguiarvieira.pt` and `aguiarvieira.pt` mid-connection; it gets
+`M_UNKNOWN_POS` and re-bootstraps. That is deliberate — docs/decisions.md — and
+`M_UNKNOWN_POS` is a supported path rather than an error.
+
+**`pos` and `timeout` come from the QUERY STRING.** MSC4186 puts them in the
+body; Synapse reads them from the query. We accept both, query first, so
+today's clients and the stable endpoint's clients both work.
+
+**A full-range list is returned UNSORTED by Synapse.** Comparing the order of
+one is comparing nothing; comparing a partial range's order is the only test of
+the sort. See docs/comparability.md source 10.
+
+Verification is a lockstep comparison rather than a single request: the response
+is a delta against per-connection state, so nothing about it means anything
+until several rounds have run. Six rounds on each of the three accounts —
+including widening the window mid-sequence and re-sending `pos=0/<token>` —
+agree with `av-sync-worker-2` exactly.
