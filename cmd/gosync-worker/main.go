@@ -29,11 +29,13 @@ import (
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/lazyload"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/metrics"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/notifier"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/presence"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/pushrules"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/replication"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/server"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/slidingstore"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/store"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/synapsecfg"
 )
 
 // Build information, stamped by the Docker build via -ldflags, in the same
@@ -156,6 +158,45 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 		}
 		defer inbox.Close()
 		log.Info().Msg("to_device enabled: acknowledged messages will be deleted")
+	}
+
+	// Presence, resolved out of Synapse's own homeserver.yaml at every start
+	// rather than duplicated into ours. See internal/synapsecfg for why.
+	//
+	// This is the only thing this worker TELLS the homeserver. Without it every
+	// account it serves appears permanently offline, because Synapse's /sync
+	// calls user_syncing() and ours would say nothing.
+	var presenceClient *presence.Client
+	if cfg.SynapseConfig != "" {
+		sc, err := synapsecfg.Load(cfg.SynapseConfig)
+		if err != nil {
+			return err
+		}
+		switch {
+		case !sc.PresenceEnabled:
+			// Refusing to relay is right: with presence off the writer ignores
+			// what we would send, and pretending otherwise hides a
+			// configuration the operator chose.
+			log.Info().Str("synapse_config", cfg.SynapseConfig).
+				Msg("presence is disabled on this homeserver; not relaying")
+		default:
+			presenceClient, err = presence.New(presence.Config{
+				Socket: sc.PresenceWriter.Socket,
+				URL:    sc.PresenceWriter.URL,
+				Secret: sc.ReplicationSecret,
+				RelayInterval: presence.DeriveRelayInterval(
+					sc.SyncOnlineTimeout, sc.LastActiveGranularity),
+			}, log)
+			if err != nil {
+				return err
+			}
+			log.Info().
+				Str("writer", sc.PresenceWriter.Name).
+				Str("address", sc.PresenceWriter.Socket+sc.PresenceWriter.URL).
+				Dur("relay_interval", presence.DeriveRelayInterval(
+					sc.SyncOnlineTimeout, sc.LastActiveGranularity)).
+				Msg("presence relaying enabled")
+		}
 	}
 
 	authenticator, err := auth.New(auth.Config{
@@ -327,7 +368,8 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 		Notifier:            notif,
 		LazyLoad: lazyload.New(cfg.Caches.LazyLoadMembersCacheSize,
 			cfg.Caches.LazyLoadMembersCacheTTL),
-		Inbox: inbox,
+		Inbox:    inbox,
+		Presence: presenceClient,
 		PushRuleFeatures: pushrules.Features{
 			MSC1767Enabled:             cfg.Experimental.MSC1767Enabled,
 			MSC3381PollsEnabled:        cfg.Experimental.MSC3381PollsEnabled,

@@ -58,6 +58,18 @@ func Sync(d Deps) http.Handler {
 			return
 		}
 
+		// Synapse parses set_presence before it does any work and 400s on a
+		// value outside the allowed set, so this happens before the filter is
+		// resolved or the poll begins.
+		setPresence, presErr := parseSetPresence(r)
+		if presErr != nil {
+			refuse(w, ann, http.StatusBadRequest, *presErr)
+			return
+		}
+		// Relayed once per request, around the sync, where Synapse wraps the
+		// wait in presence_handler.user_syncing().
+		relayPresence(r.Context(), d, verdict, setPresence)
+
 		if since := r.URL.Query().Get("since"); since != "" {
 			if ann != nil {
 				ann.Since = since

@@ -16,6 +16,7 @@ import (
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/lazyload"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/matrixerr"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/notifier"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/presence"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/pushrules"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/replication"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/server"
@@ -58,6 +59,11 @@ type Deps struct {
 	// configured, in which case the section is omitted entirely rather than
 	// served without ever being cleared.
 	Inbox *deviceinbox.Deleter
+
+	// Presence relays "this user is syncing" to Synapse's presence writer.
+	// Nil when presence is not configured, in which case every account this
+	// worker serves appears permanently offline -- see internal/presence.
+	Presence *presence.Client
 
 	// Sliding holds sliding sync's per-connection state. Nil when sliding sync
 	// is not configured, in which case the endpoint is not registered at all.

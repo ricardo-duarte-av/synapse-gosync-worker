@@ -215,8 +215,32 @@ undecryptable. Use a new login. With `to_device.enabled: false` nothing is lost
 either — Synapse keeps the messages, and the device receives them when it next
 syncs against the real host — so that is the setting for a first pass.
 
-Also true and visible to other people: **we never write presence**, so an
-account syncing only against this worker appears permanently offline.
+Presence used to be the exception to all of this: **we never wrote it**, so an
+account syncing only against this worker appeared permanently offline. That is
+fixed, and the fix is worth knowing because it is the one thing this worker
+TELLS the homeserver rather than asks it.
+
+It is not a database write. Presence has a single writer instance
+(`stream_writers.presence`) and every other process reaches it over Synapse's
+HTTP replication API, so `internal/presence` is an HTTP client and
+`internal/store` stays 100% `SELECT`. A worker with no replication listener can
+be a pure client: the writer authorises on the bearer secret alone, nothing
+calls back, and `EXTERNAL_PROCESS_EXPIRY` (5 min) means a worker that dies has
+its users timed out rather than pinned online.
+
+**Everything it needs comes from Synapse's own `homeserver.yaml`, re-read at
+every start** (`internal/synapsecfg`), never copied into our config: the
+replication secret rotates, the presence writer moves between workers, and its
+socket path changes, and a duplicate would not fail loudly when it drifted. The
+container must mount that file read-only.
+
+Two behaviours to not get backwards:
+
+- `set_presence=offline` means **leave my presence alone**, not "set me
+  offline". Synapse computes `affect_presence = set_presence != offline` and
+  relays nothing when false.
+- `busy` is accepted by the presence *writer* under MSC3026 but rejected by the
+  `/sync` *servlet*, so it must be a 400 here.
 
 ### Comparing against a real account
 
