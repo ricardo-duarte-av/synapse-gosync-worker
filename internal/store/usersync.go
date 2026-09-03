@@ -182,6 +182,21 @@ func (s *Store) AllRoomAccountData(ctx context.Context, userID string, msc3391 b
 		if err := rows.Scan(&roomID, &e.Type, &content); err != nil {
 			return nil, fmt.Errorf("store: all room account data: %w", err)
 		}
+		// A STORED m.tag row must not be emitted alongside the synthesised one.
+		//
+		// Synapse holds a room's account data as a map from type to content, so
+		// a type appears at most once and its synthesised tag simply replaces
+		// whatever was stored. Ours is a list, so both survive -- and a room
+		// really can have both: `!8DitJr9...` on this server has an m.tag row
+		// in room_account_data AND a row in room_tags, and we sent `m.tag`
+		// twice while the reference sent it once.
+		//
+		// Only visible on such a room, which neither test account has; found
+		// through the sliding sync extension comparison on the owner's
+		// account, 2026-09-03, and fixed here so both endpoints get it.
+		if e.Type == "m.tag" && tagsByRoom[roomID] != nil {
+			continue
+		}
 		e.Content = json.RawMessage(content)
 		byRoom[roomID] = append(byRoom[roomID], e)
 	}

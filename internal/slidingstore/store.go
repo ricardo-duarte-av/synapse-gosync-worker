@@ -367,3 +367,44 @@ const (
 	StreamReceipts    = "receipts"
 	StreamAccountData = "account_data"
 )
+
+// Counts is the size of the connection store, for metrics.
+type Counts struct {
+	Connections int64
+	Positions   int64
+	// Rows maps a table name to its row count.
+	Rows map[string]int64
+}
+
+// Count reports how much the connection store holds.
+//
+// Six counts in one round trip. These tables are small by design -- reading a
+// position deletes the other positions on its connection, and the reaper
+// removes connections nobody uses -- so a row count that climbs steadily means
+// one of those two is not happening, which nothing else makes visible.
+func (s *Store) Count(ctx context.Context) (Counts, error) {
+	const q = `
+		SELECT (SELECT count(*) FROM sliding_sync_connections),
+		       (SELECT count(*) FROM sliding_sync_connection_positions),
+		       (SELECT count(*) FROM sliding_sync_connection_required_state),
+		       (SELECT count(*) FROM sliding_sync_connection_room_configs),
+		       (SELECT count(*) FROM sliding_sync_connection_streams),
+		       (SELECT count(*) FROM sliding_sync_connection_lazy_members)`
+	var conns, positions, required, configs, streams, lazy int64
+	if err := s.pool.QueryRow(ctx, q).Scan(
+		&conns, &positions, &required, &configs, &streams, &lazy); err != nil {
+		return Counts{}, fmt.Errorf("slidingstore: count: %w", err)
+	}
+	return Counts{
+		Connections: conns,
+		Positions:   positions,
+		Rows: map[string]int64{
+			"connections":    conns,
+			"positions":      positions,
+			"required_state": required,
+			"room_configs":   configs,
+			"streams":        streams,
+			"lazy_members":   lazy,
+		},
+	}, nil
+}

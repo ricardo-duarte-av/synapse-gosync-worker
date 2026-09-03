@@ -804,3 +804,67 @@ rules" is not the same as "this data skips the visibility code".
   reports `user_ids: []`. That stream is memory-only, so a freshly started
   worker has not seen clears Synapse remembers from hours ago. A room both
   sides report must match; one only the reference reports is counted.
+
+
+## Sliding sync metrics, and the hot loop they were asked for (2026-09-03)
+
+Real clients reached the endpoint, and one of them — SchildiChat Next — hit it
+about **ten times a second per connection**. The nginx log is what showed it:
+the same `pos` back and forth with `timeout=30000` and an instant 200 every
+time.
+
+**The long poll never waited.** Emptiness was computed by looking for a `rooms`
+or `extensions` key in the encoded response, and several fields are present on
+every response — `e2ee`'s one-time-key counts, `to_device`'s `next_batch`,
+`typing` and `receipts`' empty `rooms` object, a room entry carrying only a
+`bump_stamp`. So every response looked like news.
+
+Synapse gives each section its own truthiness rule, and they differ from each
+other deliberately; the table is in [synapse-notes.md](synapse-notes.md). Those
+rules are now named functions in `internal/slidingsync` rather than expressions
+inline, because a rule written inline is a rule that cannot be tested — and 22
+unit-test cases now cover exactly the fields that caused this.
+
+Verified after the fix: a second request with `timeout=8000` and nothing to say
+parked for **8,064 ms** instead of returning instantly, and a request woken by a
+real message returned in **4,941 ms** carrying that one event.
+
+### The metrics
+
+`gosync_sliding_sync_responses_total{outcome}` is the one that matters:
+`immediate`, `woken`, `empty`, `timed_out`, `unknown_pos`. **A worker answering
+`immediate` on nearly every request has a broken emptiness rule, not a busy
+server** — that shape is what this whole entry is about, and it is now one
+glance.
+
+Beside it: rooms per response and response size (histograms), rows written to
+the connection store by table, positions minted, connections reaped, and a
+scrape-time collector for the six tables' row counts. Six panels in a new
+Grafana row, and `deploy/grafana/README.md` says which two to learn.
+
+Why those: the store's write is proportional to a connection's **room count**
+rather than to what changed, so `positions minted` tracking the response rate
+means the "reuse the position when nothing changed" short-circuit has stopped
+working. And the tables are small only because reading a position prunes the
+others and the reaper removes unused connections — a row count that climbs
+steadily is one of those two having stopped, which nothing else makes visible.
+
+### Two more bugs the same investigation turned up
+
+**Sticky-event deduplication happens after the wake decision.** MSC4354's "drop
+what is already in the timeline" lives in Synapse's REST serialiser, and the
+notifier's check runs before it on the pre-dedup set. So a sticky event already
+in the timeline still wakes a client, and the room survives carrying
+`events: []`. Ours dedupted while building and omitted the section entirely.
+
+**A room can have both a stored `m.tag` and a `room_tags` row.** Synapse keys
+per-room account data by type, so the synthesised tag replaces the stored one;
+ours is a list, so we sent `m.tag` twice. Only visible on such a room, which
+neither test account has — and **classic sync had the same bug**, fixed in the
+store so both endpoints get it.
+
+The extension comparison also had to be loosened once, honestly: a room-scoped
+extension covers whatever is in the response's window, and on the 654-room
+account the activity-ordered list reorders between the two requests. It now
+compares the rooms both sides described and reports a differing scope
+separately.

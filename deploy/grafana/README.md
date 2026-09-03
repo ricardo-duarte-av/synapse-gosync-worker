@@ -147,6 +147,36 @@ not just for a disarmed one. That is deliberate: such a cache answers "changed"
 to everything, which is indistinguishable from disarmed to every caller, and
 reporting it armed would draw a flat healthy line for a cache doing nothing.
 
+**The sliding sync row starts with one panel, and it is the one that matters.**
+`Responses by outcome` says whether the long poll is working. Healthy: `woken`
+and `timed_out` carry the traffic, and `immediate` appears only as often as
+clients start new connections. A worker answering `immediate` on nearly every
+request is **not** a busy worker — it is one whose emptiness rule is wrong, so
+the poll never waits and every client is answered instantly and asks again.
+
+That is not hypothetical. On 2026-09-03 this endpoint treated any *present*
+extension as news, and several are present on every response: `e2ee` carries
+one-time-key counts, `to_device` carries a `next_batch`, `typing` and `receipts`
+carry an empty `rooms` object, and a room entry can carry nothing but a
+`bump_stamp`. SchildiChat was answered about ten times a second per connection,
+and it took reading an nginx access log to notice. With this panel it is one
+glance.
+
+**`Connection-store writes` is the other one to learn.** Sliding sync is the
+only endpoint here that writes, and the write is proportional to the
+connection's *room count* rather than to what changed — each new position copies
+the previous one's rows forward. Compare `positions minted` against
+`responses`: if they track each other, the "reuse the position when nothing
+changed" short-circuit has stopped working, and a 654-room connection is paying
+about a thousand rows on every poll.
+
+**`Connection store size` is a slow alarm.** These tables are small by design,
+because reading a position prunes the others and the reaper removes unused
+connections. A row count that climbs steadily means one of those two has
+stopped: `reaped` flat at zero for days is the reaper, positions far above
+connections is the prune. `store_up` at 0 means the scrape could not reach the
+database, so the rest of that row is stale rather than zero.
+
 ## What this dashboard cannot tell you
 
 Two blind spots, both known and neither instrumented yet:

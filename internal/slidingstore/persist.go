@@ -7,6 +7,8 @@ import (
 	"sort"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/metrics"
 )
 
 // Persist writes updated per-connection state and returns the position to hand
@@ -76,6 +78,7 @@ func (s *Store) Persist(
 	if err := tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("slidingstore: commit: %w", err)
 	}
+	metrics.SlidingSyncPositionsMinted.Inc()
 	return position, nil
 }
 
@@ -279,6 +282,7 @@ func upsertStreams(ctx context.Context, tx pgx.Tx, position int64, state *PerCon
 	if err := tx.SendBatch(ctx, batch).Close(); err != nil {
 		return fmt.Errorf("slidingstore: upsert streams: %w", err)
 	}
+	metrics.SlidingSyncRowsWritten.WithLabelValues("streams").Add(float64(len(rows)))
 	return nil
 }
 
@@ -313,6 +317,7 @@ func upsertRoomConfigs(
 	if err := tx.SendBatch(ctx, batch).Close(); err != nil {
 		return fmt.Errorf("slidingstore: upsert room configs: %w", err)
 	}
+	metrics.SlidingSyncRowsWritten.WithLabelValues("room_configs").Add(float64(len(roomIDs)))
 	return nil
 }
 
@@ -370,6 +375,7 @@ func persistLazyMembers(
 		if err := tx.SendBatch(ctx, batch).Close(); err != nil {
 			return fmt.Errorf("slidingstore: upsert lazy members: %w", err)
 		}
+		metrics.SlidingSyncRowsWritten.WithLabelValues("lazy_members").Add(float64(len(toUpsert)))
 	}
 
 	if len(toRemove) > 0 {
@@ -430,5 +436,6 @@ func (s *Store) DeleteOldConnections(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("slidingstore: reap connections: %w", err)
 	}
+	metrics.SlidingSyncConnectionsReaped.Add(float64(tag.RowsAffected()))
 	return tag.RowsAffected(), nil
 }

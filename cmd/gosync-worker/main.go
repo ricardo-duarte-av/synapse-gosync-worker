@@ -289,6 +289,20 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 			return fmt.Errorf("sliding sync cannot be served yet: %s", why)
 		}
 
+		metrics.RegisterSlidingSyncStore(func() (metrics.SlidingStoreCounts, error) {
+			// A scrape must not hang on the database, so it gets its own short
+			// deadline rather than the process's lifetime context.
+			cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			c, err := sliding.Count(cctx)
+			if err != nil {
+				return metrics.SlidingStoreCounts{}, err
+			}
+			return metrics.SlidingStoreCounts{
+				Connections: c.Connections, Positions: c.Positions, Rows: c.Rows,
+			}, nil
+		})
+
 		go reapSlidingConnections(ctx, sliding, cfg.SlidingSync.ReapIntervalMinutes, log)
 		log.Info().Msg("sliding sync enabled")
 	}

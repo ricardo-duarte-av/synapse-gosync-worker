@@ -43,6 +43,57 @@ literally, or was found only by querying the live database.
   serve a stale sync. `bound_future_token` (`streams/events.py:110`) clamps
   tokens from the future rather than trusting them.
 
+## Sliding sync: emptiness, and two things it hides (2026-09-03)
+
+### Presence is not news, and getting that wrong is a hot loop
+
+A sliding sync response decides whether the long poll waits. Several of its
+fields are on EVERY response: `lists` carries its counts, `e2ee` carries
+one-time-key counts, `to_device` carries a `next_batch`, `typing` and `receipts`
+carry an empty `rooms` object, and a room entry can carry nothing but a
+`bump_stamp`.
+
+So Synapse gives each section its own `__bool__`, and they disagree with each
+other on purpose:
+
+| Section | Counts as news |
+|---|---|
+| top level | `rooms or extensions` — `lists` explicitly excluded |
+| a room | `initial`, name, avatar, heroes, either count, required_state, timeline or stripped_state — **not** `bump_stamp`, `limited` or `num_live` |
+| `to_device` | the events, not the `next_batch` |
+| `e2ee` | the device list changes, **not** the key counts |
+| `account_data` | global or rooms |
+| `receipts`, `typing`, `sticky_events` | the `rooms` map's contents |
+| `thread_subscriptions` | subscribed, unsubscribed, or a `prev_batch` |
+
+The e2ee rule has a comment pointing at element-android#3725: the counts must be
+SENT on every response and must never COUNT. Ours treated any present extension
+as news, so the poll never waited — SchildiChat was answered about ten times a
+second per connection until an nginx access log gave it away. `gosync_sliding_sync_responses_total`
+exists so the next one takes a glance instead.
+
+### Sticky-event deduplication happens AFTER the wake decision
+
+MSC4354's dedup — drop a sticky event already in the room's timeline — lives in
+Synapse's REST serialiser, not in the handler. The notifier's truthiness check
+runs first, on the pre-dedup set.
+
+Two consequences, and both are observable: a sticky event already in the
+timeline still counts as news and still wakes a parked client, and the room
+survives dedup carrying an `events: []`. Doing the dedup while building the
+response, as ours first did, omits the section entirely and does not wake.
+
+### A room can have both a stored `m.tag` and a `room_tags` row
+
+Synapse holds a room's account data as a map from type to content, so its
+synthesised `m.tag` simply replaces whatever `room_account_data` stored. Ours is
+a list, so both survived and we sent `m.tag` twice.
+
+Only visible on a room that has both, which neither test account does.
+`!8DitJr9...` on the owner's account does, and **classic sync had the same bug**
+— found through the sliding sync extension comparison and fixed in the store, so
+both endpoints get it.
+
 ## Sliding sync: the rewind and newly-joined/left (2026-09-03)
 
 ### A server admin can ask to see soft-failed events, and Synapse obeys

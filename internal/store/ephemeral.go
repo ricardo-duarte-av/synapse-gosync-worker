@@ -102,6 +102,13 @@ func (s *Store) RoomAccountData(ctx context.Context, userID, roomID string) ([]A
 		if err := rows.Scan(&e.Type, &content); err != nil {
 			return nil, fmt.Errorf("store: room account data: %w", err)
 		}
+		// Same rule as AllRoomAccountData: a stored m.tag row must not be
+		// emitted beside the synthesised one. Synapse's per-room account data
+		// is a map from type to content, so the synthesised tag replaces the
+		// stored one rather than joining it.
+		if e.Type == "m.tag" && tags != nil {
+			continue
+		}
 		e.Content = json.RawMessage(content)
 		out = append(out, e)
 	}

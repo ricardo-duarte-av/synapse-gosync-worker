@@ -122,7 +122,7 @@ func slidingSyncPoll(r *http.Request, d Deps, verdict auth.Verdict,
 	req *slidingsync.Request, posParam string, timeoutMS int,
 	ann *server.Annotation) ([]byte, int, *matrixerr.Error) {
 
-	body, status, mxErr := slidingSyncOnce(r, d, verdict, req, posParam)
+	body, updates, status, mxErr := slidingSyncOnce(r, d, verdict, req, posParam)
 	if mxErr != nil || status != http.StatusOK {
 		return body, status, mxErr
 	}
@@ -132,7 +132,11 @@ func slidingSyncPoll(r *http.Request, d Deps, verdict auth.Verdict,
 	// for when the client has nothing. A pinned request is a comparison rather
 	// than a client.
 	if timeout <= 0 || posParam == "" || d.Notifier == nil ||
-		r.URL.Query().Get("_gosync_now") != "" || !slidingSyncIsEmpty(body) {
+		r.URL.Query().Get("_gosync_now") != "" || updates {
+		if ann != nil {
+			ann.Outcome = slidingOutcome(updates, false)
+		}
+		metrics.SlidingSyncResponses.WithLabelValues(slidingOutcome(updates, false)).Inc()
 		return body, status, mxErr
 	}
 	if timeout > maxSyncTimeout {
@@ -160,12 +164,14 @@ func slidingSyncPoll(r *http.Request, d Deps, verdict auth.Verdict,
 		}
 		handle := d.Notifier.Register(roomIDs, []string{verdict.UserID})
 
-		body, status, mxErr = slidingSyncOnce(r, d, verdict, req, posParam)
-		if mxErr != nil || status != http.StatusOK || !slidingSyncIsEmpty(body) {
+		body, updates, status, mxErr = slidingSyncOnce(r, d, verdict, req, posParam)
+		if mxErr != nil || status != http.StatusOK || updates {
 			handle.Close()
 			if ann != nil {
 				ann.Waited = time.Since(started)
+				ann.Outcome = slidingOutcome(updates, true)
 			}
+			metrics.SlidingSyncResponses.WithLabelValues(slidingOutcome(updates, true)).Inc()
 			return body, status, mxErr
 		}
 
@@ -174,7 +180,9 @@ func slidingSyncPoll(r *http.Request, d Deps, verdict auth.Verdict,
 			handle.Close()
 			if ann != nil {
 				ann.Waited = time.Since(started)
+				ann.Outcome = "timed_out"
 			}
+			metrics.SlidingSyncResponses.WithLabelValues("timed_out").Inc()
 			return body, status, mxErr
 		}
 		woken := handle.Wait(ctx, remaining)
@@ -182,15 +190,31 @@ func slidingSyncPoll(r *http.Request, d Deps, verdict auth.Verdict,
 		if !woken {
 			if ann != nil {
 				ann.Waited = time.Since(started)
+				ann.Outcome = "timed_out"
 			}
+			metrics.SlidingSyncResponses.WithLabelValues("timed_out").Inc()
 			return body, status, mxErr
 		}
 	}
 }
 
 // slidingSyncOnce computes one response.
+// slidingOutcome labels a response for the metric that would have caught the
+// hot loop: a worker answering `immediate` on nearly every request is one whose
+// emptiness rule is wrong.
+func slidingOutcome(updates, waited bool) string {
+	switch {
+	case updates && waited:
+		return "woken"
+	case updates:
+		return "immediate"
+	default:
+		return "empty"
+	}
+}
+
 func slidingSyncOnce(r *http.Request, d Deps, verdict auth.Verdict,
-	req *slidingsync.Request, posParam string) ([]byte, int, *matrixerr.Error) {
+	req *slidingsync.Request, posParam string) ([]byte, bool, int, *matrixerr.Error) {
 
 	ctx := r.Context()
 
@@ -201,7 +225,8 @@ func slidingSyncOnce(r *http.Request, d Deps, verdict auth.Verdict,
 		if err != nil {
 			// A malformed `pos` is the client's, so it is told to start over
 			// rather than given a 500.
-			return unknownPos(), http.StatusBadRequest, nil
+			metrics.SlidingSyncResponses.WithLabelValues("unknown_pos").Inc()
+			return unknownPos(), false, http.StatusBadRequest, nil
 		}
 		connectionPos = parsed.ConnectionPosition
 		tok := parsed.StreamToken
@@ -210,11 +235,11 @@ func slidingSyncOnce(r *http.Request, d Deps, verdict auth.Verdict,
 
 	now, _, mxErr := nowToken(r, d)
 	if mxErr != nil {
-		return nil, http.StatusBadRequest, mxErr
+		return nil, false, http.StatusBadRequest, mxErr
 	}
 	nowMS, mxErr := nowMillis(r, d)
 	if mxErr != nil {
-		return nil, http.StatusBadRequest, mxErr
+		return nil, false, http.StatusBadRequest, mxErr
 	}
 
 	res, err := slidingsync.Build(ctx, d.slidingDeps(), slidingsync.BuildRequest{
@@ -229,17 +254,22 @@ func slidingSyncOnce(r *http.Request, d Deps, verdict auth.Verdict,
 	if errors.Is(err, slidingstore.ErrUnknownPosition) {
 		// Not a failure: the connection state is gone, and the client is told
 		// to start a fresh one. See internal/slidingstore.
-		return unknownPos(), http.StatusBadRequest, nil
+		metrics.SlidingSyncResponses.WithLabelValues("unknown_pos").Inc()
+		return unknownPos(), false, http.StatusBadRequest, nil
 	}
 	if err != nil {
-		return nil, http.StatusInternalServerError, internalError(d, "sliding sync", err)
+		return nil, false, http.StatusInternalServerError, internalError(d, "sliding sync", err)
 	}
 
 	body, err := json.Marshal(res)
 	if err != nil {
-		return nil, http.StatusInternalServerError, internalError(d, "encode sliding sync", err)
+		return nil, false, http.StatusInternalServerError,
+			internalError(d, "encode sliding sync", err)
 	}
-	return body, http.StatusOK, nil
+
+	metrics.SlidingSyncRooms.Observe(float64(len(res.Rooms)))
+	metrics.SlidingSyncResponseBytes.Observe(float64(len(body)))
+	return body, res.HasUpdates(), http.StatusOK, nil
 }
 
 func unknownPos() []byte {
@@ -248,21 +278,6 @@ func unknownPos() []byte {
 		"error":   "Unknown position",
 	})
 	return body
-}
-
-// slidingSyncIsEmpty reports whether a response is worth returning early.
-//
-// `pos` and `lists` are always present -- the counts alone are news a client
-// acts on -- so emptiness is about rooms and extensions.
-func slidingSyncIsEmpty(body []byte) bool {
-	var parsed struct {
-		Rooms      map[string]json.RawMessage `json:"rooms"`
-		Extensions map[string]json.RawMessage `json:"extensions"`
-	}
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return false
-	}
-	return len(parsed.Rooms) == 0 && len(parsed.Extensions) == 0
 }
 
 func (d Deps) slidingDeps() slidingsync.Deps {

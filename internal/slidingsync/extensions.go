@@ -58,82 +58,143 @@ type extensionInputs struct {
 	New      *slidingstore.PerConnectionState
 }
 
-// buildExtensions assembles the extension section.
-func buildExtensions(ctx context.Context, d Deps, in extensionInputs) (map[string]json.RawMessage, error) {
+// buildExtensions assembles the extension section, and reports whether any of
+// it is NEWS.
+//
+// Presence is not news, and the difference is a hot loop. `e2ee` always carries
+// one-time-key counts, `to_device` always carries a `next_batch`, `typing` and
+// `receipts` always carry a `rooms` object. Synapse gives each extension its
+// own truthiness rule for exactly this reason -- its comment on e2ee cites
+// element-android#3725 for why the key counts must be sent yet must not count.
+func buildExtensions(
+	ctx context.Context, d Deps, in extensionInputs,
+) (map[string]json.RawMessage, bool, error) {
+
 	out := map[string]json.RawMessage{}
+	news := false
 	ext := in.Request.Extensions
 	if ext == nil {
-		return out, nil
+		return out, false, nil
 	}
 
 	if ext.ToDevice != nil && ext.ToDevice.Enabled {
 		v, err := toDeviceExtension(ctx, d, in, ext.ToDevice)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if err := set(out, "to_device", v); err != nil {
-			return nil, err
+			return nil, false, err
 		}
+		// The messages, not the next_batch: a token that has moved is not
+		// something the client needs waking for.
+		news = news || toDeviceIsNews(v)
 	}
 	if ext.E2EE != nil && ext.E2EE.Enabled {
 		v, err := e2eeExtension(ctx, d, in)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if err := set(out, "e2ee", v); err != nil {
-			return nil, err
+			return nil, false, err
 		}
+		// ONLY the device list changes. The one-time-key counts are always sent
+		// and must never count as news -- that is the whole hot loop.
+		news = news || e2eeIsNews(v)
 	}
 	if ext.AccountData != nil && ext.AccountData.Enabled {
 		v, err := accountDataExtension(ctx, d, in, &ext.AccountData.ExtensionScope)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if err := set(out, "account_data", v); err != nil {
-			return nil, err
+			return nil, false, err
 		}
+		news = news || accountDataIsNews(v)
 	}
 	if ext.Receipts != nil && ext.Receipts.Enabled {
 		v, err := receiptsExtension(ctx, d, in, &ext.Receipts.ExtensionScope)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if err := set(out, "receipts", v); err != nil {
-			return nil, err
+			return nil, false, err
 		}
+		news = news || receiptsIsNews(v)
 	}
 	if ext.Typing != nil && ext.Typing.Enabled {
 		v := typingExtension(d, in, &ext.Typing.ExtensionScope)
 		if err := set(out, "typing", v); err != nil {
-			return nil, err
+			return nil, false, err
 		}
+		news = news || typingIsNews(v)
 	}
 	if ext.ThreadSubscriptions != nil && ext.ThreadSubscriptions.Enabled && d.MSC4308Enabled {
 		v, err := threadSubscriptionsExtension(ctx, d, in, ext.ThreadSubscriptions)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		// Synapse omits this one entirely when there is nothing to say, unlike
 		// the others, which are present whenever enabled.
 		if v != nil {
 			if err := set(out, "io.element.msc4308.thread_subscriptions", v); err != nil {
-				return nil, err
+				return nil, false, err
 			}
+			news = news || threadSubscriptionsIsNews(v)
 		}
 	}
 	if ext.StickyEvents != nil && ext.StickyEvents.Enabled && d.MSC4354Enabled {
 		v, err := stickyEventsExtension(ctx, d, in, ext.StickyEvents)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if v != nil {
 			if err := set(out, "org.matrix.msc4354.sticky_events", v); err != nil {
-				return nil, err
+				return nil, false, err
 			}
+			news = news || stickyEventsIsNews(v)
 		}
 	}
-	return out, nil
+	return out, news, nil
 }
+
+// Each extension's own definition of NEWS -- whether it should stop a long
+// poll from waiting. Named functions rather than expressions inline above,
+// because they are the whole difference between a working long poll and a hot
+// loop, and a rule written inline is a rule that cannot be tested.
+//
+// The shared shape: a field that is present on EVERY response is never news.
+// Synapse gives each extension its own __bool__ for exactly this reason.
+
+// toDeviceIsNews: the messages, not the `next_batch`. A token that moved is not
+// something to wake a client for.
+func toDeviceIsNews(v *toDeviceJSON) bool { return len(v.Events) > 0 }
+
+// e2eeIsNews: the device list changes ONLY.
+//
+// The one-time-key counts are sent on every response and must never count --
+// Synapse's comment cites element-android#3725 for why they cannot be omitted,
+// and its __bool__ explicitly excludes them. This is the rule whose absence
+// produced the hot loop.
+func e2eeIsNews(v *e2eeJSON) bool {
+	return v.DeviceLists != nil &&
+		(len(v.DeviceLists.Changed) > 0 || len(v.DeviceLists.Left) > 0)
+}
+
+func accountDataIsNews(v *accountDataJSON) bool {
+	return len(v.Global) > 0 || len(v.Rooms) > 0
+}
+
+// receiptsIsNews and typingIsNews: the `rooms` object is always present, so its
+// CONTENTS are the question.
+func receiptsIsNews(v *receiptsJSON) bool { return len(v.Rooms) > 0 }
+func typingIsNews(v *typingJSON) bool     { return len(v.Rooms) > 0 }
+
+func threadSubscriptionsIsNews(v *threadSubscriptionsJSON) bool {
+	return len(v.Subscribed) > 0 || len(v.Unsubscribed) > 0 || v.PrevBatch != nil
+}
+
+// stickyEventsIsNews: the `next_batch` alone is not news, same as to_device.
+func stickyEventsIsNews(v *stickyEventsJSON) bool { return len(v.Rooms) > 0 }
 
 func set(out map[string]json.RawMessage, key string, v any) error {
 	body, err := json.Marshal(v)
@@ -526,8 +587,23 @@ func accountDataExtension(
 	return out, nil
 }
 
+// addRoomAccountData appends a room's account data, at most ONE entry per type.
+//
+// Synapse holds per-room account data as a map from type to content, so a type
+// appears at most once. Ours is a list, so this is where that invariant is
+// re-imposed. The store already drops a stored `m.tag` when it synthesises one
+// (see AllRoomAccountData); this is the same guarantee applied to the merged
+// result, since a room can be filled from more than one query here.
 func addRoomAccountData(out *accountDataJSON, roomID string, entries []store.AccountDataEntry) error {
+	seen := map[string]bool{}
+	for _, existing := range out.Rooms[roomID] {
+		seen[gjson.GetBytes(existing, "type").String()] = true
+	}
 	for _, e := range entries {
+		if seen[e.Type] {
+			continue
+		}
+		seen[e.Type] = true
 		body, err := json.Marshal(map[string]any{"type": e.Type, "content": e.Content})
 		if err != nil {
 			return err
@@ -849,6 +925,14 @@ func stickyEventsExtension(
 		// key at all.
 		return nil, nil
 	}
+	// From here the extension IS present, because a room was found with sticky
+	// events in range. Deduplication against the timeline happens below and
+	// may empty a room's list, but it does not remove the room and it does not
+	// change that decision: in Synapse the dedup lives in the REST serialiser,
+	// which runs AFTER the truthiness check the notifier uses. So a sticky
+	// event already in the timeline still counts as news and still leaves an
+	// empty `events` array behind. Verified against the reference, which
+	// returns exactly that.
 
 	var wanted []string
 	for _, ids := range byRoom {
@@ -875,6 +959,9 @@ func stickyEventsExtension(
 			}
 		}
 		if len(ids) == 0 {
+			// Every sticky event for this room is already in its timeline. The
+			// room stays, with nothing in it -- see above.
+			out.Rooms[roomID] = stickyRoomJSON{Events: []json.RawMessage{}}
 			continue
 		}
 
@@ -937,13 +1024,10 @@ func stickyEventsExtension(
 			}
 			rendered = append(rendered, body)
 		}
-		if len(rendered) > 0 {
-			out.Rooms[roomID] = stickyRoomJSON{Events: rendered}
+		if rendered == nil {
+			rendered = []json.RawMessage{}
 		}
-	}
-	if len(out.Rooms) == 0 {
-		// Everything was already in a timeline, so there is nothing to add.
-		return nil, nil
+		out.Rooms[roomID] = stickyRoomJSON{Events: rendered}
 	}
 	return out, nil
 }

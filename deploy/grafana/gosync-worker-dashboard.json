@@ -3905,6 +3905,516 @@
      "refId": "B"
     }
    ]
+  },
+  {
+   "type": "row",
+   "title": "Sliding sync (MSC4186)",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 107,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "type": "timeseries",
+   "title": "Responses by outcome",
+   "description": "THE PANEL TO CHECK FIRST. `immediate` means there was news without waiting, `woken` means a parked poll was woken by it, `timed_out` means it waited to the deadline with nothing. A worker answering `immediate` on nearly every request has a broken emptiness rule, not a busy server -- on 2026-09-03 any present extension counted as news, so the long poll never waited and SchildiChat was answered about ten times a second per connection. Healthy shape: `woken` and `timed_out` carrying the traffic, `immediate` only as often as clients start new connections.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 108,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": true,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       }
+      ]
+     },
+     "mappings": [],
+     "unit": "reqps"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true,
+     "calcs": []
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${datasource}"
+     },
+     "editorMode": "code",
+     "expr": "sum by (outcome) (rate(gosync_sliding_sync_responses_total{job=~\"$job\"}[$bucket]))",
+     "legendFormat": "{{outcome}}",
+     "range": true,
+     "instant": false,
+     "refId": "A"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Rooms per response",
+   "description": "After the first response for a connection, a quiet poll should describe ZERO rooms. A steady stream of full windows means every response re-sends everything, which is the difference between a sliding sync and a very expensive /sync.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 108,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": true,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       }
+      ]
+     },
+     "mappings": [],
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true,
+     "calcs": []
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${datasource}"
+     },
+     "editorMode": "code",
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(gosync_sliding_sync_rooms_bucket{job=~\"$job\"}[$bucket])))",
+     "legendFormat": "median",
+     "range": true,
+     "instant": false,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${datasource}"
+     },
+     "editorMode": "code",
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(gosync_sliding_sync_rooms_bucket{job=~\"$job\"}[$bucket])))",
+     "legendFormat": "p99",
+     "range": true,
+     "instant": false,
+     "refId": "B"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Connection-store writes",
+   "description": "This endpoint is the only one that writes. The write is proportional to the connection's ROOM COUNT rather than to what changed, because each new position copies the previous one's rows forward -- measured at ~725 stream rows plus ~248 room-config rows per position for a 654-room connection, times the three connections Element X holds per device. A quiet poll should write nothing: compare positions_minted against the response rate, and if they track each other the 'reuse the position when nothing changed' short-circuit has stopped working.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 116,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": true,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       }
+      ]
+     },
+     "mappings": [],
+     "unit": "reqps"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true,
+     "calcs": []
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${datasource}"
+     },
+     "editorMode": "code",
+     "expr": "sum by (table) (rate(gosync_sliding_sync_rows_written_total{job=~\"$job\"}[$bucket]))",
+     "legendFormat": "rows {{table}}",
+     "range": true,
+     "instant": false,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${datasource}"
+     },
+     "editorMode": "code",
+     "expr": "sum(rate(gosync_sliding_sync_positions_minted_total{job=~\"$job\"}[$bucket]))",
+     "legendFormat": "positions minted",
+     "range": true,
+     "instant": false,
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${datasource}"
+     },
+     "editorMode": "code",
+     "expr": "sum(rate(gosync_sliding_sync_responses_total{job=~\"$job\"}[$bucket]))",
+     "legendFormat": "responses",
+     "range": true,
+     "instant": false,
+     "refId": "C"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Connection store size",
+   "description": "Small by design: reading a position deletes the other positions on its connection, and the reaper removes connections nobody uses. A row count that climbs steadily means one of those two has stopped -- `reaped` flat at zero for days is the reaper, and positions far above connections is the prune. Neither is visible any other way. `store_up` at 0 means the last scrape could not reach the database, so the other numbers here are stale.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 116,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": true,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       }
+      ]
+     },
+     "mappings": [],
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true,
+     "calcs": []
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${datasource}"
+     },
+     "editorMode": "code",
+     "expr": "sum by (table) (gosync_sliding_sync_store_rows{job=~\"$job\"})",
+     "legendFormat": "{{table}}",
+     "range": true,
+     "instant": false,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${datasource}"
+     },
+     "editorMode": "code",
+     "expr": "sum(rate(gosync_sliding_sync_connections_reaped_total{job=~\"$job\"}[$bucket]))",
+     "legendFormat": "reaped/s",
+     "range": true,
+     "instant": false,
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${datasource}"
+     },
+     "editorMode": "code",
+     "expr": "min(gosync_sliding_sync_store_up{job=~\"$job\"})",
+     "legendFormat": "store up",
+     "range": true,
+     "instant": false,
+     "refId": "C"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Response size",
+   "description": "A client controls its own window and required_state, so it controls this almost entirely. The expensive failure here is not a slow query but a client asking for a thousand rooms with [\"*\",\"*\"].",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 124,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": true,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       }
+      ]
+     },
+     "mappings": [],
+     "unit": "bytes"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true,
+     "calcs": []
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${datasource}"
+     },
+     "editorMode": "code",
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(gosync_sliding_sync_response_bytes_bucket{job=~\"$job\"}[$bucket])))",
+     "legendFormat": "median",
+     "range": true,
+     "instant": false,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${datasource}"
+     },
+     "editorMode": "code",
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(gosync_sliding_sync_response_bytes_bucket{job=~\"$job\"}[$bucket])))",
+     "legendFormat": "p99",
+     "range": true,
+     "instant": false,
+     "refId": "B"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Unknown positions",
+   "description": "M_UNKNOWN_POS is a supported path, not an error: the client starts a fresh connection. A steady trickle is normal (9.3% of live requests already begin with no connection state). A SPIKE is not -- every connected client re-bootstrapping at once is what a schema change or a misconfigured reaper looks like.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 124,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": true,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       }
+      ]
+     },
+     "mappings": [],
+     "unit": "reqps"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true,
+     "calcs": []
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${datasource}"
+     },
+     "editorMode": "code",
+     "expr": "sum(rate(gosync_sliding_sync_responses_total{job=~\"$job\",outcome=\"unknown_pos\"}[$bucket])) or vector(0)",
+     "legendFormat": "unknown_pos/s",
+     "range": true,
+     "instant": false,
+     "refId": "A"
+    }
+   ]
   }
  ]
 }

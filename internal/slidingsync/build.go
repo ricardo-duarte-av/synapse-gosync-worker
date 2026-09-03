@@ -46,7 +46,27 @@ type Response struct {
 	Lists      map[string]listJSON        `json:"lists"`
 	Rooms      map[string]roomJSON        `json:"rooms"`
 	Extensions map[string]json.RawMessage `json:"extensions"`
+
+	// updates records whether anything here is NEWS. See HasUpdates.
+	updates bool
 }
+
+// HasUpdates reports whether this response is worth returning immediately, or
+// whether the request should keep waiting.
+//
+// Not the same as "is any field set", and the difference is a hot loop. Several
+// fields are always present: `lists` carries its counts on every response,
+// `e2ee` carries one-time-key counts, `to_device` carries a `next_batch`,
+// `typing` and `receipts` carry an empty `rooms` object, and a room entry can
+// carry nothing but a `bump_stamp`. Treating any of those as news means the
+// long poll never waits, the client is answered instantly, and it asks again --
+// which is what SchildiChat did to this worker on 2026-09-03 at roughly ten
+// requests a second per connection.
+//
+// Synapse defines this per section (SlidingSyncResult.__bool__ and one on each
+// extension) and each rule is different; they are ported at their source rather
+// than re-derived from the encoded JSON.
+func (r *Response) HasUpdates() bool { return r.updates }
 
 type listJSON struct {
 	Count int      `json:"count"`
@@ -191,11 +211,15 @@ func Build(ctx context.Context, d Deps, req BuildRequest) (*Response, error) {
 
 	rooms := make(map[string]roomJSON, len(roomIDs))
 	sent := make([]string, 0, len(roomIDs))
+	anyRoomIsNews := false
 	for i, roomID := range roomIDs {
 		if results[i] == nil {
 			continue
 		}
 		rooms[roomID] = renderRoom(results[i])
+		if roomIsNews(results[i]) {
+			anyRoomIsNews = true
+		}
 		sent = append(sent, roomID)
 		mergeRoomState(next, roomID, states[i])
 	}
@@ -250,7 +274,7 @@ func Build(ctx context.Context, d Deps, req BuildRequest) (*Response, error) {
 		}
 	}
 
-	extensions, err := buildExtensions(ctx, d, extensionInputs{
+	extensions, extensionsAreNews, err := buildExtensions(ctx, d, extensionInputs{
 		UserID: req.UserID, DeviceID: req.DeviceID, Request: req.Request,
 		From: req.From, Now: req.Now, NowMS: req.NowMS,
 		Lists: lists.Lists, Subscribed: subscribed, AllRooms: lists.AllRooms,
@@ -274,6 +298,10 @@ func Build(ctx context.Context, d Deps, req BuildRequest) (*Response, error) {
 		Lists:      make(map[string]listJSON, len(lists.Lists)),
 		Rooms:      rooms,
 		Extensions: extensions,
+		// `lists` is deliberately excluded, and Synapse says why: it is
+		// non-empty on every response, and anything that would reorder it also
+		// changes a room, which shows up above.
+		updates: anyRoomIsNews || extensionsAreNews,
 	}
 	for key, l := range lists.Lists {
 		ops := make([]opJSON, 0, len(l.Ops))
@@ -325,3 +353,20 @@ func renderRoom(r *RoomResult) roomJSON {
 }
 
 var _ = store.SlidingRoom{}
+
+// roomIsNews reports whether a room entry tells the client anything.
+//
+// A room can be present carrying only a `bump_stamp`, which is a re-statement
+// rather than news -- so presence in the map is not enough. Ported from
+// SlidingSyncResult.RoomResult.__bool__.
+func roomIsNews(r *RoomResult) bool {
+	return r.Initial ||
+		r.Name != nil ||
+		r.Avatar != nil ||
+		len(r.Heroes) > 0 ||
+		r.JoinedCount != nil ||
+		r.InvitedCount != nil ||
+		len(r.RequiredState) > 0 ||
+		len(r.Timeline) > 0 ||
+		len(r.StrippedState) > 0
+}
