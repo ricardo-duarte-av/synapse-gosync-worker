@@ -2,6 +2,70 @@
 
 Newest first. Numbers are measurements, not estimates.
 
+## 2026-09-03 — M11: the connection store, and the second write
+
+`internal/slidingstore` holds sliding sync's per-connection state — what this
+worker has already told a client, so the next response can send only the
+difference. `deploy/sliding-sync-role.sql` creates the role and schema.
+
+**Sliding sync cannot be served read-only, and the read path is a write.**
+Synapse's `_get_and_clear_connection_positions_txn` bumps `last_used_ts`,
+deletes every other position on the connection and rewrites lazy-member rows
+before returning anything, and the `pos` a client carries is literally a
+sequence value from `sliding_sync_connection_positions`. Measured on the live
+database first: six tables, 128 connections, 112,884 required-state rows, and
+~725 stream rows plus ~248 room-config rows written per response for a 654-room
+connection — times the three connections Element X runs per device.
+
+The decision to use our own tables in our own schema rather than Synapse's is in
+[decisions.md](decisions.md). The short version: sharing them would let a client
+move between hosts with its `pos` intact, and that is exactly why not — a bug in
+our bookkeeping would then corrupt real clients' state on the real hostname.
+
+The role check is the same argument as the to-device grant, made harder: `Open`
+refuses a role that is read-only, cannot write `gosync`, or **can read
+`public.events`**. Verified against the live database — the role can insert,
+delete and cascade in its own schema and is refused on `public.events`,
+`public.device_inbox` and `public.sliding_sync_connections`.
+
+### Everything here fails on the request after next
+
+That is what makes this the hardest correctness problem in the project so far.
+Every other defect has been visible in a single response body; "this room was
+marked sent but never was" is not. So the tests check the properties directly
+against the real database, and all seven were verified to bite by mutation.
+
+Three findings from doing that, none of which a passing test would have shown:
+
+**Completeness is guaranteed twice, and neither mechanism is load-bearing
+alone.** Each position must be a full snapshot, and Synapse both copies the
+previous position's rows forward AND upserts the flattened state rather than
+only the changes. Remove either and the tests stay green; remove both and they
+fail. Both are kept, and `copyForward`'s comment now says so rather than
+claiming to be the place it happens.
+
+**The fork test was not building forks.** Reading a position is itself what
+prunes, so a loop that reads before each write never accumulates more than two.
+The case worth testing — several responses computed from one position that is
+never re-read, which is what a 499 leaves behind, and 1,102 of 27,465 live
+requests ended that way — had to be constructed on purpose.
+
+**The dedup test could not see a broken dedup.** The collector in `loadState`
+tidies up behind it: each request writes a fresh copy of the required state,
+orphans the previous one, and the next read deletes it. The count stays right
+while every request pays an extra INSERT and DELETE on the largest of the six
+tables. The test asserts the row's identity instead — reuse means the id does
+not move.
+
+### Not wired yet, deliberately
+
+The pool, the config section and the reaper's caller land in M12 with the
+handler that needs them. Written down because this project has already been
+bitten by a documented contract with nothing behind it: `PurgeCaches()` had no
+callers for three milestones. `DeleteOldConnections` must not repeat that —
+reading a position prunes only that connection's own forks, and nothing at all
+prunes a connection whose client simply stopped coming back.
+
 ## 2026-09-03 — M10: stream-change caches, and two defects they exposed
 
 `internal/streamcache` answers "has entity X changed since position P?" from

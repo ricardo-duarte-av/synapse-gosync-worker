@@ -20,7 +20,7 @@ Status is recorded here; what actually happened is in [log.md](log.md).
 | — | MSC4354 sticky events | **done** |
 | M9 | Soak, then possibly the promotion ladder | not started |
 | M10 | Stream-change caches (`internal/streamcache`) | **done** |
-| M11 | Sliding sync: the connection store | not started |
+| M11 | Sliding sync: the connection store | **done** |
 | M12 | Sliding sync: the endpoint, lists and rooms | not started |
 | M13 | Sliding sync: extensions | not started |
 
@@ -414,3 +414,68 @@ A fourth thing worth keeping: a cache configured to hold nothing used to report
 `gosync_stream_cache_armed 1`. It behaves exactly like a disarmed cache, so that
 drew a flat, healthy line for a cache answering nothing — which is how a cache
 turned off by a config change goes unnoticed for months.
+
+
+## M11 — done
+
+`internal/slidingstore` holds sliding sync's per-connection state, and
+`deploy/sliding-sync-role.sql` creates the role and schema it writes. Nothing is
+user-visible yet; the endpoint is M12.
+
+This is the project's **second** write, and unlike the first it is not a
+read-only workload that needed one exception — it cannot be made read-only at
+all. Why, and why our own tables rather than Synapse's, is in
+[decisions.md](decisions.md). The containment is the same shape as the
+to-device grant: one package, one pool, one role that owns the `gosync` schema
+and has nothing in `public`, and a startup check that refuses a role which can
+read `public.events`.
+
+### What is hard here, and it is not the SQL being long
+
+Every other defect this project has found was visible in one response body.
+"This room was marked sent but never was" only shows up on the request after
+next. So `live_test.go` tests the properties directly against the real database,
+and all of them were verified to bite by mutation on 2026-09-03:
+
+| Break | Caught by |
+|---|---|
+| `RecordUnsentRooms` does nothing | `TestLivePreviouslyKeepsItsToken` |
+| Position ownership unchecked | `TestLiveAPositionBelongsToOneTriple` |
+| Forks never pruned | `TestLiveUsingAPositionPrunesTheForks` |
+| `HasUpdates` always true | `TestLiveAnUnchangedResponseWritesNothing` |
+| `pos=0` treated as unknown | `TestLiveUnknownPositionIsNotAnError` |
+| required_state rows not reused | `TestLiveRequiredStateIsDeduplicated` |
+| Copy-forward **and** full upsert removed | two tests |
+
+That last row is the interesting one. Each connection position must be a
+complete snapshot, and Synapse guarantees that **twice**: by copying the
+previous position's rows forward, and by upserting the flattened state rather
+than only the changes. Removing either alone leaves the tests green; removing
+both fails them. Both are kept — they cover the same guarantee from opposite
+ends, one from the row already stored and one from the state in memory — but a
+reader looking for the single place completeness is enforced will not find it,
+so `copyForward`'s comment says so.
+
+Two more things the tests could not see until they were rewritten to look
+properly, and both are worth the pattern:
+
+- **The fork test was not building forks.** Reading a position is itself what
+  prunes, so a loop that reads before each write never accumulates more than
+  two positions. The real case — several responses computed from one position
+  that is not read again in between — had to be constructed deliberately.
+- **The dedup test could not see a broken dedup.** The collector in `loadState`
+  tidies up behind it: each request writes a fresh copy of the required state,
+  orphans the previous one, and the next read deletes it. The row count stays
+  right while every request pays an extra INSERT and DELETE on the largest of
+  the six tables. The test asserts the row's **identity** instead — reuse means
+  the id does not move.
+
+### Deliberately not wired yet
+
+The pool, the config section and the reaper's caller land in M12 with the
+handler that needs them. Recorded here rather than left loose because this
+project has been bitten once already by a documented contract with no
+implementation behind it — `PurgeCaches()` had no callers for three milestones.
+`DeleteOldConnections` must not repeat that: without it the six tables grow
+without bound, because reading a position prunes only its own connection's
+forks and nothing prunes a connection whose client simply went away.
