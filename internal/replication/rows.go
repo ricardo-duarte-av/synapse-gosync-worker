@@ -54,22 +54,51 @@ func rowDetails(stream, row string) RowDetail {
 
 	switch stream {
 	case StreamEvents:
-		// ["ev", [event_id, room_id, type, state_key, ...]]
-		// ["ev", [event_id, room_id, type, state_key, ...]]
-		if len(a) >= 2 && a[0].String() == "ev" {
-			inner := a[1].Array()
-			at := func(i int) string {
-				if i < len(inner) {
-					return inner[i].String()
-				}
-				return ""
+		// The events stream merges three sources into one, and each has its own
+		// row shape and its own leading type id (EventsStream._update_function,
+		// replication/tcp/streams/events.py). Only "ev" used to be parsed, so
+		// the other two named no room and therefore woke EVERY parked client --
+		// and a state change emits one of them alongside every "ev" row it
+		// accompanies, so a single join woke the world twice.
+		if len(a) < 2 {
+			break
+		}
+		inner := a[1].Array()
+		at := func(i int) string {
+			if i < len(inner) {
+				return inner[i].String()
 			}
+			return ""
+		}
+		switch a[0].String() {
+		case "ev":
+			// [event_id, room_id, type, state_key, redacts, relates_to,
+			//  membership, rejected, outlier]
 			if len(inner) >= 2 {
 				return RowDetail{
 					RoomIDs:  []string{inner[1].String()},
 					Type:     at(2),
 					StateKey: at(3),
 				}
+			}
+		case "state":
+			// [room_id, type, state_key, event_id] -- a current-state delta.
+			// Carries type and state key like an "ev" row, and deliberately so:
+			// a state reset moves a membership with no event of its own, and
+			// this is the only row that says as much.
+			if len(inner) >= 1 {
+				return RowDetail{
+					RoomIDs:  []string{inner[0].String()},
+					Type:     at(1),
+					StateKey: at(2),
+				}
+			}
+		case "state-all":
+			// [room_id] -- stands in for a burst of state deltas too large to
+			// send individually. It names no type, which is the point: the
+			// listener is being told to treat the room's whole state as changed.
+			if len(inner) >= 1 {
+				return RowDetail{RoomIDs: []string{inner[0].String()}}
 			}
 		}
 	case StreamTyping:

@@ -116,6 +116,37 @@ version treated all of them as destructive -- which emptied the state caches
 continuously and cost 4,910 extra queries on a single initial sync. A rising
 `purge` means that is back.
 
+**The stream-cache row measures a different thing from the cache row above it,
+and its hit rate is the one to ignore.** A derived cache holds an answer; a
+stream cache holds only whether asking is worth it. So a "hit" there means a
+question was answered from memory whether the answer was "changed" or
+"unchanged" -- a 100% hit rate is compatible with every gated query still
+running. **Queries the gates skipped** is the panel that says whether they are
+paying: watch `PresenceSince` against the sync rate, because on a quiet server
+most syncs should run neither of the two gated queries.
+
+**Gate horizon lag is the panel that matters**, and it is the one that catches
+the failure a hit-rate panel cannot see. A stream cache is a complete record of
+changes above its horizon and knows nothing below it; the lag is how far back
+that reaches. A cache too small for its stream has the lag shrink towards zero,
+at which point every question falls below the horizon, every gate answers
+"changed", and the queries quietly come back -- with no error, no wrong answer,
+and no other symptom. Read it with evictions beside it.
+
+Two series on that panel sit at zero legitimately. `account_data` and
+`membership` are armed empty rather than prefilled: account_data's position
+space is shared by three tables, so seeding from any one of them produces a
+horizon far below what it can account for, and membership has no table to seed
+from at all. Both fill from live traffic. Measured on this deployment with the
+defaults: events 100,041, receipts 121,038, presence 8,903,677, to_device 566 --
+that last one is shallow because Synapse scans only 1,000 device_inbox rows,
+which is right for a table that is drained as clients acknowledge messages.
+
+And `gosync_stream_cache_armed` reads 0 for a cache configured to hold nothing,
+not just for a disarmed one. That is deliberate: such a cache answers "changed"
+to everything, which is indistinguishable from disarmed to every caller, and
+reporting it armed would draw a flat healthy line for a cache doing nothing.
+
 ## What this dashboard cannot tell you
 
 Two blind spots, both known and neither instrumented yet:
@@ -123,6 +154,9 @@ Two blind spots, both known and neither instrumented yet:
 - **Replication lag.** `gosync_replication_connected` says the subscription is
   alive, not that it is keeping up. A worker that is connected but minutes
   behind serves stale answers and looks perfectly healthy here.
+  `gosync_replication_position` now exports where each stream has reached, which
+  is half of it -- but there is nothing to compare it against, because Synapse's
+  own position is not scraped here.
 - **Parity.** Nothing on this dashboard says whether the answers are *right*.
   That is `cmd/syncdiff`'s job, and it currently prints to a terminal rather
   than exporting anything. Agreement with Synapse is measured by running the

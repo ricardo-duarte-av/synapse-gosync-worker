@@ -233,6 +233,48 @@ caches:
   #ignored_users_cache_size: 5000
   #rooms_for_user_cache_size: 1000
 
+  # Stream-change caches: "has this room or user changed since position P?"
+  #
+  # A different kind of cache from the ones above, and sized on a different
+  # axis. Those hold an ANSWER and must be invalidated when it changes. These
+  # hold no answer at all -- only whether asking is worth it -- and are kept
+  # warm by replication rather than invalidated. They are what let a quiet sync
+  # skip the presence query (25ms warm, 430ms cold, previously run once per
+  # sync whether or not anybody's presence had moved) and the timeline-gap
+  # lookup.
+  #
+  # The unit is distinct stream POSITIONS, not entries: one position can name
+  # many rooms. So these do not scale with users or rooms the way the caches
+  # above do, and the default of 10000 is Synapse's.
+  #
+  # The failure to watch for is not memory, it is a cache that has quietly
+  # stopped working. Too small for a busy stream and its horizon climbs above
+  # the `since` values clients actually send; every question then falls below
+  # it, every gate answers "changed", and the queries come back with no error
+  # and no wrong answer. gosync_stream_cache_earliest_position is that horizon
+  # -- compare it against the stream's current position, and watch
+  # gosync_stream_cache_evictions_total alongside it.
+  #
+  # Measured on this deployment, 2026-09-03, with the defaults: events covers
+  # ~100,000 stream orderings and evicts nothing; presence covers ~8.9M
+  # positions but evicts ~23,000 of 33,000 users during prefill, because the
+  # presence stream is far busier than the rest. That is harmless here only
+  # because the presence gate reads the cache's maximum position rather than
+  # any individual user; raise it if a user-keyed presence question is ever
+  # added.
+  #
+  # Two of these are armed empty rather than prefilled, deliberately:
+  # account_data's position space is shared by three tables, so seeding from
+  # any one of them produces a horizon far below what it can account for, and
+  # membership has no table to seed from at all. Both fill from live traffic.
+  # See internal/store/streamgates.go.
+  #events_stream_cache_size: 10000
+  #membership_stream_cache_size: 10000
+  #receipts_stream_cache_size: 10000
+  #account_data_stream_cache_size: 10000
+  #to_device_stream_cache_size: 10000
+  #presence_stream_cache_size: 10000
+
   # The immutable state caches. A state group's contents are fixed once
   # written, so these need no invalidation -- only the purge that happens when
   # replication drops and rooms could be deleted unseen.

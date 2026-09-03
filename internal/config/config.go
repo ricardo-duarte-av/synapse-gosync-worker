@@ -243,6 +243,22 @@ type Caches struct {
 	HistoryVisibilityCacheSize int `yaml:"history_visibility_cache_size"`
 	IgnoredUsersCacheSize      int `yaml:"ignored_users_cache_size"`
 	RoomsForUserCacheSize      int `yaml:"rooms_for_user_cache_size"`
+
+	// Stream-change cache sizes, in distinct stream POSITIONS rather than
+	// entities -- one position can name many rooms, so these do not scale the
+	// way the entry-counted caches above do.
+	//
+	// They are the wrong knob to reach for when tuning memory and the right one
+	// when a gate stops working: a cache too small for a busy stream has its
+	// horizon climb above the `since` values clients actually send, every
+	// question falls below it, and the queries quietly come back. Watch
+	// gosync_stream_cache_earliest_position rather than guessing.
+	EventsStreamCacheSize      int `yaml:"events_stream_cache_size"`
+	MembershipStreamCacheSize  int `yaml:"membership_stream_cache_size"`
+	ReceiptsStreamCacheSize    int `yaml:"receipts_stream_cache_size"`
+	AccountDataStreamCacheSize int `yaml:"account_data_stream_cache_size"`
+	ToDeviceStreamCacheSize    int `yaml:"to_device_stream_cache_size"`
+	PresenceStreamCacheSize    int `yaml:"presence_stream_cache_size"`
 }
 
 // Testing gates behaviour that exists only to make the comparator possible.

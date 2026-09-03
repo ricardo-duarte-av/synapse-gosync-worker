@@ -194,6 +194,24 @@ func (s *Store) TimelineGaps(ctx context.Context, roomIDs []string,
 	if from != nil {
 		fromStream = from.Stream
 	}
+
+	// A timeline_gaps row is written in the same transaction as an event in the
+	// same room (`storage/databases/main/events.py`), so a room with no event
+	// in the window has no gap in it either. Narrowing the room list here turns
+	// the common quiet sync -- nothing happened anywhere -- into no query at
+	// all.
+	//
+	// from.Stream rather than MaxStreamPos: for a vector-clock key it is the
+	// lower bound, so the narrowing errs towards keeping rooms in. Below the
+	// horizon the cache returns the list unchanged and this is a no-op.
+	//
+	// Do NOT try to infer this from an empty timeline instead: RoomTimelineSince
+	// drops rejected events in Go, after the window function, so an empty slice
+	// does not prove nothing was persisted.
+	if roomIDs = s.RoomsWithEventsSince(roomIDs, fromStream); len(roomIDs) == 0 {
+		return nil, nil
+	}
+
 	const q = `
 		SELECT room_id, COALESCE(instance_name, ''), stream_ordering
 		  FROM timeline_gaps

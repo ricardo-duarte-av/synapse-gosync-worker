@@ -26,6 +26,7 @@ type Store struct {
 	pool    *pgxpool.Pool
 	caches  *caches
 	derived *derivedCaches
+	streams *streamCaches
 
 	// instance_map is append-only, so the name-to-id mapping a stream token
 	// needs is read once and kept for the process's life.
@@ -67,6 +68,10 @@ type Config struct {
 	HistoryVisibilityCacheEntries int
 	IgnoredUsersCacheEntries      int
 	RoomsForUserCacheEntries      int
+
+	// StreamCaches bounds the stream-change caches, in distinct stream
+	// positions rather than entities. See internal/store/streamgates.go.
+	StreamCaches StreamCacheSizes
 }
 
 // Open connects and verifies the database is reachable.
@@ -97,7 +102,12 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 		pool.Close()
 		return nil, fmt.Errorf("store: ping: %w", err)
 	}
-	return &Store{pool: pool, caches: newCaches(cfg), derived: newDerivedCaches(cfg)}, nil
+	return &Store{
+		pool:    pool,
+		caches:  newCaches(cfg),
+		derived: newDerivedCaches(cfg),
+		streams: newStreamCaches(cfg.StreamCaches),
+	}, nil
 }
 
 func newCaches(cfg Config) *caches {

@@ -281,6 +281,22 @@ func (s *Store) ReceiptsSince(ctx context.Context, roomIDs []string, since, now 
 // Unlike the initial-sync presence, this one IS bounded by the token, so it can
 // be pinned and compared exactly.
 func (s *Store) PresenceSince(ctx context.Context, userID string, since, now int64) ([]PresenceState, error) {
+	// The gate, not the answer. This query is the most expensive thing on the
+	// sync path -- a correlated subquery over presence_stream and
+	// current_state_events, 25ms warm and 430ms cold, run once per sync whether
+	// or not anybody's presence moved -- and on a quiet server nobody's did.
+	//
+	// Asking "did ANY presence move after `since`?" is enough: if none did,
+	// this query returns nothing, so skipping it and returning nothing is the
+	// same answer for less. Below the cache's horizon, or with replication
+	// down, the gate says "changed" and the query runs exactly as before.
+	//
+	// Note what is NOT cached here: the presence rows themselves. last_active_ago
+	// is recomputed from the wall clock per request, so a cached row is wrong
+	// the moment it is stored. Cache the gate, never the rows.
+	if !s.AnyPresenceSince(since) {
+		return nil, nil
+	}
 	const q = `
 		SELECT p.user_id, p.state, p.last_active_ts, p.status_msg, p.currently_active
 		  FROM presence_stream p

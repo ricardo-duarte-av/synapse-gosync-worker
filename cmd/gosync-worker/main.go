@@ -106,6 +106,15 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 		HistoryVisibilityCacheEntries: cacheSize(cfg.Caches.Enabled, cfg.Caches.HistoryVisibilityCacheSize),
 		IgnoredUsersCacheEntries:      cacheSize(cfg.Caches.Enabled, cfg.Caches.IgnoredUsersCacheSize),
 		RoomsForUserCacheEntries:      cacheSize(cfg.Caches.Enabled, cfg.Caches.RoomsForUserCacheSize),
+
+		StreamCaches: store.StreamCacheSizes{
+			Events:      cacheSize(cfg.Caches.Enabled, cfg.Caches.EventsStreamCacheSize),
+			Membership:  cacheSize(cfg.Caches.Enabled, cfg.Caches.MembershipStreamCacheSize),
+			Receipts:    cacheSize(cfg.Caches.Enabled, cfg.Caches.ReceiptsStreamCacheSize),
+			AccountData: cacheSize(cfg.Caches.Enabled, cfg.Caches.AccountDataStreamCacheSize),
+			ToDevice:    cacheSize(cfg.Caches.Enabled, cfg.Caches.ToDeviceStreamCacheSize),
+			Presence:    cacheSize(cfg.Caches.Enabled, cfg.Caches.PresenceStreamCacheSize),
+		},
 	})
 	if err != nil {
 		return err
@@ -117,6 +126,7 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 	// readonly-role.sql yet, but running against one unknowingly is exactly the
 	// situation the SQL file exists to prevent.
 	metrics.RegisterCaches(db.DerivedCacheStats)
+	metrics.RegisterStreamCaches(db.StreamCacheStats)
 
 	readOnly, err := db.IsReadOnly(openCtx)
 	if err != nil {
@@ -187,6 +197,12 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 		DB:       cfg.Replication.DB,
 	}, log, notif)
 
+	// The stream-change caches ride alongside the notifier rather than inside
+	// it. Both read every row; see streamfeed.go for why they cannot share a
+	// reading of one.
+	sub.AddListener(&streamFeeder{db: db})
+	metrics.RegisterStreamPositions(sub.Positions)
+
 	// The state caches hold data that is immutable but not permanent: a purged
 	// room's state groups stay valid right up until they stop existing. While
 	// we follow the stream that deletion is visible; while we do not, it is
@@ -199,12 +215,34 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 		// it is down, every answer they could give is a guess about what has
 		// changed since, and a guess is not a fallback.
 		db.DisarmDerivedCaches()
+		// Same reasoning, different failure: a disarmed stream cache answers
+		// "changed" to everything, which is precisely the behaviour this worker
+		// had before it had one. An armed cache with a stale horizon would
+		// answer "unchanged" for events it never saw arrive.
+		db.DisarmStreamCaches()
 		log.Warn().Int("state_groups", groups).Int("filtered_state", filtered).
-			Msg("replication dropped; discarded state caches and disarmed derived caches")
+			Msg("replication dropped; discarded state caches, disarmed derived and stream caches")
 	})
 	sub.SetOnConnect(func(positions map[string]int64) {
 		db.ArmDerivedCaches(positions)
-		log.Info().Msg("replication live; derived caches armed")
+
+		// Prefill runs on every connect, not just the first. Arming without it
+		// leaves each horizon at "now": every question falls below it, every
+		// gate says "changed", and the only symptom is queries that never went
+		// away. Six scans, bounded, off the request path.
+		//
+		// If it fails the caches stay disarmed rather than armed-and-empty --
+		// an empty cache above a "now" horizon is useless, but an empty cache
+		// below one is wrong.
+		prefillCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		err := db.PrefillStreamCaches(prefillCtx, positions)
+		cancel()
+		if err != nil {
+			db.DisarmStreamCaches()
+			log.Error().Err(err).Msg("replication live; stream caches left disarmed")
+			return
+		}
+		log.Info().Msg("replication live; derived and stream caches armed")
 	})
 	if cfg.Caches.Enabled {
 		sub.SetInvalidator(&cacheInvalidator{db: db, log: log})

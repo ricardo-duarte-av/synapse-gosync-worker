@@ -32,6 +32,11 @@ func (c *cacheInvalidator) OnRow(stream string, pos int64, d replication.RowDeta
 		// another, and it is the target's room list that changes.
 		if d.Type == "m.room.member" && d.StateKey != "" {
 			c.db.InvalidateUserMembership(d.StateKey)
+			// The membership stream cache is fed from here rather than from
+			// streamFeeder, because it is the only consumer that sees a row's
+			// type and state key. Synapse keeps membership in the events
+			// stream's position space too, so `pos` is a stream ordering.
+			c.db.MembershipChanged(d.StateKey, pos)
 		}
 
 	case replication.StreamAccountData:

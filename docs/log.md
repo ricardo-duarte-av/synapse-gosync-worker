@@ -2,6 +2,97 @@
 
 Newest first. Numbers are measurements, not estimates.
 
+## 2026-09-03 — M10: stream-change caches, and two defects they exposed
+
+`internal/streamcache` answers "has entity X changed since position P?" from
+memory. A port of Synapse's `StreamChangeCache`, six instances, fed by a second
+replication listener and prefilled at every connect.
+
+The asymmetry is the whole design: **a false positive is free, a false negative
+is a lost event.** Saying "changed" when nothing did costs a query that would
+have run anyway; saying "unchanged" when something did means a client never
+learns about it, and nothing downstream notices. The horizon is what makes the
+useful answer safe -- the cache is a complete record above it and knows nothing
+below it, so an entity it has never heard of provably did not change in a range
+it covers. That is why the horizon may never move backwards, and why eviction
+raises it.
+
+Two gates so far. Measured on the live deployment, five quiet incremental syncs
+on the test account, two builds of the same commit:
+
+| | caches off | caches on |
+|---|---|---|
+| `PresenceSince` | 5 | **2** |
+| `TimelineGaps` | 5 | **0** |
+
+`PresenceSince` is the one worth having: a correlated subquery over
+`presence_stream` and `current_state_events`, 25 ms warm and 430 ms cold, 803 s
+of database time over the measured window, on the request path of every sync.
+
+`cmd/syncdiff` reports the responses identical across `sync`,
+`incremental_sync`, `initial_sync`, and an incremental with lazy-loaded members.
+
+### The plan's fix for batched rows was wrong
+
+A replication batch's rows carry the literal token `batch`; only the last names
+a position. The worker passed 0 for the rest. The plan proposed substituting the
+stream's last known position, as `updateTyping` already does -- and that is
+exactly backwards for anything recording *when* a thing changed. The last known
+position is the one from **before** the batch, so a change would be filed below
+where it happened, and a client asking "anything since that position?" would be
+told no. A false negative, generated deliberately, on the busiest stream.
+
+It is tolerable in `updateTyping` because typing is a last-writer-wins map, not
+a change record. Synapse buffers the rows and applies them all at the final
+token (`ReplicationCommandHandler._pending_batches`). So do we now, with the
+buffer released on a lost connection -- half a batch carried across a reconnect
+would be applied against whatever position the next one supplies.
+
+### `state` rows on the events stream woke every parked client
+
+The events stream merges three sources with three row shapes: `ev`, `state` (a
+current-state delta) and `state-all` (a burst too large to send individually).
+Only `ev` was parsed, so the other two named no room and fell into the "wake
+everybody" default -- and a `state` row is emitted alongside every `ev` row for
+a state change, so one join woke the world twice.
+
+Third of this shape after `caches` and `presence_federation`, and found the same
+way: by needing the row's subject for something other than waking people.
+
+### The comparator says "ok" to a broken presence gate
+
+Worth recording, because it is a limit of the tool rather than a bug in it. A
+build with the presence gate hard-wired to "nothing changed" compares **clean**
+on the test account -- 9 rooms, and an incremental sync there carries **zero**
+presence events, so there is nothing to lose. On the main account it carries
+**189**, and the *unmutated* build already mismatches: presence is live and
+unpinnable, which is why CLAUDE.md §6's large-account recipe blocks it with
+`not_types: ["*"]` in the first place. Blind on one account for want of data,
+blind on the other for want of determinism.
+
+So the gates are tested directly, in
+`internal/store/streamgates_live_test.go`: for every range the cache claims to
+know, its answer must agree with the query it exists to skip. Over-reporting is
+allowed and counted; under-reporting fails. Both bite under mutation. The two
+mutations those tests *cannot* see -- eviction not raising the horizon, and
+dropping Synapse's `+1` on the prefill horizon -- are named in the file with a
+pointer to the unit tests that do catch them.
+
+### Smaller things
+
+- Prefilling `account_data` from the `account_data` table alone is **wrong**:
+  its position space is shared with `room_account_data` and
+  `room_tags_revisions`, and doing so produced a horizon of 47 against a current
+  position of 1,530,013. Synapse does not prefill it at all, and neither do we.
+- A cache configured to hold nothing reported `gosync_stream_cache_armed 1`. It
+  answers "changed" to everything, so that drew a flat healthy line for a cache
+  doing nothing -- which is how a cache switched off by a config change goes
+  unnoticed for months.
+- `gosync_replication_position{stream}` is new, and exists mainly so the
+  dashboard can subtract the cache horizon from it. That difference is the only
+  thing that makes a silently useless cache visible. Measured with the defaults:
+  events 100,041, receipts 121,038, presence 8,903,677, to_device 566.
+
 ## 2026-09-01 — M5: replication, typing, and long-polling
 
 The worker now follows Synapse's replication stream, and three things follow

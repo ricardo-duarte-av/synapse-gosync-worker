@@ -19,6 +19,14 @@ Status is recorded here; what actually happened is in [log.md](log.md).
 | M8 | To-device and device lists | **done** |
 | — | MSC4354 sticky events | **done** |
 | M9 | Soak, then possibly the promotion ladder | not started |
+| M10 | Stream-change caches (`internal/streamcache`) | **done** |
+| M11 | Sliding sync: the connection store | not started |
+| M12 | Sliding sync: the endpoint, lists and rooms | not started |
+| M13 | Sliding sync: extensions | not started |
+
+M10 onwards exist because sliding sync came into scope on 2026-09-03; the plan
+is in `.claude/plans/`. M10 was pulled out of it as its own milestone because
+it pays for itself on classic sync alone.
 
 ## M1 and M2 — done, no gaps
 
@@ -342,3 +350,67 @@ people who just joined is emitted **once per join event, not once per user**.
 Synapse loops over the events and extends the chunk each time, so three joins by
 the same person produce that person's presence three times. Our first version
 only handled the caller's own join and produced none of them.
+
+
+## M10 — done
+
+`internal/streamcache` answers "has entity X changed since position P?" from
+memory, a port of Synapse's `StreamChangeCache`. Six caches — events and
+receipts keyed by room, membership, account_data, to_device and presence keyed
+by user — fed by a second replication listener and prefilled at every connect.
+
+**A false positive is free; a false negative is a lost event.** Every decision
+in the package resolves in that direction, and the horizon is what makes the
+useful answer safe: the cache is a complete record of changes above it, so an
+entity it has never heard of provably did not change in a range it covers. That
+is why the horizon may never move backwards, and why eviction raises it.
+
+Two gates use it so far:
+
+| Gate | 5 quiet syncs, caches off | caches on |
+|---|---|---|
+| `PresenceSince` | 5 queries | **2** |
+| `TimelineGaps` | 5 queries | **0** |
+
+The presence query is the expensive one: a correlated subquery over
+`presence_stream` and `current_state_events`, 25 ms warm and 430 ms cold, 803 s
+of database time over the measured window, on the request path of every sync.
+
+### Two defects found on the way, both pre-existing
+
+**Batched replication rows were applied at the wrong position.** A batch's rows
+carry the literal token `batch` and only the last names a position. The worker
+passed 0 for the rest, which was harmless for a notifier and would have been a
+false-negative generator for a stream cache: the plan's proposed fix —
+substitute the last known position, as `updateTyping` does — files a change
+*below* where it happened, which is precisely the answer that loses an event.
+Synapse buffers the rows and applies them at the final token
+(`ReplicationCommandHandler._pending_batches`); so do we now.
+
+**`state` and `state-all` rows on the events stream named no room.** The events
+stream merges three sources with three row shapes, and only `ev` was parsed. A
+current-state delta is emitted alongside every `ev` row for a state change, so
+one join woke every parked client twice. This is the same class as the `caches`
+and `presence_federation` findings and was found the same way — by needing the
+row's subject for something else.
+
+### What the comparator cannot test here, and why
+
+`cmd/syncdiff` says "ok" to a presence gate hard-wired to "nothing changed", on
+both accounts and for opposite reasons. The test account has 9 rooms and sees
+**zero** presence events in an incremental sync, so there is nothing to lose.
+The main account sees **189**, and the *unmutated* build already mismatches
+there — presence is live and unpinnable, which is why CLAUDE.md §6's
+large-account recipe blocks it with `not_types: ["*"]`.
+
+So the gates are tested directly instead, in
+`internal/store/streamgates_live_test.go`: for every range the cache claims to
+know, its answer must agree with the query it exists to skip. Over-reporting is
+allowed and counted; under-reporting fails. Both gates were verified to bite by
+mutation, and the two mutations the live tests *cannot* see are named in that
+file with a pointer to the unit tests that do.
+
+A fourth thing worth keeping: a cache configured to hold nothing used to report
+`gosync_stream_cache_armed 1`. It behaves exactly like a disarmed cache, so that
+drew a flat, healthy line for a cache answering nothing — which is how a cache
+turned off by a config change goes unnoticed for months.

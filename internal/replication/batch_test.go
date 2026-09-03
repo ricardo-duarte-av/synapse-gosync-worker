@@ -1,0 +1,283 @@
+package replication
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/rs/zerolog"
+)
+
+// posListener records the position each call carried, which recordingListener
+// deliberately discards. The position is the whole point here.
+type posListener struct {
+	name  string
+	calls []posCall
+}
+
+type posCall struct {
+	stream string
+	pos    int64
+	rooms  []string
+	users  []string
+}
+
+func (p *posListener) OnStreamAdvance(stream string, pos int64, rooms, users []string) {
+	p.calls = append(p.calls, posCall{stream, pos, rooms, users})
+}
+
+func eventRow(roomID string) string {
+	return `["ev",["$x","` + roomID + `","m.room.message",null,null,null,null,false,false]]`
+}
+
+// A batched row must not reach anybody until the row that names the batch's
+// position arrives. Delivering it early with the position we happen to hold
+// files the change below where it happened.
+func TestBatchRowsAreHeldUntilThePositionArrives(t *testing.T) {
+	s := newTestSub()
+	rec := &posListener{}
+	s.listener = rec
+	s.advance(StreamEvents, 500)
+
+	s.handle(`RDATA events p1 batch ` + eventRow("!a:e"))
+	s.handle(`RDATA events p1 batch ` + eventRow("!b:e"))
+
+	if len(rec.calls) != 0 {
+		t.Fatalf("a held batch reached the listener %d times, want 0", len(rec.calls))
+	}
+	if got := s.Position(StreamEvents); got != 500 {
+		t.Fatalf("position moved to %d during a batch, want 500", got)
+	}
+}
+
+// Every row of a batch belongs at the position the LAST row names. This is the
+// property the stream-change caches depend on: a change filed at 500 when it
+// happened at 600 makes "anything since 500?" answer no.
+func TestBatchRowsAreAppliedAtTheFinalPosition(t *testing.T) {
+	s := newTestSub()
+	rec := &posListener{}
+	s.listener = rec
+	s.advance(StreamEvents, 500)
+
+	s.handle(`RDATA events p1 batch ` + eventRow("!a:e"))
+	s.handle(`RDATA events p1 batch ` + eventRow("!b:e"))
+	s.handle(`RDATA events p1 600 ` + eventRow("!c:e"))
+
+	if len(rec.calls) != 3 {
+		t.Fatalf("listener saw %d rows, want all 3 of the batch", len(rec.calls))
+	}
+	for i, c := range rec.calls {
+		if c.pos != 600 {
+			t.Errorf("row %d delivered at position %d, want 600", i, c.pos)
+		}
+	}
+	// Order must be preserved, and each row must keep its own subject rather
+	// than inheriting the terminating row's.
+	want := []string{"!a:e", "!b:e", "!c:e"}
+	for i, c := range rec.calls {
+		if len(c.rooms) != 1 || c.rooms[0] != want[i] {
+			t.Errorf("row %d named %v, want [%s]", i, c.rooms, want[i])
+		}
+	}
+	if got := s.Position(StreamEvents); got != 600 {
+		t.Fatalf("position = %d, want 600", got)
+	}
+}
+
+// A batch interrupted by a lost connection must be dropped, not carried across
+// the reconnect: its rows would be applied against whatever position the next
+// connection happens to supply.
+func TestALostConnectionDiscardsAHalfBatch(t *testing.T) {
+	s := newTestSub()
+	rec := &posListener{}
+	s.listener = rec
+	s.setLive(true)
+
+	s.handle(`RDATA events p1 batch ` + eventRow("!a:e"))
+	s.setLive(false)
+	s.setLive(true)
+	s.handle(`RDATA events p1 700 ` + eventRow("!c:e"))
+
+	if len(rec.calls) != 1 {
+		t.Fatalf("listener saw %d rows, want only the one after the reconnect", len(rec.calls))
+	}
+	if rec.calls[0].rooms[0] != "!c:e" {
+		t.Fatalf("the surviving row named %v, want the post-reconnect one", rec.calls[0].rooms)
+	}
+}
+
+// A batch that never ends is a broken connection, not a large one. It must not
+// grow without bound.
+func TestAnUnterminatedBatchIsTreatedAsALostConnection(t *testing.T) {
+	s := New(Config{}, zerolog.Nop(), nil)
+	s.setLive(true)
+	dropped := false
+	s.SetOnDrop(func() { dropped = true })
+
+	row := `RDATA events p1 batch ` + eventRow("!a:e")
+	for i := 0; i < maxPendingBatch+2; i++ {
+		s.handle(row)
+	}
+
+	if !dropped {
+		t.Fatal("an unterminated batch did not trip the drop path")
+	}
+	s.mu.RLock()
+	held := len(s.pending[StreamEvents])
+	s.mu.RUnlock()
+	if held > maxPendingBatch {
+		t.Fatalf("pending holds %d rows, want the buffer released", held)
+	}
+}
+
+// The stream-change caches ride alongside the notifier rather than inside it.
+// Both must see the same rows.
+func TestAddListenerFeedsEveryListener(t *testing.T) {
+	s := newTestSub()
+	first, second := &posListener{name: "notifier"}, &posListener{name: "caches"}
+	s.listener = first
+	s.AddListener(second)
+
+	s.handle(`RDATA events p1 42 ` + eventRow("!a:e"))
+
+	for _, l := range []*posListener{first, second} {
+		if len(l.calls) != 1 {
+			t.Fatalf("%s saw %d rows, want 1", l.name, len(l.calls))
+		}
+		if l.calls[0].pos != 42 {
+			t.Errorf("%s saw position %d, want 42", l.name, l.calls[0].pos)
+		}
+	}
+}
+
+// A POSITION jump names nobody: rows happened that we did not see. Every
+// listener has to hear about it, because "we do not know what changed" is the
+// one thing a cache must not miss.
+func TestPositionCommandReachesEveryListener(t *testing.T) {
+	s := newTestSub()
+	first, second := &posListener{name: "notifier"}, &posListener{name: "caches"}
+	s.listener = first
+	s.AddListener(second)
+
+	s.handle(`POSITION events p1 100 900`)
+
+	for _, l := range []*posListener{first, second} {
+		if len(l.calls) != 1 {
+			t.Fatalf("%s saw %d POSITION calls, want 1", l.name, len(l.calls))
+		}
+		c := l.calls[0]
+		if c.pos != 900 || len(c.rooms) != 0 || len(c.users) != 0 {
+			t.Errorf("%s saw pos=%d rooms=%v users=%v, want 900 and no subjects",
+				l.name, c.pos, c.rooms, c.users)
+		}
+	}
+}
+
+// A silent stream stays silent even when batched, and the buffer must not leak
+// rows for it either.
+func TestSilentStreamsStaySilentWhenBatched(t *testing.T) {
+	s := newTestSub()
+	rec := &posListener{}
+	s.listener = rec
+
+	s.handle(`RDATA presence_federation p1 batch ["matrix.org","@u:e"]`)
+	s.handle(`RDATA presence_federation p1 9 ["matrix.org","@v:e"]`)
+
+	if len(rec.calls) != 0 {
+		t.Fatalf("a silent stream woke the listener %d times, want 0", len(rec.calls))
+	}
+	s.mu.RLock()
+	held := len(s.pending)
+	s.mu.RUnlock()
+	if held != 0 {
+		t.Fatalf("pending still holds %d streams after the batch closed", held)
+	}
+}
+
+func TestBatchesAreKeptPerStream(t *testing.T) {
+	s := newTestSub()
+	rec := &posListener{}
+	s.listener = rec
+
+	s.handle(`RDATA events p1 batch ` + eventRow("!a:e"))
+	s.handle(`RDATA receipts p1 batch ["m.read","!r:e","@u:e",null,{}]`)
+	s.handle(`RDATA events p1 600 ` + eventRow("!b:e"))
+
+	// Closing the events batch must not flush the receipts one.
+	streams := map[string]int{}
+	for _, c := range rec.calls {
+		streams[c.stream]++
+	}
+	if streams[StreamEvents] != 2 {
+		t.Errorf("events delivered %d rows, want 2", streams[StreamEvents])
+	}
+	if streams[StreamReceipts] != 0 {
+		t.Errorf("receipts delivered %d rows while still batching, want 0", streams[StreamReceipts])
+	}
+	if !strings.Contains(rec.calls[0].stream, "events") {
+		t.Errorf("first delivered row was %s", rec.calls[0].stream)
+	}
+}
+
+// The events stream merges three sources, each with its own row shape. Only
+// "ev" was parsed, so a current-state delta -- emitted alongside every "ev" row
+// for a state change -- named no room and woke every parked client.
+func TestEveryEventsRowShapeNamesItsRoom(t *testing.T) {
+	cases := []struct {
+		name         string
+		row          string
+		wantRoom     string
+		wantType     string
+		wantStateKey string
+	}{
+		{
+			name:     "ev",
+			row:      `["ev",["$x","!a:e","m.room.message",null,null,null,null,false,false]]`,
+			wantRoom: "!a:e", wantType: "m.room.message",
+		},
+		{
+			// A state reset moves a membership with no event of its own, so
+			// the type and state key here are load-bearing rather than noise.
+			name:     "state",
+			row:      `["state",["!b:e","m.room.member","@u:e","$y"]]`,
+			wantRoom: "!b:e", wantType: "m.room.member", wantStateKey: "@u:e",
+		},
+		{
+			name:     "state-all",
+			row:      `["state-all",["!c:e"]]`,
+			wantRoom: "!c:e",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := rowDetails(StreamEvents, tc.row)
+			if len(d.RoomIDs) != 1 || d.RoomIDs[0] != tc.wantRoom {
+				t.Fatalf("rooms = %v, want [%s] -- an unnamed room wakes everybody",
+					d.RoomIDs, tc.wantRoom)
+			}
+			if d.Type != tc.wantType {
+				t.Errorf("type = %q, want %q", d.Type, tc.wantType)
+			}
+			if d.StateKey != tc.wantStateKey {
+				t.Errorf("state key = %q, want %q", d.StateKey, tc.wantStateKey)
+			}
+		})
+	}
+
+	// And the classification that follows from it: none of the three may be
+	// global.
+	for _, tc := range cases {
+		d := rowDetails(StreamEvents, tc.row)
+		if len(d.RoomIDs) == 0 && len(d.UserIDs) == 0 {
+			t.Errorf("%s row classified global", tc.name)
+		}
+	}
+}
+
+// A row shape we do not recognise must still name nobody rather than name the
+// wrong thing: waking everyone is the safe failure.
+func TestUnknownEventsRowShapeNamesNobody(t *testing.T) {
+	d := rowDetails(StreamEvents, `["some-future-shape",["!a:e"]]`)
+	if len(d.RoomIDs) != 0 || len(d.UserIDs) != 0 {
+		t.Fatalf("an unknown row shape named %v/%v; it must name nobody", d.RoomIDs, d.UserIDs)
+	}
+}

@@ -123,6 +123,11 @@ type Subscriber struct {
 	listener    Listener
 	invalidator Invalidator
 
+	// extra are listeners added after construction. Kept separate from
+	// listener only because that one is the notifier and is required; these
+	// are optional and there may be none.
+	extra []Listener
+
 	mu sync.RWMutex
 	// live is false whenever the subscription is not known to be healthy.
 	// Positions and typing are only trustworthy while it is true.
@@ -137,6 +142,10 @@ type Subscriber struct {
 	// memory because that is the only place it exists anywhere: Synapse keeps
 	// it in a counter on the typing worker and never writes it down.
 	typing map[string][]string
+
+	// pending buffers the rows of a batch until the row that names the
+	// batch's position arrives. See handleRDATA.
+	pending map[string][]pendingRow
 
 	// onDrop and onConnect run on the edges of the subscription's health. Set
 	// by the caller rather than called directly so this package need not know
@@ -190,6 +199,32 @@ func New(cfg Config, log zerolog.Logger, listener Listener) *Subscriber {
 		positions:    map[string]int64{},
 		typing:       map[string][]string{},
 		typingSerial: map[string]int64{},
+		pending:      map[string][]pendingRow{},
+	}
+}
+
+// AddListener registers a further listener, notified alongside the first.
+//
+// The stream-change caches are fed this way rather than by extending the
+// notifier, because the two want opposite readings of the same row. A row that
+// names nobody means "wake everyone" to the notifier -- a harmless over-wake --
+// and means "we do not know what changed" to a cache, which is not harmless at
+// all and has to be handled as a horizon reset. Each consumer decides for
+// itself; see Invalidator for the same argument made once already.
+//
+// Not safe to call once Run has started.
+func (s *Subscriber) AddListener(l Listener) {
+	if l != nil {
+		s.extra = append(s.extra, l)
+	}
+}
+
+func (s *Subscriber) notify(stream string, pos int64, roomIDs, userIDs []string) {
+	if s.listener != nil {
+		s.listener.OnStreamAdvance(stream, pos, roomIDs, userIDs)
+	}
+	for _, l := range s.extra {
+		l.OnStreamAdvance(stream, pos, roomIDs, userIDs)
 	}
 }
 
@@ -310,6 +345,9 @@ func (s *Subscriber) setLive(live bool) {
 		// typist forever.
 		s.typing = map[string][]string{}
 		s.typingSerial = map[string]int64{}
+		// Half a batch is worse than none: its rows would be applied later
+		// against whatever position the next connection happens to supply.
+		s.pending = map[string][]pendingRow{}
 	}
 	s.live = live
 	s.mu.Unlock()
@@ -344,6 +382,18 @@ func (s *Subscriber) handle(payload string) {
 	}
 }
 
+// pendingRow is one row of a batch, held until its position is known.
+type pendingRow struct {
+	row    string
+	detail RowDetail
+}
+
+// maxPendingBatch bounds the buffer. Synapse's batches are bounded by one
+// persistence transaction and are nowhere near this; exceeding it means the
+// row that ends the batch is never coming, which is a broken connection rather
+// than a large one. Treated as such, so the existing reconnect path recovers.
+const maxPendingBatch = 10000
+
 func (s *Subscriber) handleRDATA(payload string) {
 	// RDATA <stream> <instance> <token> <row json>
 	parts := strings.SplitN(payload, " ", 5)
@@ -352,18 +402,6 @@ func (s *Subscriber) handleRDATA(payload string) {
 	}
 	stream, token, row := parts[1], parts[3], parts[4]
 
-	// A batched row carries the literal "batch" instead of a position; only the
-	// last row of the batch names the token. Ignoring the position is right:
-	// the batch's final row supplies it.
-	var pos int64
-	if token != "batch" {
-		n, err := strconv.ParseInt(token, 10, 64)
-		if err != nil {
-			return
-		}
-		pos = n
-	}
-
 	detail := rowDetails(stream, row)
 
 	// "global" means the row named neither a room nor a user, so every parked
@@ -371,6 +409,8 @@ func (s *Subscriber) handleRDATA(payload string) {
 	// Recorded per stream because that is the only way to notice a busy stream
 	// in the wrong bucket -- reading the code is how the last four were found,
 	// and this metric is how `caches` was.
+	//
+	// Counted on arrival rather than on apply, because it measures wire volume.
 	_, silent := silentStreams[stream]
 	scope := "targeted"
 	switch {
@@ -381,8 +421,50 @@ func (s *Subscriber) handleRDATA(payload string) {
 	}
 	metrics.ReplicationRows.WithLabelValues(stream, scope).Inc()
 
+	// A batched row carries the literal "batch" instead of a position, and the
+	// position for every row of the batch is the one the LAST row names. So the
+	// rows are held until it arrives and then applied together.
+	//
+	// The obvious shortcut -- substitute the stream's currently known position,
+	// as updateTyping does -- is wrong for anything that records "X changed at
+	// P". The known position is the one *before* the batch, so a change would
+	// be filed below where it happened, and a client asking "anything since
+	// that position?" would be told no. That is a false negative, which is the
+	// one answer a stream-change cache may never give. It is tolerable in
+	// updateTyping because typing is a last-writer-wins map rather than a
+	// change record. Synapse buffers for the same reason:
+	// ReplicationCommandHandler._pending_batches in replication/tcp/handler.py.
+	if token == "batch" {
+		s.mu.Lock()
+		s.pending[stream] = append(s.pending[stream], pendingRow{row: row, detail: detail})
+		overflow := len(s.pending[stream]) > maxPendingBatch
+		if overflow {
+			delete(s.pending, stream)
+		}
+		s.mu.Unlock()
+		if overflow {
+			s.log.Error().Str("stream", stream).Int("limit", maxPendingBatch).
+				Msg("replication batch never terminated; treating as a lost connection")
+			s.setLive(false)
+		}
+		return
+	}
+
+	pos, err := strconv.ParseInt(token, 10, 64)
+	if err != nil {
+		return
+	}
+
+	s.mu.Lock()
+	batch := s.pending[stream]
+	delete(s.pending, stream)
+	s.mu.Unlock()
+	batch = append(batch, pendingRow{row: row, detail: detail})
+
 	if stream == StreamTyping {
-		s.updateTyping(row, pos)
+		for _, r := range batch {
+			s.updateTyping(r.row, pos)
+		}
 	}
 
 	// Invalidation runs before the position is advanced and before anything is
@@ -390,10 +472,12 @@ func (s *Subscriber) handleRDATA(payload string) {
 	// dropped and the position not yet raised, which costs a query; the other
 	// order costs a stale answer.
 	if s.invalidator != nil {
-		if stream == StreamCaches {
-			s.handleCacheInvalidation(row)
-		} else {
-			s.invalidator.OnRow(stream, pos, detail)
+		for _, r := range batch {
+			if stream == StreamCaches {
+				s.handleCacheInvalidation(r.row)
+			} else {
+				s.invalidator.OnRow(stream, pos, r.detail)
+			}
 		}
 	}
 
@@ -401,8 +485,11 @@ func (s *Subscriber) handleRDATA(payload string) {
 		s.advance(stream, pos)
 	}
 	// A silent stream reaches nobody. See silentStreams for why each is there.
-	if s.listener != nil && !silent {
-		s.listener.OnStreamAdvance(stream, pos, detail.RoomIDs, detail.UserIDs)
+	if silent {
+		return
+	}
+	for _, r := range batch {
+		s.notify(stream, pos, r.detail.RoomIDs, r.detail.UserIDs)
 	}
 }
 
@@ -477,9 +564,11 @@ func (s *Subscriber) handlePosition(payload string) {
 		return
 	}
 	s.advance(parts[1], pos)
-	if s.listener != nil {
-		s.listener.OnStreamAdvance(parts[1], pos, nil, nil)
-	}
+	// No room or user is named, so this reaches every listener as "we do not
+	// know what changed" -- the notifier wakes everybody, and a stream-change
+	// cache must reset its horizon rather than assume it saw the rows in
+	// between.
+	s.notify(parts[1], pos, nil, nil)
 }
 
 func (s *Subscriber) advance(stream string, pos int64) {
