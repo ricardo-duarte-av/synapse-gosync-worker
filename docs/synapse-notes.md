@@ -1260,3 +1260,31 @@ stuck client rather than a missing event.
 The rule is the same on both paths, with only the starting position differing:
 report a room when its typing serial has moved past the client's token (0 on an
 initial sync), and then render whatever the current list is, empty or not.
+
+## The room list is sorted by last event, not by `bump_stamp`
+
+These look like the same thing and are not, and the difference is visible to
+anyone with a busy account: a room whose newest event is somebody joining ranks
+as highly as one carrying a message sent a second ago.
+
+`sort_rooms` (`handlers/sliding_sync/room_lists.py`) says it sorts by "the
+`stream_ordering` of the last event that the user should see", and it means any
+event — its slow path is `bulk_get_last_event_pos_in_room_before_stream_ordering`,
+whose innermost query filters only on `NOT outlier AND rejection_reason IS NULL`.
+Membership changes, state, reactions, redactions and edits all count.
+
+`bump_stamp` is a *different* number for a different job: it moves only for
+`m.room.message`, `m.room.encrypted`, `m.sticker`, call invites and poll starts,
+and it is sent to the client so the client can order by message recency itself.
+Element X does exactly that. A client that renders the server's order verbatim
+shows the activity order instead, which reads as wrong and is not.
+
+Observed on `@daedric` (654 rooms) on 2026-09-03: three rooms in the top twenty
+had an `m.room.member` event from that day and no message for weeks — one had
+last been spoken in on 2026-08-17. `av-sync-worker-2` placed all three exactly
+where we did.
+
+**The reference server's own answer is how to check this.** Its `bump_stamp`s
+come back non-monotonic in its own room order — 12727541 at position 10,
+12727189 at 18, 13977570 at 19. Any change that makes them monotonic has
+replaced the sort key with the wrong one.
