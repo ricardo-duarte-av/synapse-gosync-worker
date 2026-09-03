@@ -10,6 +10,7 @@ package notifier
 
 import (
 	"context"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/metrics"
 	"sync"
 	"time"
 )
@@ -92,9 +93,9 @@ func (h *Handle) Close() {
 // A row that names no room and no user wakes everyone: the conservative reading
 // is that we do not know who it concerns, and a spurious wakeup costs one
 // recomputation while a missed one costs a client its timeout.
-func (n *Notifier) OnStreamAdvance(_ string, _ int64, roomIDs, userIDs []string) {
+func (n *Notifier) OnStreamAdvance(stream string, _ int64, roomIDs, userIDs []string) {
 	n.mu.Lock()
-	defer n.mu.Unlock()
+	woken := 0
 	global := len(roomIDs) == 0 && len(userIDs) == 0
 	for _, w := range n.waiters {
 		if w.done {
@@ -102,8 +103,16 @@ func (n *Notifier) OnStreamAdvance(_ string, _ int64, roomIDs, userIDs []string)
 		}
 		if global || w.interested(roomIDs, userIDs) {
 			w.done = true
+			woken++
 			close(w.wake)
 		}
+	}
+	n.mu.Unlock()
+
+	// Counted outside the lock, and only when something was actually woken:
+	// this runs for every replication row, and most rows wake nobody.
+	if woken > 0 {
+		metrics.NotifierWakeups.WithLabelValues(stream).Add(float64(woken))
 	}
 }
 

@@ -295,3 +295,34 @@ func TestRowDetailsLeavesStateKeyEmptyForAMessage(t *testing.T) {
 		t.Errorf("StateKey = %q, want empty for a non-state event", d.StateKey)
 	}
 }
+
+// The scope label is what makes a stream waking everybody visible. If a row
+// names a room or a user it must not be counted global, and if it names
+// neither it must be -- that classification is the entire signal.
+func TestRowScopeClassification(t *testing.T) {
+	cases := []struct {
+		name       string
+		stream     string
+		row        string
+		wantGlobal bool
+	}{
+		{"sticky names a room", StreamStickyEvents,
+			`["!r:example.com","$e"]`, false},
+		{"profile update names a user", StreamProfileUpdates,
+			`["@u:example.com","update",["displayname"]]`, false},
+		{"quarantined media names neither", StreamQuarantinedMedia,
+			`["example.com","abc",true]`, true},
+		{"an unknown stream names neither", "some_future_stream",
+			`["whatever"]`, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := rowDetails(tc.stream, tc.row)
+			global := len(d.RoomIDs) == 0 && len(d.UserIDs) == 0
+			if global != tc.wantGlobal {
+				t.Errorf("global = %v, want %v (rooms=%v users=%v)",
+					global, tc.wantGlobal, d.RoomIDs, d.UserIDs)
+			}
+		})
+	}
+}

@@ -89,6 +89,31 @@ var (
 		Help: "Rows seen on Synapse's caches replication stream, by action taken.",
 	}, []string{"action"})
 
+	// ReplicationRows counts rows received, by stream and by whether the row
+	// named anyone.
+	//
+	// `scope="global"` is the one to read. A row that names no room and no
+	// user wakes EVERY parked client, so a busy stream sitting in that bucket
+	// is every long poll on the worker recomputing a sync that will be empty.
+	// Four streams were in exactly that state -- sticky_events among them,
+	// which is served in /sync -- and nothing here could see it. Some global
+	// rows are correct and expected; a large and growing count on one stream
+	// is the signal.
+	ReplicationRows = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "gosync_replication_rows_total",
+		Help: "Replication rows received, by stream and whether the row named a room or user.",
+	}, []string{"stream", "scope"})
+
+	// NotifierWakeups counts parked syncs actually woken, by stream.
+	//
+	// Divided by ReplicationRows for the same stream, this is how many clients
+	// each row costs. Near the parked-client count means that stream is waking
+	// everybody.
+	NotifierWakeups = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "gosync_notifier_wakeups_total",
+		Help: "Parked syncs woken, by the stream that woke them.",
+	}, []string{"stream"})
+
 	// DatabaseReadOnly is 1 when the connected role cannot write.
 	//
 	// A gauge rather than a startup check alone, so that a role changed

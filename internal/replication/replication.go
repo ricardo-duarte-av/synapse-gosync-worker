@@ -338,6 +338,17 @@ func (s *Subscriber) handleRDATA(payload string) {
 	}
 
 	detail := rowDetails(stream, row)
+
+	// "global" means the row named neither a room nor a user, so every parked
+	// client gets woken. Recorded per stream because that is the only way to
+	// notice a busy stream in that state -- reading the code is how the last
+	// four were found.
+	scope := "targeted"
+	if len(detail.RoomIDs) == 0 && len(detail.UserIDs) == 0 {
+		scope = "global"
+	}
+	metrics.ReplicationRows.WithLabelValues(stream, scope).Inc()
+
 	if stream == StreamTyping {
 		s.updateTyping(row, pos)
 	}
