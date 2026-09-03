@@ -332,21 +332,46 @@ func TestRowScopeClassification(t *testing.T) {
 // on_rdata does not notify for it -- but it names no room and no user, so
 // reaching the notifier at all means waking every parked client, about once a
 // second on a live server.
-func TestCachesStreamWakesNobody(t *testing.T) {
+func TestSilentStreamsWakeNobody(t *testing.T) {
+	rows := map[string]string{
+		StreamCaches: `["get_destination_retry_timings",["c3.krbonne.net"],1788390297977]`,
+		// [destination, user_id]: presence being forwarded to a remote server.
+		// The user's own presence change arrives on the presence stream.
+		StreamPresenceFederation: `["matrix.org","@daedric:aguiarvieira.pt"]`,
+	}
+	for stream, row := range rows {
+		t.Run(stream, func(t *testing.T) {
+			sub := newTestSub()
+			rec := &recordingListener{}
+			sub.listener = rec
+
+			sub.handle("RDATA " + stream + " someworker 42 " + row)
+			if rec.calls != 0 {
+				t.Fatalf("%s woke the notifier %d times, want 0", stream, rec.calls)
+			}
+		})
+	}
+
+	// The guard must not be a blanket: a stream that should wake still does.
 	sub := newTestSub()
 	rec := &recordingListener{}
 	sub.listener = rec
-
-	sub.handle(`RDATA caches av-edu-worker 85270420 ` +
-		`["get_destination_retry_timings",["c3.krbonne.net"],1788390297977]`)
-	if rec.calls != 0 {
-		t.Fatalf("caches woke the notifier %d times, want 0", rec.calls)
-	}
-
-	// A stream that does wake must still wake, so the guard is not a blanket.
 	sub.handle(`RDATA typing av-typing 42 ["!r:example.com",["@u:example.com"]]`)
 	if rec.calls != 1 {
 		t.Fatalf("typing woke the notifier %d times, want 1", rec.calls)
+	}
+}
+
+// Every silent stream needs a stated reason, so the set cannot quietly grow
+// into "streams somebody once found noisy".
+func TestEverySilentStreamHasAReason(t *testing.T) {
+	if len(silentStreams) == 0 {
+		t.Fatal("no silent streams declared")
+	}
+	for stream, reason := range silentStreams {
+		if reason == "" {
+			t.Errorf("%s is silenced with no reason given", stream)
+		}
 	}
 }
 

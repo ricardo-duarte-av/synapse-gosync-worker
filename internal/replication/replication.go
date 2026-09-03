@@ -60,7 +60,34 @@ const (
 	// something we cached as immutable has been DELETED -- a purged room, a
 	// deleted room -- rather than merely changed.
 	StreamCaches = "caches"
+	// StreamPresenceFederation carries [destination, user_id]: presence to be
+	// sent to a remote server. Federation sender business, not ours.
+	StreamPresenceFederation = "presence_federation"
 )
+
+// silentStreams never wake a sync, with the reason each is here.
+//
+// Everything else keeps the conservative default -- a row naming nobody wakes
+// everybody -- because an over-wake costs one recomputation and an under-wake
+// costs a client its timeout. A stream only earns a place here on evidence:
+// its position appears in no stream token, nothing it carries can change a
+// response, and Synapse itself does not notify on it.
+//
+// Both entries were found by gosync_replication_rows_total{scope="global"}
+// rather than by reading code, which is the argument for that metric existing.
+var silentStreams = map[string]string{
+	// Synapse invalidating its OWN caches: server keys, destination retry
+	// timings, cross-signing keys. ReplicationDataHandler.on_rdata notifies
+	// the notifier for an explicit list of streams and this is not among them.
+	StreamCaches: "synapse's own cache invalidations",
+	// The outbound copy of a presence change, addressed to a remote server.
+	// The change itself arrives on the presence stream, which is targeted at
+	// the user and does wake them; this row is the federation sender being
+	// told to forward it. PresenceFederationQueue.process_replication_rows is
+	// its only consumer and it returns immediately unless the worker is a
+	// federation sender.
+	StreamPresenceFederation: "outbound presence to remote servers",
+}
 
 // Listener is notified when a stream advances.
 //
@@ -344,9 +371,10 @@ func (s *Subscriber) handleRDATA(payload string) {
 	// Recorded per stream because that is the only way to notice a busy stream
 	// in the wrong bucket -- reading the code is how the last four were found,
 	// and this metric is how `caches` was.
+	_, silent := silentStreams[stream]
 	scope := "targeted"
 	switch {
-	case stream == StreamCaches:
+	case silent:
 		scope = "silent"
 	case len(detail.RoomIDs) == 0 && len(detail.UserIDs) == 0:
 		scope = "global"
@@ -372,21 +400,8 @@ func (s *Subscriber) handleRDATA(payload string) {
 	if pos > 0 {
 		s.advance(stream, pos)
 	}
-	// The caches stream never wakes a sync.
-	//
-	// It carries Synapse invalidating its OWN caches -- server keys,
-	// destination retry timings, cross-signing keys -- and its position
-	// appears nowhere in a stream token, so no row on it can change what a
-	// client would be told. Synapse agrees: ReplicationDataHandler.on_rdata
-	// notifies the notifier for an explicit list of streams and CachesStream
-	// is not among them.
-	//
-	// It reached the notifier with no subjects, which is read as "wake
-	// everyone", so on this deployment roughly one row a second woke every
-	// parked client to recompute a sync that was always empty. Invisible until
-	// gosync_replication_rows_total{scope="global"} showed 94 of 95 global
-	// rows were this one stream.
-	if s.listener != nil && stream != StreamCaches {
+	// A silent stream reaches nobody. See silentStreams for why each is there.
+	if s.listener != nil && !silent {
 		s.listener.OnStreamAdvance(stream, pos, detail.RoomIDs, detail.UserIDs)
 	}
 }
