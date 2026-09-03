@@ -9,6 +9,7 @@ import (
 	"github.com/tidwall/gjson"
 
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/clientevent"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/streamtoken"
 )
 
 func isNoRows(err error) bool { return errors.Is(err, pgx.ErrNoRows) }
@@ -409,4 +410,264 @@ func (s *Store) InviteOrKnockStrippedState(
 		stripped = []byte(v.Raw)
 	}
 	return stripped, []byte(raw), nil
+}
+
+// SlidingMembershipChange is one meaningful change to a user's membership in a room.
+//
+// "Meaningful" excludes join→join: a display-name change rewrites the
+// membership event without changing the membership, and reporting it would make
+// every profile edit look like a re-join.
+type SlidingMembershipChange struct {
+	RoomID     string
+	Membership string
+	// EventID and Sender are EMPTY when the server left the room -- everyone
+	// local left -- or when a state reset removed the user with no event.
+	// current_state_delta_stream cannot tell those apart; checking whether a
+	// membership still exists in the room is the only way, and the caller does
+	// that.
+	EventID     string
+	Sender      string
+	Instance    string
+	StreamPos   int64
+	RoomVersion string
+}
+
+// SlidingMembershipChanges returns the meaningful membership changes for a user
+// in (from, to].
+//
+// Two sources unioned, and the second is not redundant:
+// sliding_sync_membership_snapshots holds a row per current membership, so it
+// misses a user who was **state reset** out of a room -- there is no membership
+// left to hold. current_state_delta_stream still records the removal.
+//
+// Ported from get_sliding_sync_membership_changes.
+func (s *Store) SlidingMembershipChanges(
+	ctx context.Context, userID string,
+	from, to streamtoken.RoomKey, excluded map[string]bool,
+) (map[string]SlidingMembershipChange, error) {
+
+	if from.MaxStreamPos() >= to.MaxStreamPos() {
+		return map[string]SlidingMembershipChange{}, nil
+	}
+	// The membership stream cache answers "has this user's membership moved at
+	// all?" without a query. On a quiet sync it always has, and this is the
+	// whole reason that cache is keyed by user.
+	if s.streams != nil && !s.streams.membership.HasEntityChanged(userID, from.Stream) {
+		return map[string]SlidingMembershipChange{}, nil
+	}
+
+	const q = `
+		SELECT room_id, membership_event_id, event_instance_name,
+		       event_stream_ordering, membership, sender, prev_membership, room_version
+		  FROM (
+			SELECT s.room_id, s.membership_event_id, s.event_instance_name,
+			       s.event_stream_ordering, s.membership, s.sender,
+			       m_prev.membership AS prev_membership
+			  FROM sliding_sync_membership_snapshots AS s
+			  LEFT JOIN event_edges AS e ON e.event_id = s.membership_event_id
+			  LEFT JOIN room_memberships AS m_prev ON m_prev.event_id = e.prev_event_id
+			 WHERE s.user_id = $1
+			UNION ALL
+			SELECT s.room_id, e.event_id, s.instance_name, s.stream_id,
+			       m.membership, e.sender, m_prev.membership AS prev_membership
+			  FROM current_state_delta_stream AS s
+			  LEFT JOIN events AS e ON e.event_id = s.event_id
+			  LEFT JOIN room_memberships AS m ON m.event_id = s.event_id
+			  LEFT JOIN room_memberships AS m_prev ON m_prev.event_id = s.prev_event_id
+			 WHERE s.type = 'm.room.member' AND s.state_key = $1
+		  ) AS c
+		  JOIN rooms USING (room_id)
+		 WHERE event_stream_ordering > $2 AND event_stream_ordering <= $3
+		 ORDER BY event_stream_ordering ASC`
+
+	rows, err := s.query(ctx, "SlidingMembershipChanges", q,
+		userID, from.Stream, to.MaxStreamPos())
+	if err != nil {
+		return nil, fmt.Errorf("store: sliding membership changes: %w", err)
+	}
+	defer rows.Close()
+
+	instances, err := s.InstanceIDs(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	out := map[string]SlidingMembershipChange{}
+	for rows.Next() {
+		var c SlidingMembershipChange
+		var eventID, membership, sender, prevMembership *string
+		var instance *string
+		if err := rows.Scan(&c.RoomID, &eventID, &instance, &c.StreamPos,
+			&membership, &sender, &prevMembership, &c.RoomVersion); err != nil {
+			return nil, fmt.Errorf("store: sliding membership changes: %w", err)
+		}
+		if excluded[c.RoomID] {
+			continue
+		}
+		if instance != nil {
+			c.Instance = *instance
+		}
+		if !inStreamRange(from, to, c.Instance, c.StreamPos, instances) {
+			continue
+		}
+
+		prev := ""
+		if prevMembership != nil {
+			prev = *prevMembership
+		}
+
+		if eventID == nil {
+			// Leaving a room writes a delta row per state key with a NULL
+			// event_id, so a leave can appear twice: once as the event and once
+			// as the wholesale removal that follows it. Reporting the second
+			// would tell the client it left a room it has already been told it
+			// left.
+			if prev == "leave" {
+				continue
+			}
+			if _, already := out[c.RoomID]; already {
+				continue
+			}
+			// A NULL event_id only happens when the server left the room or a
+			// state reset removed the user, so leave is the only membership it
+			// can mean.
+			c.Membership = "leave"
+		} else {
+			c.EventID = *eventID
+			if membership != nil {
+				c.Membership = *membership
+			}
+			if sender != nil {
+				c.Sender = *sender
+			}
+		}
+
+		if c.Membership == prev {
+			// join -> join is a display name change, not a membership change.
+			continue
+		}
+		out[c.RoomID] = c
+	}
+	return out, rows.Err()
+}
+
+// DeltaMembershipChange is a membership change together with what it replaced.
+//
+// The rewind needs the PREVIOUS membership, which is the whole difference from
+// SlidingMembershipChange: to answer "what was this user's membership at the token"
+// you have to step backwards from the first change after it.
+type DeltaMembershipChange struct {
+	RoomID    string
+	EventID   string
+	Instance  string
+	StreamPos int64
+
+	PrevEventID    string
+	PrevInstance   string
+	PrevStreamPos  int64
+	PrevMembership string
+	PrevSender     string
+}
+
+// CurrentStateDeltaMembershipChanges returns a user's membership changes in
+// (from, to], each with the membership it replaced, in ascending order.
+//
+// Ported from get_current_state_delta_membership_changes_for_user. Synapse's
+// caveat is worth repeating: current_state_delta_stream records how the
+// server's view of current state MOVED, not how the room's state was built, so
+// a range starting before the first local user joined the room returns nothing
+// useful. Both callers pass a recent range.
+func (s *Store) CurrentStateDeltaMembershipChanges(
+	ctx context.Context, userID string,
+	from, to streamtoken.RoomKey, excluded map[string]bool,
+) ([]DeltaMembershipChange, error) {
+
+	const q = `
+		SELECT s.room_id, e.event_id, s.instance_name, s.stream_id,
+		       s.prev_event_id, e_prev.instance_name, e_prev.stream_ordering,
+		       m_prev.membership, e_prev.sender
+		  FROM current_state_delta_stream AS s
+		  LEFT JOIN events AS e ON e.event_id = s.event_id
+		  LEFT JOIN events AS e_prev ON e_prev.event_id = s.prev_event_id
+		  LEFT JOIN room_memberships AS m_prev ON m_prev.event_id = s.prev_event_id
+		 WHERE s.stream_id > $1 AND s.stream_id <= $2
+		   AND s.type = 'm.room.member' AND s.state_key = $3
+		 ORDER BY s.stream_id ASC`
+
+	rows, err := s.query(ctx, "CurrentStateDeltaMembershipChanges", q,
+		from.Stream, to.MaxStreamPos(), userID)
+	if err != nil {
+		return nil, fmt.Errorf("store: current state delta membership changes: %w", err)
+	}
+	defer rows.Close()
+
+	instances, err := s.InstanceIDs(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []DeltaMembershipChange
+	for rows.Next() {
+		var c DeltaMembershipChange
+		var eventID, instance, prevEventID, prevInstance, prevMembership, prevSender *string
+		var prevStream *int64
+		if err := rows.Scan(&c.RoomID, &eventID, &instance, &c.StreamPos,
+			&prevEventID, &prevInstance, &prevStream, &prevMembership, &prevSender); err != nil {
+			return nil, fmt.Errorf("store: current state delta membership changes: %w", err)
+		}
+		if excluded[c.RoomID] {
+			continue
+		}
+		if instance != nil {
+			c.Instance = *instance
+		}
+		if !inStreamRange(from, to, c.Instance, c.StreamPos, instances) {
+			continue
+		}
+		if eventID != nil {
+			c.EventID = *eventID
+		}
+		if prevEventID != nil {
+			c.PrevEventID = *prevEventID
+		}
+		if prevInstance != nil {
+			c.PrevInstance = *prevInstance
+		}
+		if prevStream != nil {
+			c.PrevStreamPos = *prevStream
+		}
+		if prevMembership != nil {
+			c.PrevMembership = *prevMembership
+		}
+		if prevSender != nil {
+			c.PrevSender = *prevSender
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// inStreamRange is Synapse's _filter_results_by_stream.
+//
+// The SQL bound is deliberately loose -- it uses the token's minimum position,
+// pulling more rows than needed -- because a vector-clock token cannot be
+// expressed as one comparison. The precise per-writer check happens here.
+//
+// An absent instance name means "master", matching Synapse's handling of
+// historic rows written before instance names were recorded.
+func inStreamRange(from, to streamtoken.RoomKey, instance string, pos int64, instances map[string]int) bool {
+	if instance == "" {
+		instance = "master"
+	}
+	id, known := instances[instance]
+	if !known {
+		// A writer we have never heard of cannot be in either token's map, so
+		// both fall back to the token's base position -- which is what
+		// StreamPosForInstance does with an unknown id anyway.
+		id = -1
+	}
+	if pos <= from.StreamPosForInstance(id) {
+		return false
+	}
+	return pos <= to.StreamPosForInstance(id)
 }

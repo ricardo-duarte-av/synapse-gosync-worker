@@ -70,6 +70,17 @@ type Config struct {
 	// MSC4354Enabled mirrors Synapse's experimental.msc4354_enabled. When set,
 	// a sticky event carries the time it has left to live.
 	MSC4354Enabled bool
+	// IncludeAdminMetadata adds the server-admin-only `unsigned` fields
+	// `io.element.synapse.soft_failed` and
+	// `io.element.synapse.policy_server_spammy`
+	// (rust/src/events/serialize.rs, `include_admin_metadata`).
+	//
+	// Set only for a server admin whose
+	// `io.element.synapse.admin_client_config` asks for such events. It goes
+	// together with the visibility filter letting them through: showing an
+	// admin a soft-failed event without saying so would give them no way to
+	// tell it apart from an ordinary one.
+	IncludeAdminMetadata bool
 	// EventFields is a filter's `event_fields`: an allowlist of (possibly
 	// dotted) paths, applied last of all. Nil or empty means no pruning.
 	//
@@ -274,6 +285,22 @@ func Serialize(ev Stored, nowMS int64, cfg Config) ([]byte, error) {
 	if ev.Type == "m.room.redaction" {
 		if out, err = mirrorRedacts(out, rv); err != nil {
 			return nil, err
+		}
+	}
+
+	// Server-admin-only metadata, written from internal_metadata just as
+	// rust/src/events/serialize.rs does. Only reachable when the caller is an
+	// admin who asked for such events; see Config.IncludeAdminMetadata.
+	if cfg.IncludeAdminMetadata {
+		if gjson.GetBytes(ev.InternalMetadata, "soft_failed").Bool() {
+			if out, err = sjson.SetBytes(out, "unsigned.io\\.element\\.synapse\\.soft_failed", true); err != nil {
+				return nil, err
+			}
+		}
+		if gjson.GetBytes(ev.InternalMetadata, "policy_server_spammy").Bool() {
+			if out, err = sjson.SetBytes(out, "unsigned.io\\.element\\.synapse\\.policy_server_spammy", true); err != nil {
+				return nil, err
+			}
 		}
 	}
 

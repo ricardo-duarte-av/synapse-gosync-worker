@@ -35,6 +35,10 @@ type Result struct {
 	// Pruned names events withheld because their sender has been erased. See
 	// the comment at the drop site.
 	Pruned []string
+	// AdminMetadata is true when the caller is a server admin who asked to see
+	// soft-failed events, and so should also be told which events those are.
+	// Passed to clientevent.Config.IncludeAdminMetadata.
+	AdminMetadata bool
 }
 
 // historyVisKey and memberKey are the two state entries a visibility decision
@@ -110,6 +114,8 @@ func ForClient(ctx context.Context, db *store.Store, roomID, userID string,
 		ErasedSenders:          extra.ErasedSenders,
 		RetentionMaxLifetimeMS: extra.RetentionMaxLifetimeMS,
 		NowMS:                  nowMS,
+		ReturnSoftFailed:       extra.ReturnSoftFailed,
+		ReturnPolicySpammy:     extra.ReturnPolicySpammy,
 	}
 
 	kept := make([]store.TimelineEvent, 0, len(events))
@@ -147,18 +153,22 @@ func ForClient(ctx context.Context, db *store.Store, roomID, userID string,
 		kept = append(kept, ev)
 		memberships = append(memberships, verdict.Membership)
 	}
-	return Result{Events: kept, Memberships: memberships, Pruned: pruned}, nil
+	return Result{
+		Events: kept, Memberships: memberships, Pruned: pruned,
+		AdminMetadata: extra.ReturnSoftFailed || extra.ReturnPolicySpammy,
+	}, nil
 }
 
 func timelineToVisibilityEvent(ev store.TimelineEvent) visibility.Event {
 	out := visibility.Event{
-		EventID:        ev.EventID,
-		Type:           ev.Type,
-		StateKey:       ev.StateKey,
-		IsState:        ev.IsState,
-		Sender:         ev.Sender,
-		OriginServerTS: gjson.GetBytes(ev.JSON, "origin_server_ts").Int(),
-		SoftFailed:     softFailed(ev.InternalMetadata),
+		EventID:            ev.EventID,
+		Type:               ev.Type,
+		StateKey:           ev.StateKey,
+		IsState:            ev.IsState,
+		Sender:             ev.Sender,
+		OriginServerTS:     gjson.GetBytes(ev.JSON, "origin_server_ts").Int(),
+		SoftFailed:         softFailed(ev.InternalMetadata),
+		PolicyServerSpammy: policyServerSpammy(ev.InternalMetadata),
 	}
 	if ev.Type == "m.room.member" {
 		out.Membership = gjson.GetBytes(ev.JSON, "content.membership").String()
@@ -180,4 +190,15 @@ func softFailed(internalMetadata []byte) bool {
 		return false
 	}
 	return gjson.GetBytes(internalMetadata, "soft_failed").Bool()
+}
+
+// policyServerSpammy reads internal_metadata.policy_server_spammy.
+//
+// Distinguishes an event soft-failed by a policy server from one soft-failed by
+// auth, which a server admin can ask to see separately.
+func policyServerSpammy(internalMetadata []byte) bool {
+	if len(internalMetadata) == 0 {
+		return false
+	}
+	return gjson.GetBytes(internalMetadata, "policy_server_spammy").Bool()
 }

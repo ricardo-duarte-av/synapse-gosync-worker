@@ -171,7 +171,7 @@ func TestLiveListParityOnAPartialRange(t *testing.T) {
 		CommonRoomParameters: CommonRoomParameters{TimelineLimit: 1},
 		Ranges:               [][2]int{{0, end}},
 	}}}
-	got, err := ComputeRoomLists(ctx, d, userID, req, now)
+	got, err := ComputeRoomLists(ctx, d, userID, req, nil, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +215,7 @@ func TestLiveListParityOnTheFullSet(t *testing.T) {
 		CommonRoomParameters: CommonRoomParameters{TimelineLimit: 1},
 		Ranges:               [][2]int{{0, 999}},
 	}}}
-	got, err := ComputeRoomLists(ctx, d, userID, req, now)
+	got, err := ComputeRoomLists(ctx, d, userID, req, nil, now)
 	if err != nil {
 		t.Fatal(err)
 	}

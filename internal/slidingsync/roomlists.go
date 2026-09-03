@@ -38,6 +38,14 @@ type RoomLists struct {
 	// DMRooms is the `m.direct` set, needed for the is_dm response flag as well
 	// as the filter.
 	DMRooms map[string]bool
+
+	// NewlyJoined and NewlyLeft name rooms whose membership changed inside the
+	// token range. Both change how a room is BUILT, not just whether it is
+	// listed: a newly joined room is sent in full even on an incremental sync,
+	// and a newly left one is kept so the user's own leave is the last thing
+	// they see.
+	NewlyJoined map[string]bool
+	NewlyLeft   map[string]bool
 }
 
 // ListResult is one list's answer.
@@ -76,7 +84,15 @@ type Deps struct {
 // second serialiser is the whole reason the two endpoints agree byte for byte
 // on an event body.
 func (d Deps) EventConfig(userID, deviceID string, tokenID int64) clientevent.Config {
+	return d.EventConfigAdmin(userID, deviceID, tokenID, false)
+}
+
+// EventConfigAdmin is EventConfig with the server-admin metadata switch, which
+// only a caller that has already established the requester is an admin asking
+// for soft-failed events may set.
+func (d Deps) EventConfigAdmin(userID, deviceID string, tokenID int64, adminMetadata bool) clientevent.Config {
 	return clientevent.Config{
+		IncludeAdminMetadata: adminMetadata,
 		// The same shape /sync emits: `room_id` is stripped, because the room
 		// is the key of the map the event sits in. Verified against the
 		// reference, whose timeline events carry exactly content, event_id,
@@ -93,8 +109,12 @@ func (d Deps) EventConfig(userID, deviceID string, tokenID int64) clientevent.Co
 }
 
 // ComputeRoomLists resolves a request's lists and subscriptions into rooms.
+// from is the incoming connection position's stream token, nil on an initial
+// sync. It bounds "newly joined" and "newly left"; without it there is no range
+// for anything to be newly anything IN.
 func ComputeRoomLists(
-	ctx context.Context, d Deps, userID string, req *Request, now streamtoken.Token,
+	ctx context.Context, d Deps, userID string, req *Request,
+	from *streamtoken.Token, now streamtoken.Token,
 ) (*RoomLists, error) {
 	rooms, err := d.Store.SlidingRoomsForUser(ctx, userID)
 	if err != nil {
@@ -130,10 +150,60 @@ func ComputeRoomLists(
 		delete(rooms, roomID)
 	}
 
-	// A room the user has left is gone unless they were kicked -- their own
-	// leave is the last thing they should see, and they have already seen it.
+	// Which rooms changed membership inside the token range. Needed before the
+	// relevance filter below, because a newly left room survives it.
+	newlyJoined, newlyLeft, err := newlyJoinedAndLeft(ctx, d, userID, from, now)
+	if err != nil {
+		return nil, err
+	}
+
+	// The snapshot describes memberships as they are NOW; this sync answers as
+	// of `now.Room`, which may be behind. Undo anything that happened after it.
+	rewind, err := rewindToToken(ctx, d, userID, rooms, now)
+	if err != nil {
+		return nil, err
+	}
+	for roomID, change := range rewind {
+		if change.drop {
+			delete(rooms, roomID)
+			continue
+		}
+		if _, known := rooms[roomID]; !known {
+			// A room the user is not in now but was at the token.
+			rooms[roomID] = change.room
+			continue
+		}
+		rooms[roomID] = change.room
+	}
+
+	// A room left inside the range is not in the snapshot -- the query excludes
+	// self-leaves -- so it has to be put back, or the client is never told it
+	// left.
+	for roomID, c := range newlyLeft {
+		if _, present := rooms[roomID]; present {
+			continue
+		}
+		rooms[roomID] = store.SlidingRoom{
+			RoomID:        roomID,
+			Sender:        c.Sender,
+			Membership:    c.Membership,
+			EventID:       c.EventID,
+			RoomVersion:   c.RoomVersion,
+			EventInstance: c.Instance,
+			EventStream:   c.StreamPos,
+			// Its metadata is not recoverable from the delta stream, and a room
+			// being left needs none of it: the response carries the leave and
+			// little else.
+			HasKnownState: true,
+		}
+	}
+
+	// A room the user has left is gone unless they were kicked, or unless they
+	// left inside this range -- their own leave is the last thing they should
+	// see, and a `newly_left` room is exactly the case where they have not seen
+	// it yet.
 	for roomID, r := range rooms {
-		if !membershipIsRelevant(userID, r) {
+		if _, isNewlyLeft := newlyLeft[roomID]; !membershipIsRelevant(userID, r) && !isNewlyLeft {
 			delete(rooms, roomID)
 		}
 	}
@@ -143,12 +213,19 @@ func ComputeRoomLists(
 		return nil, err
 	}
 
+	leftIDs := make(map[string]bool, len(newlyLeft))
+	for roomID := range newlyLeft {
+		leftIDs[roomID] = true
+	}
+
 	out := &RoomLists{
-		Lists:      map[string]ListResult{},
-		Relevant:   map[string]slidingstore.RoomSyncConfig{},
-		AllRooms:   map[string]bool{},
-		Membership: rooms,
-		DMRooms:    dmRooms,
+		Lists:       map[string]ListResult{},
+		Relevant:    map[string]slidingstore.RoomSyncConfig{},
+		AllRooms:    map[string]bool{},
+		Membership:  rooms,
+		DMRooms:     dmRooms,
+		NewlyJoined: newlyJoined,
+		NewlyLeft:   leftIDs,
 	}
 
 	// Metadata for every candidate room, in one query. Everything the filters

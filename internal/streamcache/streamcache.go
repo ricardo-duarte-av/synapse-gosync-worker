@@ -62,7 +62,18 @@ type Stats struct {
 	Armed                   bool
 }
 
-// New returns a cache that knows nothing below currentPos.
+// New returns a cache that knows nothing below currentPos, DISARMED.
+//
+// Disarmed until Arm is called, and that is not a detail. A cache constructed
+// armed at horizon 0 with nothing in it claims to hold a complete record of all
+// history and therefore answers "unchanged" to every question -- the exact
+// false negative this package exists to prevent, arrived at by doing nothing.
+//
+// It is reachable, which is why it is guarded rather than merely documented: a
+// deployment with replication disabled never fires the connect callback that
+// prefills and arms these, and a Store built for a test or a one-off tool never
+// prefills at all. Found on 2026-09-03 when a test's membership gate silently
+// reported no changes.
 //
 // A max of zero or less is a supported configuration, not a mistake: it makes
 // "does this cache hide a bug?" answerable by turning it off. Such a cache
@@ -74,6 +85,7 @@ func New(name string, currentPos int64, max int) *Cache {
 		byPos:     make(map[int64]map[string]struct{}),
 		entityPos: make(map[string]int64),
 		earliest:  currentPos,
+		disarmed:  true,
 	}
 }
 

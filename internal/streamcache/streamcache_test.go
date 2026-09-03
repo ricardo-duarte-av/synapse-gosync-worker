@@ -7,7 +7,7 @@ import (
 )
 
 func TestUnknownEntityIsUnchangedAboveHorizon(t *testing.T) {
-	c := New("events", 100, 10)
+	c := armedCache("events", 100, 10)
 	c.EntityHasChanged("!a", 110)
 
 	if c.HasEntityChanged("!b", 105) {
@@ -19,7 +19,7 @@ func TestUnknownEntityIsUnchangedAboveHorizon(t *testing.T) {
 }
 
 func TestChangeAtPositionIsNotChangeAfterIt(t *testing.T) {
-	c := New("events", 0, 10)
+	c := armedCache("events", 0, 10)
 	c.EntityHasChanged("!a", 10)
 
 	if c.HasEntityChanged("!a", 10) {
@@ -31,7 +31,7 @@ func TestChangeAtPositionIsNotChangeAfterIt(t *testing.T) {
 }
 
 func TestPositionsAtOrBelowHorizonAreDropped(t *testing.T) {
-	c := New("events", 100, 10)
+	c := armedCache("events", 100, 10)
 	c.EntityHasChanged("!a", 100)
 	c.EntityHasChanged("!a", 50)
 
@@ -44,7 +44,7 @@ func TestPositionsAtOrBelowHorizonAreDropped(t *testing.T) {
 }
 
 func TestHorizonNeverDecreases(t *testing.T) {
-	c := New("events", 500, 10)
+	c := armedCache("events", 500, 10)
 	c.AllEntitiesChanged(100)
 	if got := c.EarliestKnownPosition(); got != 500 {
 		t.Fatalf("horizon moved backwards to %d, want 500", got)
@@ -58,7 +58,7 @@ func TestHorizonNeverDecreases(t *testing.T) {
 func TestEvictionRaisesHorizon(t *testing.T) {
 	// Two positions fit; the third evicts the oldest. The evicted entity must
 	// not silently become "unchanged" -- the horizon has to move up with it.
-	c := New("events", 0, 2)
+	c := armedCache("events", 0, 2)
 	c.EntityHasChanged("!a", 10)
 	c.EntityHasChanged("!b", 20)
 	c.EntityHasChanged("!c", 30)
@@ -75,7 +75,7 @@ func TestEvictionRaisesHorizon(t *testing.T) {
 }
 
 func TestMovingAnEntityForwardCleansUpTheOldPosition(t *testing.T) {
-	c := New("events", 0, 10)
+	c := armedCache("events", 0, 10)
 	c.EntityHasChanged("!a", 10)
 	c.EntityHasChanged("!a", 20)
 
@@ -93,7 +93,7 @@ func TestMovingAnEntityForwardCleansUpTheOldPosition(t *testing.T) {
 }
 
 func TestEntitiesChangedPreservesOrderAndFallsBackBelowHorizon(t *testing.T) {
-	c := New("events", 100, 10)
+	c := armedCache("events", 100, 10)
 	c.EntityHasChanged("!b", 110)
 	c.EntityHasChanged("!d", 120)
 
@@ -114,7 +114,7 @@ func TestEntitiesChangedPreservesOrderAndFallsBackBelowHorizon(t *testing.T) {
 }
 
 func TestHasAnyEntityChanged(t *testing.T) {
-	c := New("presence", 100, 10)
+	c := armedCache("presence", 100, 10)
 	if c.HasAnyEntityChanged(150) {
 		t.Fatal("an empty cache above the horizon has seen nothing")
 	}
@@ -137,7 +137,7 @@ func TestHasAnyEntityChanged(t *testing.T) {
 // keeps the reads correct if Disarm ever stops emptying), and it is therefore
 // not something a test can distinguish. Verified by mutation, 2026-09-03.
 func TestDisarmedAnswersChangedToEverything(t *testing.T) {
-	c := New("events", 0, 10)
+	c := armedCache("events", 0, 10)
 	c.EntityHasChanged("!a", 10)
 	c.Disarm()
 
@@ -163,7 +163,7 @@ func TestDisarmedAnswersChangedToEverything(t *testing.T) {
 }
 
 func TestArmEmptiesWhatPredatesTheOutage(t *testing.T) {
-	c := New("events", 0, 10)
+	c := armedCache("events", 0, 10)
 	c.EntityHasChanged("!a", 10)
 	c.Disarm()
 	c.Arm(500)
@@ -201,7 +201,7 @@ func TestZeroSizedCacheAnswersChanged(t *testing.T) {
 }
 
 func TestPrefillSetsTheHorizon(t *testing.T) {
-	c := New("events", 0, 100)
+	c := armedCache("events", 0, 100)
 	c.Prefill(map[string]int64{"!a": 150, "!b": 200}, 100)
 
 	if got := c.EarliestKnownPosition(); got != 100 {
@@ -226,7 +226,7 @@ func TestNoFalseNegatives(t *testing.T) {
 	rng := rand.New(rand.NewSource(20260903))
 
 	for trial := 0; trial < 200; trial++ {
-		c := New("events", 0, 1+rng.Intn(8))
+		c := armedCache("events", 0, 1+rng.Intn(8))
 		truth := make(map[string]int64)
 		var pos int64
 
@@ -277,7 +277,7 @@ func TestNoFalseNegatives(t *testing.T) {
 // the last element of.
 func TestPositionsStaySorted(t *testing.T) {
 	rng := rand.New(rand.NewSource(7))
-	c := New("events", 0, 1000)
+	c := armedCache("events", 0, 1000)
 	for i := 0; i < 2000; i++ {
 		c.EntityHasChanged(names[rng.Intn(len(names))], int64(1+rng.Intn(5000)))
 		if !sort.SliceIsSorted(c.positions, func(a, b int) bool { return c.positions[a] < c.positions[b] }) {
@@ -289,6 +289,15 @@ func TestPositionsStaySorted(t *testing.T) {
 	}
 }
 
+// armedCache is New followed by Arm: a cache in service, which is what every
+// test below is about. Construction alone leaves a cache disarmed on purpose --
+// see TestAFreshCacheAnswersChangedUntilArmed.
+func armedCache(name string, currentPos int64, max int) *Cache {
+	c := New(name, currentPos, max)
+	c.Arm(currentPos)
+	return c
+}
+
 var names = func() []string {
 	out := make([]string, 64)
 	for i := range out {
@@ -296,3 +305,41 @@ var names = func() []string {
 	}
 	return out
 }()
+
+// A cache that has never been armed must gate nothing.
+//
+// The alternative is the worst failure this package can have: armed at horizon
+// 0 with no entries, it claims a complete record of all history and answers
+// "unchanged" to everything. Nothing has to go wrong to reach that -- it is what
+// construction alone used to produce, so a deployment with replication disabled,
+// or a Store built without prefilling, silently stopped serving presence.
+func TestAFreshCacheAnswersChangedUntilArmed(t *testing.T) {
+	c := New("events", 0, 100)
+
+	if !c.HasEntityChanged("!a", 100) {
+		t.Error("an unarmed cache claimed an entity had not changed")
+	}
+	if !c.HasAnyEntityChanged(100) {
+		t.Error("an unarmed cache claimed nothing had changed")
+	}
+	if got := c.EntitiesChanged([]string{"!a", "!b"}, 100); len(got) != 2 {
+		t.Errorf("an unarmed cache narrowed a list to %v", got)
+	}
+	if c.Armed() {
+		t.Error("a fresh cache reports itself armed")
+	}
+
+	// And it accepts nothing until armed, so arming cannot inherit junk.
+	c.EntityHasChanged("!a", 200)
+	if c.Stats().Entities != 0 {
+		t.Error("an unarmed cache accepted an update")
+	}
+
+	c.Arm(500)
+	if !c.Armed() {
+		t.Fatal("Arm did not arm")
+	}
+	if c.HasEntityChanged("!x", 600) {
+		t.Error("after arming, an unknown entity above the horizon must be unchanged")
+	}
+}

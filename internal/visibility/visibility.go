@@ -62,6 +62,10 @@ type Event struct {
 	Sender         string
 	OriginServerTS int64
 
+	// PolicyServerSpammy comes from internal_metadata, and marks an event
+	// soft-failed specifically by a policy server rather than by auth. An admin
+	// can ask to see these alone.
+	PolicyServerSpammy bool
 	// SoftFailed comes from internal_metadata. Soft-failed events are excluded
 	// from client responses entirely.
 	SoftFailed bool
@@ -104,6 +108,14 @@ type Context struct {
 	RetentionMaxLifetimeMS int64
 	// NowMS is the wall clock the retention check compares against.
 	NowMS int64
+	// ReturnSoftFailed lets a SERVER ADMIN who has asked for them see
+	// soft-failed events. It comes from
+	// `io.element.synapse.admin_client_config` and does nothing for anyone
+	// else; the store checks the admin flag before setting it.
+	ReturnSoftFailed bool
+	// ReturnPolicySpammy is the narrower version: only events soft-failed by a
+	// policy server.
+	ReturnPolicySpammy bool
 }
 
 // Verdict is the outcome for one event.
@@ -124,11 +136,21 @@ type Verdict struct {
 // A close port of _check_client_allowed_to_see_event. state is the resolved
 // state after the event; for an outlier it must have Present false.
 func Check(ctx Context, ev Event, state StateAtEvent) Verdict {
-	// Soft-failed events never reach a client. Synapse drops them before any
-	// of the rest of this runs, and only a server admin who has explicitly
-	// asked can see them.
+	// Soft-failed events never reach a client -- unless the caller is a server
+	// admin who has explicitly asked for them, which is the only exception
+	// Synapse makes and which it makes for both flavours of the request
+	// (visibility.py, get_admin_client_config_for_user).
+	//
+	// The check is here rather than at a call site because it precedes
+	// everything else: Synapse drops soft-failed events before any visibility
+	// rule runs.
 	if ev.SoftFailed {
-		return Verdict{}
+		switch {
+		case ctx.ReturnSoftFailed:
+		case ctx.ReturnPolicySpammy && ev.PolicyServerSpammy:
+		default:
+			return Verdict{}
+		}
 	}
 	if !passesSendToClientFilter(ctx, ev) {
 		return Verdict{}

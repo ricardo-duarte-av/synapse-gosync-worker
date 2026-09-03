@@ -335,6 +335,11 @@ func buildTimeline(
 	}
 	events = filtered.Events
 
+	// A server admin who asked to see soft-failed events is also told WHICH
+	// events those are; showing them without saying so would leave no way to
+	// tell one from an ordinary event.
+	cfg := d.EventConfigAdmin(req.UserID, req.DeviceID, req.TokenID, filtered.AdminMetadata)
+
 	// Redactions. A redacted event must be served pruned, with
 	// `unsigned.redacted_because` explaining why -- Synapse applies this on
 	// READ rather than rewriting the stored event, so an endpoint that skips it
@@ -396,7 +401,6 @@ func buildTimeline(
 		if i < len(filtered.Memberships) {
 			stored.Membership = filtered.Memberships[i]
 		}
-		cfg := d.EventConfig(req.UserID, req.DeviceID, req.TokenID)
 		if err := eventfilter.AttachRedaction(&stored, redactions, req.NowMS, cfg); err != nil {
 			return out, nil, nil, nil, err
 		}

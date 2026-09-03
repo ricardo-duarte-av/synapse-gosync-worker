@@ -66,7 +66,7 @@ func allRoomsList(limit int) *Request {
 func TestLiveComputeRoomLists(t *testing.T) {
 	d, userID, now, ctx := liveDeps(t)
 
-	got, err := ComputeRoomLists(ctx, d, userID, allRoomsList(20), now)
+	got, err := ComputeRoomLists(ctx, d, userID, allRoomsList(20), nil, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func TestLiveComputeRoomLists(t *testing.T) {
 func TestLiveOrderingIsByActivityAndStable(t *testing.T) {
 	d, userID, now, ctx := liveDeps(t)
 
-	first, err := ComputeRoomLists(ctx, d, userID, allRoomsList(30), now)
+	first, err := ComputeRoomLists(ctx, d, userID, allRoomsList(30), nil, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func TestLiveOrderingIsByActivityAndStable(t *testing.T) {
 
 	// Same token, same answer. A list that reshuffles between identical
 	// requests makes a client's room list jump.
-	second, err := ComputeRoomLists(ctx, d, userID, allRoomsList(30), now)
+	second, err := ComputeRoomLists(ctx, d, userID, allRoomsList(30), nil, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +171,7 @@ func TestLiveOrderingIsByActivityAndStable(t *testing.T) {
 func TestLiveRangesArePagesOfOneOrder(t *testing.T) {
 	d, userID, now, ctx := liveDeps(t)
 
-	whole, err := ComputeRoomLists(ctx, d, userID, allRoomsList(10), now)
+	whole, err := ComputeRoomLists(ctx, d, userID, allRoomsList(10), nil, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +184,7 @@ func TestLiveRangesArePagesOfOneOrder(t *testing.T) {
 	list.Ranges = [][2]int{{0, 4}, {5, 9}}
 	req.Lists["all"] = list
 
-	split, err := ComputeRoomLists(ctx, d, userID, req, now)
+	split, err := ComputeRoomLists(ctx, d, userID, req, nil, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +214,7 @@ func TestLiveARangePastTheEndIsEmpty(t *testing.T) {
 	list.Ranges = [][2]int{{1000000, 1000010}}
 	req.Lists["all"] = list
 
-	got, err := ComputeRoomLists(ctx, d, userID, req, now)
+	got, err := ComputeRoomLists(ctx, d, userID, req, nil, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +246,7 @@ func TestLiveOverlappingListsCombineTheirConfigs(t *testing.T) {
 			Ranges: [][2]int{{0, 4}},
 		},
 	}}
-	got, err := ComputeRoomLists(ctx, d, userID, req, now)
+	got, err := ComputeRoomLists(ctx, d, userID, req, nil, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +268,7 @@ func TestLiveOverlappingListsCombineTheirConfigs(t *testing.T) {
 func TestLiveRoomSubscriptionsBypassTheWindow(t *testing.T) {
 	d, userID, now, ctx := liveDeps(t)
 
-	all, err := ComputeRoomLists(ctx, d, userID, allRoomsList(500), now)
+	all, err := ComputeRoomLists(ctx, d, userID, allRoomsList(500), nil, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +285,7 @@ func TestLiveRoomSubscriptionsBypassTheWindow(t *testing.T) {
 			RequiredState: [][2]string{{"m.room.topic", ""}}, TimelineLimit: 5,
 		}},
 	}
-	got, err := ComputeRoomLists(ctx, d, userID, req, now)
+	got, err := ComputeRoomLists(ctx, d, userID, req, nil, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +310,7 @@ func TestLiveASubscriptionToAnUnknownRoomIsIgnored(t *testing.T) {
 	req.RoomSubscriptions = map[string]RoomSubscribe{
 		"!not-a-room-we-are-in:invalid": {CommonRoomParameters: CommonRoomParameters{TimelineLimit: 1}},
 	}
-	got, err := ComputeRoomLists(ctx, d, userID, req, now)
+	got, err := ComputeRoomLists(ctx, d, userID, req, nil, now)
 	if err != nil {
 		t.Fatalf("a subscription to an unknown room failed the request: %v", err)
 	}
@@ -322,7 +322,7 @@ func TestLiveASubscriptionToAnUnknownRoomIsIgnored(t *testing.T) {
 func TestLiveFiltersAgainstRealRooms(t *testing.T) {
 	d, userID, now, ctx := liveDeps(t)
 
-	base, err := ComputeRoomLists(ctx, d, userID, allRoomsList(1000), now)
+	base, err := ComputeRoomLists(ctx, d, userID, allRoomsList(1000), nil, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -348,7 +348,7 @@ func TestLiveFiltersAgainstRealRooms(t *testing.T) {
 			list.Filters = tc.f
 			req.Lists["all"] = list
 
-			got, err := ComputeRoomLists(ctx, d, userID, req, now)
+			got, err := ComputeRoomLists(ctx, d, userID, req, nil, now)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -365,13 +365,13 @@ func TestLiveFiltersAgainstRealRooms(t *testing.T) {
 	l := enc.Lists["all"]
 	l.Filters = &Filters{IsEncrypted: ptr(true)}
 	enc.Lists["all"] = l
-	gotEnc, err := ComputeRoomLists(ctx, d, userID, enc, now)
+	gotEnc, err := ComputeRoomLists(ctx, d, userID, enc, nil, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	l.Filters = &Filters{IsEncrypted: ptr(false)}
 	enc.Lists["all"] = l
-	gotPlain, err := ComputeRoomLists(ctx, d, userID, enc, now)
+	gotPlain, err := ComputeRoomLists(ctx, d, userID, enc, nil, now)
 	if err != nil {
 		t.Fatal(err)
 	}

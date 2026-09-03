@@ -148,6 +148,13 @@ func eventStream(r *http.Request, d Deps, verdict auth.Verdict, ann *server.Anno
 		},
 		MSC4354Enabled: d.MSC4354Enabled,
 	}
+	// A server admin who asked to see soft-failed events is told which they
+	// are, matching Synapse's include_admin_metadata. The visibility filter
+	// lets them through; without this they arrive indistinguishable from
+	// ordinary events.
+	if wants, err := d.Store.AdminWantsSoftFailedEvents(ctx, verdict.UserID); err == nil {
+		cfg.IncludeAdminMetadata = wants
+	}
 	if tokenID, err := d.Store.AccessTokenID(ctx, auth.ExtractToken(r)); err == nil {
 		cfg.Requester.TokenID = tokenID
 	}

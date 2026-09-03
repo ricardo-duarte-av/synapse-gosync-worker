@@ -380,6 +380,12 @@ func (s *Store) ignoredUsers(ctx context.Context, userID string) (map[string]boo
 // VisibilityExtras are the per-request facts a visibility decision needs
 // beyond the room state resolved at each event.
 type VisibilityExtras struct {
+	// ReturnSoftFailed and ReturnPolicySpammy come from a server admin's
+	// `io.element.synapse.admin_client_config`. They have no effect for anyone
+	// else. See VisibilityExtras' query.
+	ReturnSoftFailed   bool
+	ReturnPolicySpammy bool
+
 	IgnoredSenders         map[string]bool
 	ErasedSenders          map[string]bool
 	RetentionMaxLifetimeMS int64
@@ -399,15 +405,21 @@ func (s *Store) VisibilityExtras(ctx context.Context, roomID, userID string,
 			  WHERE user_id = $1 AND account_data_type = 'm.ignored_user_list'),
 			ARRAY(SELECT user_id FROM erased_users WHERE user_id = ANY($2)),
 			(SELECT max_lifetime FROM room_retention
-			  WHERE room_id = $3 ORDER BY event_id DESC LIMIT 1)`
+			  WHERE room_id = $3 ORDER BY event_id DESC LIMIT 1),
+			COALESCE((SELECT admin FROM users WHERE name = $1), 0),
+			(SELECT content FROM account_data
+			  WHERE user_id = $1
+			    AND account_data_type = 'io.element.synapse.admin_client_config')`
 
 	var (
 		ignoredRaw  *string
 		erased      []string
 		maxLifetime *int64
+		isAdmin     int
+		adminCfgRaw *string
 	)
 	if err := s.queryRow(ctx, "VisibilityExtras", q, userID, senders, roomID).Scan(
-		&ignoredRaw, &erased, &maxLifetime); err != nil {
+		&ignoredRaw, &erased, &maxLifetime, &isAdmin, &adminCfgRaw); err != nil {
 		return VisibilityExtras{}, fmt.Errorf("store: visibility extras: %w", err)
 	}
 
@@ -434,6 +446,26 @@ func (s *Store) VisibilityExtras(ctx context.Context, roomID, userID string,
 	}
 	if maxLifetime != nil {
 		out.RetentionMaxLifetimeMS = *maxLifetime
+	}
+
+	// A SERVER ADMIN can ask to be shown soft-failed events, and Synapse honours
+	// it (visibility.py: get_admin_client_config_for_user). Both halves are
+	// required -- the account data alone does nothing for an ordinary user --
+	// which is why the admin flag is read here rather than trusted from the
+	// setting's presence.
+	//
+	// Found on 2026-09-03, and only because a sliding sync comparison ran
+	// against the server owner's account: the test accounts are not admins, so
+	// classic sync had matched for weeks without this. One event differed.
+	if isAdmin != 0 && adminCfgRaw != nil {
+		var cfg struct {
+			ReturnSoftFailed   bool `json:"return_soft_failed_events"`
+			ReturnPolicySpammy bool `json:"return_policy_server_spammy_events"`
+		}
+		if err := json.Unmarshal([]byte(*adminCfgRaw), &cfg); err == nil {
+			out.ReturnSoftFailed = cfg.ReturnSoftFailed
+			out.ReturnPolicySpammy = cfg.ReturnPolicySpammy
+		}
 	}
 	return out, nil
 }
@@ -525,4 +557,36 @@ func (s *Store) AttachPrevContent(ctx context.Context, events []*clientevent.Sto
 		t.event.JSON = body
 	}
 	return nil
+}
+
+// AdminWantsSoftFailedEvents reports whether a caller is a server admin who has
+// asked to be shown soft-failed events.
+//
+// Both halves are required: the account data setting does nothing for an
+// ordinary user. See VisibilityExtras, which reads the same pair for the
+// visibility decision -- this is the serialisation side, needed where the event
+// config is built rather than where the filter runs, so the two are separate
+// lookups of the same fact.
+func (s *Store) AdminWantsSoftFailedEvents(ctx context.Context, userID string) (bool, error) {
+	const q = `
+		SELECT COALESCE((SELECT admin FROM users WHERE name = $1), 0),
+		       (SELECT content FROM account_data
+		         WHERE user_id = $1
+		           AND account_data_type = 'io.element.synapse.admin_client_config')`
+	var isAdmin int
+	var raw *string
+	if err := s.queryRow(ctx, "AdminWantsSoftFailedEvents", q, userID).Scan(&isAdmin, &raw); err != nil {
+		return false, fmt.Errorf("store: admin client config: %w", err)
+	}
+	if isAdmin == 0 || raw == nil {
+		return false, nil
+	}
+	var cfg struct {
+		ReturnSoftFailed   bool `json:"return_soft_failed_events"`
+		ReturnPolicySpammy bool `json:"return_policy_server_spammy_events"`
+	}
+	if err := json.Unmarshal([]byte(*raw), &cfg); err != nil {
+		return false, nil
+	}
+	return cfg.ReturnSoftFailed || cfg.ReturnPolicySpammy, nil
 }

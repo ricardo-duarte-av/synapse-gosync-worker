@@ -668,14 +668,47 @@ exercises — verified after the lift: `sync`, `incremental_sync` and
 Sharing one implementation is the entire argument; a second copy is what would
 make this untested.
 
+### The rewind and newly-joined/left — done
+
+The two corrections that make a *current* room list answer for a *past* token.
+Both are no-ops on a sync whose token is current, which is almost every sync —
+so a build with either removed compares clean against Synapse all day. They are
+tested against the database instead, by picking a membership change that really
+happened and asserting the functions notice it. Five of five mutations bite.
+
+Three findings, all in [synapse-notes.md](synapse-notes.md):
+
+- **A server admin can ask to see soft-failed events**, via
+  `io.element.synapse.admin_client_config`, and Synapse marks each one in
+  `unsigned`. Found only because a sliding sync comparison ran against the
+  **server owner's** account — the test accounts are not admins, so classic sync
+  had matched for weeks without it. Now implemented for both endpoints. The
+  lesson is CLAUDE.md §3's, extended: an account with different **rights**
+  exercises different code, not just an account with more rooms.
+- **`prev_membership` is often the wrong user's.** The join→join filter reaches
+  the previous membership through `event_edges`, which gives DAG parents rather
+  than state predecessors: a usable membership only 51.7% of the time, and
+  62.3% of those belong to somebody else. The failure is safe only by accident
+  of structure, and both outcomes are now pinned by tests.
+- **The snapshot token is a vector clock.** Our first version collapsed it to a
+  single position, which would stop the rewind at the slowest of the six event
+  persisters in use here and miss everything the others did above it. Every
+  test still passed, because the tests supply single-writer tokens of their own.
+
+#### And a defect in M10's caches, found by the same tests
+
+`streamcache.New` returned an **armed** cache with horizon 0 and no entries — a
+cache claiming a complete record of all history, which therefore answers
+"unchanged" to every question. The exact false negative the package exists to
+prevent, arrived at by doing nothing.
+
+Reachable in production: a deployment with `replication.enabled: false` never
+fires the connect callback that prefills and arms the caches, so its presence
+gate would have answered "nothing changed" forever. Caches now start disarmed
+and only `Arm` enables them.
+
 ### Not done, and none of it silently
 
-- **The membership rewind** (`_get_rewind_changes_to_current_membership_to_token`)
-  and **newly-joined/newly-left rooms**. Without them the room list is computed
-  from CURRENT membership rather than membership as of the token. That is
-  correct whenever the token is current, which it almost always is, and wrong
-  for a client syncing from an old `pos` — so `membershipIsRelevant` currently
-  drops a self-leave that Synapse would keep as `newly_left`.
 - **Partial-state room exclusion** (`must_await_full_state`).
 - **The endpoint, the long poll, and the `slidingstore` pool, config and reaper
   wiring.** The reaper still has no caller; see the M11 note.

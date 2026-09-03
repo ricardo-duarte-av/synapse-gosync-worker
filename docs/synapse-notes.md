@@ -43,6 +43,60 @@ literally, or was found only by querying the live database.
   serve a stale sync. `bound_future_token` (`streams/events.py:110`) clamps
   tokens from the future rather than trusting them.
 
+## Sliding sync: the rewind and newly-joined/left (2026-09-03)
+
+### A server admin can ask to see soft-failed events, and Synapse obeys
+
+`io.element.synapse.admin_client_config` with `return_soft_failed_events: true`
+(or `return_policy_server_spammy_events`) makes Synapse include soft-failed
+events for that user, and mark each one with
+`unsigned["io.element.synapse.soft_failed"]`. Both halves are required: the
+account data does nothing unless `users.admin` is set.
+
+Found by running a sliding sync comparison against the **server owner's**
+account. The test accounts are not admins, so classic sync had matched for weeks
+without this — one event in one room differed, and only on that account. The
+lesson is the one CLAUDE.md §3 already states about scale and history, extended
+to privilege: **an account with different rights exercises different code.**
+
+Now implemented for both endpoints, in `internal/visibility` (letting them
+through) and `internal/clientevent` (marking them).
+
+### `prev_membership` in the membership-changes query is often the wrong user's
+
+`get_sliding_sync_membership_changes` unions two sources to find "meaningful"
+membership changes, and filters out join→join — a display-name change that
+rewrites the membership event without changing the membership.
+
+The `sliding_sync_membership_snapshots` half reaches the previous membership
+through `event_edges`, which gives **DAG parents, not state predecessors**.
+Measured on this server: it yields a membership at all for only **51.7%** of
+rows (1,056 of 2,044), and of those, **62.3% belong to a different user**.
+
+The failure is safe, but only by accident of structure. A row that filters is
+skipped, and nothing removes an entry another row already added, so a change is
+suppressed only when *both* branches agree it is not one. A genuine join always
+has a delta row with no predecessor, so it is always reported; a display-name
+change is reported about half the time. Over-reporting costs one room sent in
+full. Under-reporting would send a delta to a client with no base for it.
+
+`internal/slidingsync/rewind_live_test.go` asserts both outcomes, so the
+behaviour is pinned rather than the docstring's promise.
+
+### The snapshot token is a vector clock, and collapsing it loses changes
+
+`_get_rewind_changes_to_current_membership_to_token` builds the point the
+membership snapshot was taken at from **each event persister's own highest
+position**: the base is the lowest of them, and every writer ahead of it is
+listed individually.
+
+Written as a single position it is wrong in a way nothing here can see: the
+rewind would stop at the slowest writer and miss everything the others did above
+it. This deployment has **six event persisters in active use**, so it is not
+theoretical. The first version of our port did exactly that, and every test
+still passed — the tests supply single-writer tokens of their own, so the bound
+they exercise is not the one that matters.
+
 ## Sliding sync: `_required_state_changes` (2026-09-03)
 
 ### A leaked loop variable decides which members are remembered

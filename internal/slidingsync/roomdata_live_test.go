@@ -118,7 +118,7 @@ func TestLiveRoomDataParity(t *testing.T) {
 		},
 		Ranges: [][2]int{{0, 49}},
 	}}}
-	lists, err := ComputeRoomLists(ctx, d, userID, req, now)
+	lists, err := ComputeRoomLists(ctx, d, userID, req, nil, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +279,7 @@ func TestLiveRoomDataParityWithLazyMembers(t *testing.T) {
 		CommonRoomParameters: CommonRoomParameters{RequiredState: required, TimelineLimit: 5},
 		Ranges:               [][2]int{{0, 49}},
 	}}}
-	lists, err := ComputeRoomLists(ctx, d, userID, req, now)
+	lists, err := ComputeRoomLists(ctx, d, userID, req, nil, now)
 	if err != nil {
 		t.Fatal(err)
 	}
