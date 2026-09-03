@@ -897,3 +897,36 @@ stamp `refused` unconditionally, which meant the handler could classify a
 request and then have the classification discarded on the way out. Both
 severities were mutation-tested from both directions: removing the `client_gone`
 case makes an abandoned request log at error again, and the test catches it.
+
+### Replication could wedge itself until the process was restarted
+
+Reported as "why is replication down?" while the worker was plainly up. The
+metrics said `gosync_replication_connected` had been 0 for 48 minutes with no
+restart, flat memory, KeyDB healthy on 45 clients and 16 subscribers, and a
+freshly started worker subscribing on its first try.
+
+The cause was one line in the batch-overflow path. Synapse sends the rows of a
+batch with the token `batch` and only the last row names a position, so rows are
+buffered until it arrives; past `maxPendingBatch` we give up on the batch. That
+path called `setLive(false)` and kept reading. But `setLive(true)` runs in
+exactly one place -- a new session subscribing -- so nothing could ever undo it.
+The subscriber sat in its read loop, permanently reporting itself disconnected,
+until somebody restarted the container.
+
+**A batch that never terminates is what a Synapse restart produces**, so this
+was not a corner: it was the state that followed every restart of the thing we
+follow. The user had restarted Synapse that afternoon, and the flapping started
+at 18:53 the same day.
+
+The overflow path now cancels the session, so the `Run` loop reconnects and
+resyncs. Two mutations cover it: restoring `setLive(false)` fails the new test,
+and aborting unconditionally fails the "normal batch" test next to it.
+
+A second bug found in the same loop: `backoff` was declared outside it and only
+ever doubled, so a worker that had seen a few unrelated blips waited the full
+thirty seconds before every later reconnect, forever. It now resets whenever a
+session got as far as subscribing.
+
+The general shape is worth remembering: **a health flag that only one code path
+can set true must not be set false by any other.** Either the flag is owned by
+the lifecycle that can restore it, or clearing it has to end that lifecycle.

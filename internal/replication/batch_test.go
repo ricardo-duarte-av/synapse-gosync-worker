@@ -281,3 +281,59 @@ func TestUnknownEventsRowShapeNamesNobody(t *testing.T) {
 		t.Fatalf("an unknown row shape named %v/%v; it must name nobody", d.RoomIDs, d.UserIDs)
 	}
 }
+
+// An unterminated batch must end the SESSION, not just the liveness flag.
+//
+// This is the shape of the bug it was written for. The overflow path used to
+// call setLive(false) and carry on reading, but setLive(true) only ever runs
+// when a new session subscribes -- so the subscriber sat in its read loop
+// reporting "not connected" for as long as the process lived, and a restart was
+// the only cure. On 2026-09-03 the deployed worker did exactly that: up 48
+// minutes, gosync_replication_connected stuck at 0, KeyDB and Synapse both
+// healthy, and a freshly started worker connecting on the first try.
+//
+// A Synapse restart is what produces the unterminated batch, so this is not a
+// rare path -- it is the one that follows every restart of the thing we follow.
+func TestAnUnterminatedBatchEndsTheSession(t *testing.T) {
+	s := newTestSub()
+
+	aborted := false
+	s.abortSession = func() { aborted = true }
+
+	// One row past the cap. Each carries the "batch" token, so none of them
+	// ever names a position.
+	for i := 0; i <= maxPendingBatch; i++ {
+		s.handle(`RDATA events p1 batch ` + eventRow("!r:e.com"))
+	}
+
+	if !aborted {
+		t.Error("the session was not ended; the subscriber would report " +
+			"itself disconnected forever while still reading the stream")
+	}
+	if got := len(s.pending[StreamEvents]); got != 0 {
+		t.Errorf("%d rows still buffered; a half-batch must not survive the drop", got)
+	}
+}
+
+// The counterpart: a batch that stays under the cap must NOT end the session.
+// Reconnecting on ordinary traffic would be its own outage.
+func TestANormalBatchDoesNotEndTheSession(t *testing.T) {
+	s := newTestSub()
+
+	aborted := false
+	s.abortSession = func() { aborted = true }
+
+	for i := 0; i < maxPendingBatch-1; i++ {
+		s.handle(`RDATA events p1 batch ` + eventRow("!r:e.com"))
+	}
+	if aborted {
+		t.Fatal("ended the session on a batch that was still within the limit")
+	}
+	s.handle(`RDATA events p1 900 ` + eventRow("!r:e.com"))
+	if aborted {
+		t.Error("ended the session on a batch that terminated normally")
+	}
+	if got := len(s.pending[StreamEvents]); got != 0 {
+		t.Errorf("%d rows left buffered after the batch terminated", got)
+	}
+}

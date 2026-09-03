@@ -152,6 +152,16 @@ type Subscriber struct {
 	// about the store.
 	onDrop    func()
 	onConnect func(positions map[string]int64)
+
+	// abortSession ends the running session, so the Run loop reconnects.
+	//
+	// Something that goes wrong while reading the stream -- a batch that never
+	// terminates is the one we have hit -- leaves the subscription unusable
+	// but not closed: Redis is still happily delivering to a reader that can no
+	// longer make sense of what it gets. Marking ourselves not-live is then a
+	// statement with no way back, because only a NEW session ever marks us live
+	// again. Cancelling the session is what turns that into a reconnect.
+	abortSession context.CancelFunc
 }
 
 // SetInvalidator registers the cache invalidator.
@@ -282,10 +292,19 @@ func (s *Subscriber) Run(ctx context.Context) {
 	}
 	backoff := time.Second
 	for ctx.Err() == nil {
-		if err := s.session(ctx); err != nil && ctx.Err() == nil {
+		subscribed, err := s.session(ctx)
+		if err != nil && ctx.Err() == nil {
 			s.log.Warn().Err(err).Dur("retry_in", backoff).Msg("replication connection lost")
 		}
 		s.setLive(false)
+		// A session that got as far as subscribing was a working connection,
+		// so the next failure starts its backoff from the bottom again.
+		// Without this the delay only ever grows, and a worker that has been
+		// up long enough to see a handful of unrelated blips waits the full
+		// thirty seconds before every subsequent reconnect.
+		if subscribed {
+			backoff = time.Second
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -297,7 +316,20 @@ func (s *Subscriber) Run(ctx context.Context) {
 	}
 }
 
-func (s *Subscriber) session(ctx context.Context) error {
+func (s *Subscriber) session(ctx context.Context) (subscribed bool, err error) {
+	// Own cancel, so a fault found while reading can end this session and let
+	// the Run loop build a fresh one.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	s.mu.Lock()
+	s.abortSession = cancel
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.abortSession = nil
+		s.mu.Unlock()
+	}()
+
 	opts := &redis.Options{Addr: s.cfg.Address, Password: s.cfg.Password, DB: s.cfg.DB}
 	if strings.HasPrefix(s.cfg.Address, "/") {
 		opts.Network = "unix"
@@ -312,8 +344,9 @@ func (s *Subscriber) session(ctx context.Context) error {
 	defer func() { _ = pubsub.Close() }()
 
 	if _, err := pubsub.Receive(ctx); err != nil {
-		return err
+		return false, err
 	}
+	subscribed = true
 	s.setLive(true)
 	s.log.Info().Str("channel", s.cfg.Channel).Msg("following the replication stream")
 
@@ -321,13 +354,23 @@ func (s *Subscriber) session(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return subscribed, ctx.Err()
 		case msg, ok := <-ch:
 			if !ok {
-				return nil
+				return subscribed, nil
 			}
 			s.handle(msg.Payload)
 		}
+	}
+}
+
+// abort ends the running session so Run reconnects and resyncs from scratch.
+func (s *Subscriber) abort() {
+	s.mu.Lock()
+	cancel := s.abortSession
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 
@@ -444,8 +487,8 @@ func (s *Subscriber) handleRDATA(payload string) {
 		s.mu.Unlock()
 		if overflow {
 			s.log.Error().Str("stream", stream).Int("limit", maxPendingBatch).
-				Msg("replication batch never terminated; treating as a lost connection")
-			s.setLive(false)
+				Msg("replication batch never terminated; dropping the connection to resync")
+			s.abort()
 		}
 		return
 	}
