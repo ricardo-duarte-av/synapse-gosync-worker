@@ -162,6 +162,14 @@ carry an empty `rooms` object, and a room entry can carry nothing but a
 and it took reading an nginx access log to notice. With this panel it is one
 glance.
 
+**The request log carries `user_agent`, and the dashboard does not.** Which
+client is doing something is a question that keeps coming up — the sliding sync
+hot loop was found by reading an nginx access log for the user-agent string,
+because the worker's own log did not have it. It does now. It is deliberately
+not a metric label: this deployment sees a handful of clients, but a label whose
+values are chosen by callers is a cardinality incident waiting for one badly
+behaved bot. Group by it in the log, not in Prometheus.
+
 **`client_gone` is not a failure, and it is 4% of this endpoint's traffic.**
 A long poll exists to be abandoned: the nginx log for the reference worker shows
 1,102 `499`s out of 27,465 requests, and every one of them is a client that

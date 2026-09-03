@@ -5,7 +5,9 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rs/zerolog"
 
@@ -172,8 +174,59 @@ func WithRequestLog(log zerolog.Logger, next http.Handler) http.Handler {
 		if ann.Waited > 0 {
 			ev = ev.Dur("waited", ann.Waited)
 		}
+		if ua := userAgent(r); ua != "" {
+			ev = ev.Str("user_agent", ua)
+		}
 		ev.Msg("request")
 	})
+}
+
+// maxUserAgent caps the logged User-Agent.
+//
+// Long enough for every real Matrix client -- the longest seen on this
+// deployment is Element X's at 63 bytes -- and short enough that a client
+// sending a kilobyte of header cannot make every one of its log lines a
+// kilobyte long. A truncated value ends in an ellipsis so it is never mistaken
+// for the whole string.
+const maxUserAgent = 256
+
+// userAgent is the caller's User-Agent, made safe to put in a log line.
+//
+// The header is arbitrary bytes chosen by whoever is calling, and it is the
+// first thing in the request log that is. zerolog escapes it into JSON, so
+// there is no injection to worry about, but two things do get through and are
+// handled here -- verified by sending each over a raw socket:
+//
+//	invalid UTF-8   200, reaches us. net/http accepts bytes >= 0x80 in a
+//	                header value without checking they form runes, and a log
+//	                line carrying them is mojibake in every viewer downstream.
+//	over-long       200, reaches us. 4096 bytes of A arrive intact, and
+//	                without a cap every line that client logs carries them.
+//
+// The control-character filter is defence in depth rather than load-bearing:
+// net/http rejects both a newline and a DEL in a header value with 400 before
+// any handler runs. It stays because that is net/http's promise and not ours,
+// and because the cost of keeping it is one comparison per rune.
+func userAgent(r *http.Request) string {
+	ua := r.Header.Get("User-Agent")
+	if ua == "" {
+		return ""
+	}
+	ua = strings.ToValidUTF8(ua, "")
+	ua = strings.Map(func(c rune) rune {
+		if c < 0x20 || c == 0x7f {
+			return -1
+		}
+		return c
+	}, ua)
+	if len(ua) > maxUserAgent {
+		cut := maxUserAgent
+		for cut > 0 && !utf8.RuneStart(ua[cut]) {
+			cut--
+		}
+		ua = ua[:cut] + "\u2026"
+	}
+	return ua
 }
 
 func isOperationalPath(path string) bool {
