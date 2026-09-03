@@ -270,7 +270,7 @@
     {
       "type": "stat",
       "title": "5xx ratio",
-      "description": "Share of requests that failed on our side. Anything sustained above zero is a bug, not load.",
+      "description": "Share of requests that failed on our side. Anything sustained above zero is a bug, not load. Reads 0 rather than \"No data\" when it has never happened: for a panel whose healthy value is zero, those two must not look the same.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -326,7 +326,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(gosync_requests_total{endpoint=~\"$endpoint\", job=~\"$job\", status=~\"5..\"}[$bucket])) / clamp_min(sum(rate(gosync_requests_total{endpoint=~\"$endpoint\", job=~\"$job\"}[$bucket])), 0.0001)",
+          "expr": "(sum(rate(gosync_requests_total{endpoint=~\"$endpoint\", job=~\"$job\", status=~\"5..\"}[$bucket])) or vector(0)) / clamp_min(sum(rate(gosync_requests_total{endpoint=~\"$endpoint\", job=~\"$job\"}[$bucket])) or vector(0), 0.0001)",
           "legendFormat": "",
           "range": false,
           "instant": true,
@@ -1202,7 +1202,7 @@
     {
       "type": "stat",
       "title": "Rejections",
-      "description": "Tokens Synapse said no to.",
+      "description": "Tokens Synapse said no to. Reads 0 rather than \"No data\" when it has never happened: for a panel whose healthy value is zero, those two must not look the same.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1254,7 +1254,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(gosync_auth_verdicts_total{job=~\"$job\", verdict=\"rejected\"}[$bucket]))",
+          "expr": "sum(rate(gosync_auth_verdicts_total{job=~\"$job\", verdict=\"rejected\"}[$bucket])) or vector(0)",
           "legendFormat": "",
           "range": false,
           "instant": true,
@@ -1265,7 +1265,7 @@
     {
       "type": "stat",
       "title": "Whoami unavailable",
-      "description": "The one to watch: Synapse could not be asked. The worker answers 502 and NEVER 401, because refusing a valid token would log real clients out. Sustained non-zero means the whoami socket is wrong or the client-API worker is down.",
+      "description": "The one to watch: Synapse could not be asked. The worker answers 502 and NEVER 401, because refusing a valid token would log real clients out. Sustained non-zero means the whoami socket is wrong or the client-API worker is down. Reads 0 rather than \"No data\" when it has never happened: for a panel whose healthy value is zero, those two must not look the same.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1321,7 +1321,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(gosync_auth_verdicts_total{job=~\"$job\", verdict=\"unavailable\"}[$bucket]))",
+          "expr": "sum(rate(gosync_auth_verdicts_total{job=~\"$job\", verdict=\"unavailable\"}[$bucket])) or vector(0)",
           "legendFormat": "",
           "range": false,
           "instant": true,
