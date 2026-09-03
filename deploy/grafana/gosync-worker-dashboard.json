@@ -3034,7 +3034,7 @@
     {
       "type": "stat",
       "title": "Global rows",
-      "description": "Share of rows that name neither a room nor a user, and therefore wake EVERY parked client. Some are correct -- quarantined_media is deliberately here -- but a large share means a busy stream is being read as 'concerns everybody'. Four streams sat in this bucket unnoticed, sticky_events among them, which is served in /sync.",
+      "description": "Share of rows that name neither a room nor a user, and therefore wake EVERY parked client. This is the panel that found the caches stream doing it about once a second: 94 of 95 global rows were that one stream, waking every client to recompute a sync that was always empty. Streams that wake nobody by design are counted scope=\"silent\" and are not in this number.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -3363,8 +3363,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Targeted vs global rows",
-      "description": "Stacked. 'global' is every parked client woken; it should be a thin band.",
+      "title": "Rows by scope",
+      "description": "Stacked. 'global' wakes every parked client and should be a thin band; 'silent' is a stream that wakes nobody by design -- the caches stream, which carries Synapse's own invalidations and appears in no stream token.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"

@@ -326,3 +326,38 @@ func TestRowScopeClassification(t *testing.T) {
 		})
 	}
 }
+
+// The caches stream must never wake a sync. It carries Synapse's own cache
+// invalidations, its position is in no stream token, and Synapse's own
+// on_rdata does not notify for it -- but it names no room and no user, so
+// reaching the notifier at all means waking every parked client, about once a
+// second on a live server.
+func TestCachesStreamWakesNobody(t *testing.T) {
+	sub := newTestSub()
+	rec := &recordingListener{}
+	sub.listener = rec
+
+	sub.handle(`RDATA caches av-edu-worker 85270420 ` +
+		`["get_destination_retry_timings",["c3.krbonne.net"],1788390297977]`)
+	if rec.calls != 0 {
+		t.Fatalf("caches woke the notifier %d times, want 0", rec.calls)
+	}
+
+	// A stream that does wake must still wake, so the guard is not a blanket.
+	sub.handle(`RDATA typing av-typing 42 ["!r:example.com",["@u:example.com"]]`)
+	if rec.calls != 1 {
+		t.Fatalf("typing woke the notifier %d times, want 1", rec.calls)
+	}
+}
+
+type recordingListener struct {
+	calls  int
+	stream string
+	rooms  []string
+	users  []string
+}
+
+func (r *recordingListener) OnStreamAdvance(stream string, _ int64, rooms, users []string) {
+	r.calls++
+	r.stream, r.rooms, r.users = stream, rooms, users
+}

@@ -340,11 +340,15 @@ func (s *Subscriber) handleRDATA(payload string) {
 	detail := rowDetails(stream, row)
 
 	// "global" means the row named neither a room nor a user, so every parked
-	// client gets woken. Recorded per stream because that is the only way to
-	// notice a busy stream in that state -- reading the code is how the last
-	// four were found.
+	// client gets woken. "silent" means the stream wakes nobody by design.
+	// Recorded per stream because that is the only way to notice a busy stream
+	// in the wrong bucket -- reading the code is how the last four were found,
+	// and this metric is how `caches` was.
 	scope := "targeted"
-	if len(detail.RoomIDs) == 0 && len(detail.UserIDs) == 0 {
+	switch {
+	case stream == StreamCaches:
+		scope = "silent"
+	case len(detail.RoomIDs) == 0 && len(detail.UserIDs) == 0:
 		scope = "global"
 	}
 	metrics.ReplicationRows.WithLabelValues(stream, scope).Inc()
@@ -368,7 +372,21 @@ func (s *Subscriber) handleRDATA(payload string) {
 	if pos > 0 {
 		s.advance(stream, pos)
 	}
-	if s.listener != nil {
+	// The caches stream never wakes a sync.
+	//
+	// It carries Synapse invalidating its OWN caches -- server keys,
+	// destination retry timings, cross-signing keys -- and its position
+	// appears nowhere in a stream token, so no row on it can change what a
+	// client would be told. Synapse agrees: ReplicationDataHandler.on_rdata
+	// notifies the notifier for an explicit list of streams and CachesStream
+	// is not among them.
+	//
+	// It reached the notifier with no subjects, which is read as "wake
+	// everyone", so on this deployment roughly one row a second woke every
+	// parked client to recompute a sync that was always empty. Invisible until
+	// gosync_replication_rows_total{scope="global"} showed 94 of 95 global
+	// rows were this one stream.
+	if s.listener != nil && stream != StreamCaches {
 		s.listener.OnStreamAdvance(stream, pos, detail.RoomIDs, detail.UserIDs)
 	}
 }
