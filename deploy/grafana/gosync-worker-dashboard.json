@@ -1941,7 +1941,7 @@
       "gridPos": {
         "x": 0,
         "y": 48,
-        "w": 12,
+        "w": 8,
         "h": 7
       },
       "fieldConfig": {
@@ -2027,6 +2027,91 @@
     },
     {
       "type": "timeseries",
+      "title": "CPU",
+      "description": "Fraction of one core. A parked long poll costs nothing, so this should sit near zero between wakeups and rise while a sync is built. Sustained load with no traffic means work is happening off the request path -- the typing hot loop looked exactly like that, at 15%. GC is drawn alongside so a rise can be attributed: the Go client does not export a user/system split on Linux, so that is not available here.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 48,
+        "w": 8,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "unit": "percentunit",
+          "decimals": 3,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(process_cpu_seconds_total{job=~\"$job\"}[$bucket]) and on(instance, job) gosync_build_info)",
+          "legendFormat": "cpu",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(go_gc_duration_seconds_sum{job=~\"$job\"}[$bucket]) and on(instance, job) gosync_build_info)",
+          "legendFormat": "gc",
+          "range": true,
+          "instant": false,
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
       "title": "Goroutines and waiters",
       "description": "These two should move together. Goroutines climbing while waiters do not is a leak in something other than the long poll.",
       "datasource": {
@@ -2034,9 +2119,9 @@
         "uid": "${datasource}"
       },
       "gridPos": {
-        "x": 12,
+        "x": 16,
         "y": 48,
-        "w": 12,
+        "w": 8,
         "h": 7
       },
       "fieldConfig": {
