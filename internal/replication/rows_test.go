@@ -60,6 +60,37 @@ func TestRowSubjects(t *testing.T) {
 			row:       `["@someone:example.com"]`,
 			wantUsers: []string{"@someone:example.com"},
 		},
+		{
+			// Sticky events are served in /sync, so this row has to wake the
+			// room -- it was previously waking everybody instead.
+			name: "sticky_events", stream: StreamStickyEvents,
+			row:       `["!8DitJr99fJMIvafK4U42dkFtaeHdJkxgwOgFWWZWDoc","$stickyEventId"]`,
+			wantRooms: []string{"!8DitJr99fJMIvafK4U42dkFtaeHdJkxgwOgFWWZWDoc"},
+		},
+		{
+			name: "thread_subscriptions", stream: StreamThreadSubscriptions,
+			row: `["@daedric:aguiarvieira.pt","!8DitJr99fJMIvafK4U42dkFtaeHdJkxgwOgFWWZWDoc",` +
+				`"$threadRootEventId"]`,
+			wantRooms: []string{"!8DitJr99fJMIvafK4U42dkFtaeHdJkxgwOgFWWZWDoc"},
+			wantUsers: []string{"@daedric:aguiarvieira.pt"},
+		},
+		{
+			name: "un_partial_stated_room", stream: StreamUnPartialStatedRoom,
+			row:       `["!8DitJr99fJMIvafK4U42dkFtaeHdJkxgwOgFWWZWDoc"]`,
+			wantRooms: []string{"!8DitJr99fJMIvafK4U42dkFtaeHdJkxgwOgFWWZWDoc"},
+		},
+		{
+			name: "profile_updates", stream: StreamProfileUpdates,
+			row:       `["@daedric:aguiarvieira.pt","update",["displayname"]]`,
+			wantUsers: []string{"@daedric:aguiarvieira.pt"},
+		},
+		{
+			// Its row names neither a room nor a user, and its position only
+			// ever reaches a token. Left waking everybody on purpose: see the
+			// note at the bottom of rowDetails.
+			name: "quarantined_media stays global", stream: StreamQuarantinedMedia,
+			row: `["example.com","abcdef",true]`,
+		},
 		{name: "unknown stream", stream: "caches", row: `["x",["y"],1]`},
 		{name: "not an array", stream: StreamEvents, row: `{"a":1}`},
 	}
@@ -228,5 +259,39 @@ func TestTypingStoppingIsStillAChange(t *testing.T) {
 	}
 	if rooms := s.TypingChangedSince(5); len(rooms) != 1 || rooms[0] != "!r:e" {
 		t.Errorf("TypingChangedSince(5) = %v, want the room -- stopping is a change", rooms)
+	}
+}
+
+// rowDetails carries the type and state key that rowSubjects discards. Cache
+// invalidation depends on both: a membership change drops the room list of the
+// event's STATE KEY, which for an invite is the person invited rather than the
+// sender.
+func TestRowDetailsCarriesTypeAndStateKey(t *testing.T) {
+	row := `["ev",["$evid","!room:example.com","m.room.member","@invited:example.com",` +
+		`null,null,"invite",false,false]]`
+	d := rowDetails(StreamEvents, row)
+
+	if d.Type != "m.room.member" {
+		t.Errorf("Type = %q, want m.room.member", d.Type)
+	}
+	if d.StateKey != "@invited:example.com" {
+		t.Errorf("StateKey = %q, want the invited user", d.StateKey)
+	}
+	if !reflect.DeepEqual(d.RoomIDs, []string{"!room:example.com"}) {
+		t.Errorf("RoomIDs = %v", d.RoomIDs)
+	}
+}
+
+// A message is not a state event, and must not be read as one -- a non-null
+// state key would invalidate some unrelated user's room list.
+func TestRowDetailsLeavesStateKeyEmptyForAMessage(t *testing.T) {
+	row := `["ev",["$evid","!room:example.com","m.room.message",null,null,null,null,false,false]]`
+	d := rowDetails(StreamEvents, row)
+
+	if d.Type != "m.room.message" {
+		t.Errorf("Type = %q", d.Type)
+	}
+	if d.StateKey != "" {
+		t.Errorf("StateKey = %q, want empty for a non-state event", d.StateKey)
 	}
 }

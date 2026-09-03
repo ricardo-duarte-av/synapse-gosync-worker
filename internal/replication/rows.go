@@ -90,7 +90,34 @@ func rowDetails(stream, row string) RowDetail {
 	case StreamToDevice, StreamDeviceLists, StreamPushRules:
 		// [user_id, ...] for all three.
 		return RowDetail{UserIDs: []string{get(0)}}
+	case StreamStickyEvents:
+		// [room_id, event_id]. Sticky events ARE served in /sync, so this is
+		// the one of the four below that has to wake anybody at all.
+		return RowDetail{RoomIDs: []string{get(0)}}
+	case StreamThreadSubscriptions:
+		// [user_id, room_id, event_id]
+		return RowDetail{UserIDs: []string{get(0)}, RoomIDs: []string{get(1)}}
+	case StreamUnPartialStatedRoom:
+		// [room_id]. A room finishing a faster-remote-join changes what a
+		// non-lazy incremental sync owes it -- Synapse's
+		// forced_newly_joined_room_ids.
+		return RowDetail{RoomIDs: []string{get(0)}}
+	case StreamProfileUpdates:
+		// [user_id, action, affected_fields]. The profile table, not the
+		// m.room.member events a display name change also produces -- those
+		// arrive on the events stream and wake their own rooms.
+		return RowDetail{UserIDs: []string{get(0)}}
 	}
+
+	// Everything else, quarantined_media included, keeps the conservative
+	// answer: no subjects, which the notifier reads as "wake everyone".
+	//
+	// quarantined_media is deliberately left there even though its row --
+	// [origin, media_id, quarantined] -- names neither a room nor a user, and
+	// its position only ever reaches a token. Silencing it would be a change
+	// to when clients are woken that nothing in Synapse's source justifies,
+	// and an over-wake costs a recomputed sync while an under-wake costs a
+	// client hanging until its timeout. Those are not symmetric.
 	return RowDetail{}
 }
 
