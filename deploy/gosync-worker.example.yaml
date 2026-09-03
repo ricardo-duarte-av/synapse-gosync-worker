@@ -368,3 +368,24 @@ log:
   # Human-readable coloured console output instead of JSON. For eyes only;
   # leave it off if anything downstream parses the log.
   pretty: false
+
+# Synapse's own homeserver.yaml, read at EVERY start.
+#
+# Presence needs three facts that live in Synapse's config and change without
+# anybody thinking about this worker: `worker_replication_secret` on a
+# rotation, which instance holds `stream_writers.presence`, and that instance's
+# address in `instance_map`. Copying them here would mean a duplicate that does
+# not fail loudly when it drifts -- it points at a socket that is gone, or
+# presents a secret that is no longer accepted, and presence just quietly stops
+# working.
+#
+# So Synapse's config is the single source of truth and this is the path to it.
+# The worker only reads it, and never logs its contents.
+#
+# IN A CONTAINER THIS MUST BE MOUNTED, read-only:
+#
+#     volumes:
+#       - /opt/matrix/synapse/synapse/homeserver.yaml:/etc/synapse/homeserver.yaml:ro
+#
+# Leave empty to disable everything that depends on it.
+synapse_config: ""
