@@ -23,8 +23,9 @@ import (
 
 // Store holds a pool of read-only connections to Synapse's database.
 type Store struct {
-	pool   *pgxpool.Pool
-	caches *caches
+	pool    *pgxpool.Pool
+	caches  *caches
+	derived *derivedCaches
 
 	// instance_map is append-only, so the name-to-id mapping a stream token
 	// needs is read once and kept for the process's life.
@@ -55,6 +56,17 @@ type Config struct {
 	// "is the cache hiding a bug?" an answerable question.
 	EventStateGroupCacheEntries int
 	FilteredStateCacheEntries   int
+
+	// Derived cache sizes, in entries. Zero takes a default; negative
+	// disables that cache. See internal/store/derived.go for why these are
+	// split into immutable and replication-invalidated.
+	UserFilterCacheEntries        int
+	RoomInfoCacheEntries          int
+	AccessTokenCacheEntries       int
+	RoomSummaryCacheEntries       int
+	HistoryVisibilityCacheEntries int
+	IgnoredUsersCacheEntries      int
+	RoomsForUserCacheEntries      int
 }
 
 // Open connects and verifies the database is reachable.
@@ -85,7 +97,7 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 		pool.Close()
 		return nil, fmt.Errorf("store: ping: %w", err)
 	}
-	return &Store{pool: pool, caches: newCaches(cfg)}, nil
+	return &Store{pool: pool, caches: newCaches(cfg), derived: newDerivedCaches(cfg)}, nil
 }
 
 func newCaches(cfg Config) *caches {

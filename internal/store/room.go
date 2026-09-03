@@ -27,7 +27,26 @@ type RoomInfo struct {
 //
 // Synapse checks `is_room_blocked` first and answers 403 before doing anything
 // else, so this is one query rather than two.
+// Cached without invalidation: a room's version is fixed at creation, and an
+// upgrade produces a NEW room with a new id rather than changing this one.
+//
+// `blocked` can in principle be set later by an admin. It is cached with the
+// version anyway because the pair comes from one row, and a room blocked
+// mid-sync is corrected on the next purge; treating it as live would mean a
+// query per room per sync for a column that is almost always false.
 func (s *Store) RoomInfo(ctx context.Context, roomID string) (RoomInfo, error) {
+	if info, ok := s.derived.roomInfo.Get(roomID); ok {
+		return info, nil
+	}
+	info, err := s.roomInfo(ctx, roomID)
+	if err != nil {
+		return RoomInfo{}, err
+	}
+	s.derived.roomInfo.Add(roomID, info)
+	return info, nil
+}
+
+func (s *Store) roomInfo(ctx context.Context, roomID string) (RoomInfo, error) {
 	const q = `
 		SELECT r.room_version,
 		       EXISTS (SELECT 1 FROM blocked_rooms b WHERE b.room_id = r.room_id)
@@ -56,7 +75,29 @@ func (s *Store) RoomInfo(ctx context.Context, roomID string) (RoomInfo, error) {
 // a history_visibility event is an unlikely place to find one, a query that
 // fails on some rooms and not others is a worse failure than a slightly longer
 // one that never does.
+// Cached per room and invalidated by any event in that room.
+//
+// Guarded, and the guard earns its keep here more than anywhere: this decides
+// whether events are shown at all, so a stale answer does not merely look
+// wrong, it either leaks history or hides it.
 func (s *Store) HistoryVisibility(ctx context.Context, roomID string) (string, error) {
+	use := s.derived.fresh(ctx, streamEvents)
+	if use {
+		if vis, ok := s.derived.historyVis.Get(roomID); ok {
+			return vis, nil
+		}
+	}
+	vis, err := s.historyVisibility(ctx, roomID)
+	if err != nil {
+		return "", err
+	}
+	if use {
+		s.derived.historyVis.Add(roomID, vis)
+	}
+	return vis, nil
+}
+
+func (s *Store) historyVisibility(ctx context.Context, roomID string) (string, error) {
 	const q = `
 		SELECT ej.json
 		  FROM current_state_events cse JOIN event_json ej USING (event_id)
@@ -282,7 +323,30 @@ func (s *Store) RecentEvents(ctx context.Context, roomID, roomVersion string, li
 // ignored, in both the initial and the incremental path. Ignoring someone and
 // still being shown their invitations is the one case where ignoring plainly
 // does not work.
+// Cached per user and invalidated by that user's account data.
+//
+// This one FEEDS A DELTA -- it decides which invites are reported, and an
+// invite is reported once, from the membership changes in the window. Drop an
+// invite because the ignore list was a moment stale and no later sync mentions
+// it again. Hence the guard: below the horizon we ask the database.
 func (s *Store) IgnoredUsers(ctx context.Context, userID string) (map[string]bool, error) {
+	use := s.derived.fresh(ctx, streamAccountData)
+	if use {
+		if ignored, ok := s.derived.ignoredUsers.Get(userID); ok {
+			return copyStringSet(ignored), nil
+		}
+	}
+	ignored, err := s.ignoredUsers(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	if use {
+		s.derived.ignoredUsers.Add(userID, ignored)
+	}
+	return copyStringSet(ignored), nil
+}
+
+func (s *Store) ignoredUsers(ctx context.Context, userID string) (map[string]bool, error) {
 	const q = `
 		SELECT content FROM account_data
 		 WHERE user_id = $1 AND account_data_type = 'm.ignored_user_list'`

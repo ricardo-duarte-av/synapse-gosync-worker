@@ -15,9 +15,34 @@ import (
 // wakeup rather than a wrong answer -- the sync recomputes from the database
 // either way -- but a missed wakeup is a client that hangs until its timeout.
 func rowSubjects(stream, row string) (roomIDs, userIDs []string) {
+	d := rowDetails(stream, row)
+	return d.RoomIDs, d.UserIDs
+}
+
+// RowDetail is what a replication row says, including the parts the notifier
+// does not need.
+//
+// The notifier only ever asks "who should be woken", for which a room id is
+// enough. Cache invalidation needs more: dropping a user's room list requires
+// knowing that this was an m.room.member event and WHOSE, which is in the row
+// and was previously discarded.
+type RowDetail struct {
+	RoomIDs []string
+	UserIDs []string
+	// Type and StateKey are set for state events on the events stream, empty
+	// otherwise.
+	Type     string
+	StateKey string
+}
+
+// rowDetails parses one replication row.
+//
+// Kept as the single parser with rowSubjects as a thin wrapper, so the
+// notifier's behaviour is provably unchanged by anything added here.
+func rowDetails(stream, row string) RowDetail {
 	r := gjson.Parse(row)
 	if !r.IsArray() {
-		return nil, nil
+		return RowDetail{}
 	}
 	a := r.Array()
 	get := func(i int) string {
@@ -30,32 +55,43 @@ func rowSubjects(stream, row string) (roomIDs, userIDs []string) {
 	switch stream {
 	case StreamEvents:
 		// ["ev", [event_id, room_id, type, state_key, ...]]
+		// ["ev", [event_id, room_id, type, state_key, ...]]
 		if len(a) >= 2 && a[0].String() == "ev" {
 			inner := a[1].Array()
+			at := func(i int) string {
+				if i < len(inner) {
+					return inner[i].String()
+				}
+				return ""
+			}
 			if len(inner) >= 2 {
-				return []string{inner[1].String()}, nil
+				return RowDetail{
+					RoomIDs:  []string{inner[1].String()},
+					Type:     at(2),
+					StateKey: at(3),
+				}
 			}
 		}
 	case StreamTyping:
 		// [room_id, [user_id, ...]]
-		return []string{get(0)}, nil
+		return RowDetail{RoomIDs: []string{get(0)}}
 	case StreamReceipts:
 		// [room_id, receipt_type, user_id, event_id, thread_id, data]
-		return []string{get(0)}, []string{get(2)}
+		return RowDetail{RoomIDs: []string{get(0)}, UserIDs: []string{get(2)}}
 	case StreamPresence:
 		// [user_id, state, ...]
-		return nil, []string{get(0)}
+		return RowDetail{UserIDs: []string{get(0)}}
 	case StreamAccountData:
 		// [user_id, room_id, account_data_type]
 		if room := get(1); room != "" {
-			return []string{room}, []string{get(0)}
+			return RowDetail{RoomIDs: []string{room}, UserIDs: []string{get(0)}}
 		}
-		return nil, []string{get(0)}
+		return RowDetail{UserIDs: []string{get(0)}}
 	case StreamToDevice, StreamDeviceLists, StreamPushRules:
 		// [user_id, ...] for all three.
-		return nil, []string{get(0)}
+		return RowDetail{UserIDs: []string{get(0)}}
 	}
-	return nil, nil
+	return RowDetail{}
 }
 
 // updateTyping replaces a room's typist list.

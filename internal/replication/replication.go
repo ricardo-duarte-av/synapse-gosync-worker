@@ -15,6 +15,7 @@ package replication
 
 import (
 	"context"
+	"github.com/tidwall/gjson"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,6 +55,11 @@ const (
 	StreamStickyEvents        = "sticky_events"
 	StreamQuarantinedMedia    = "quarantined_media"
 	StreamProfileUpdates      = "profile_updates"
+	// StreamCaches carries Synapse's own cache invalidations, as
+	// [cache_func, keys, invalidation_ts]. It is the only signal that
+	// something we cached as immutable has been DELETED -- a purged room, a
+	// deleted room -- rather than merely changed.
+	StreamCaches = "caches"
 )
 
 // Listener is notified when a stream advances.
@@ -65,11 +71,30 @@ type Listener interface {
 	OnStreamAdvance(stream string, position int64, roomIDs, userIDs []string)
 }
 
+// Invalidator is told what each replication row makes stale.
+//
+// A second listener rather than an addition to Listener, because the two want
+// opposite defaults. The notifier treats "no subjects" as "wake everybody",
+// which is a harmless over-wake. An invalidator that treated it as "drop
+// everything" would throw the caches away on every row it could not parse, and
+// one that treated it as "drop nothing" would serve stale answers. It needs to
+// make that choice itself, per stream.
+type Invalidator interface {
+	// OnRow is called for every row, in arrival order, before the position is
+	// reported as applied.
+	OnRow(stream string, pos int64, detail RowDetail)
+	// OnRoomInvalidated says one room's derived data is stale.
+	OnRoomInvalidated(roomID string)
+	// OnPurge asks for everything to be dropped.
+	OnPurge(reason string)
+}
+
 // Subscriber follows the replication channel.
 type Subscriber struct {
-	cfg      Config
-	log      zerolog.Logger
-	listener Listener
+	cfg         Config
+	log         zerolog.Logger
+	listener    Listener
+	invalidator Invalidator
 
 	mu sync.RWMutex
 	// live is false whenever the subscription is not known to be healthy.
@@ -86,11 +111,15 @@ type Subscriber struct {
 	// it in a counter on the typing worker and never writes it down.
 	typing map[string][]string
 
-	// onDrop runs when the subscription goes from healthy to not. Set by the
-	// caller rather than called directly so this package need not know about
-	// the store.
-	onDrop func()
+	// onDrop and onConnect run on the edges of the subscription's health. Set
+	// by the caller rather than called directly so this package need not know
+	// about the store.
+	onDrop    func()
+	onConnect func(positions map[string]int64)
 }
+
+// SetInvalidator registers the cache invalidator.
+func (s *Subscriber) SetInvalidator(inv Invalidator) { s.invalidator = inv }
 
 // SetOnDrop registers a callback for the moment the subscription is lost.
 //
@@ -104,6 +133,26 @@ type Subscriber struct {
 // before the first connection, and doing so would make startup log a discard
 // of an empty cache.
 func (s *Subscriber) SetOnDrop(f func()) { s.onDrop = f }
+
+// SetOnConnect registers a callback for the moment the subscription becomes
+// healthy, given the stream positions known at that instant.
+//
+// Those positions are the seed from the database plus anything already seen.
+// A cache armed here starts empty, so claiming that everything up to them has
+// been applied claims it of nothing -- and every entry added afterwards is
+// read from a database that is at or beyond them.
+func (s *Subscriber) SetOnConnect(f func(positions map[string]int64)) { s.onConnect = f }
+
+// Positions returns a copy of every stream position currently known.
+func (s *Subscriber) Positions() map[string]int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]int64, len(s.positions))
+	for k, v := range s.positions {
+		out[k] = v
+	}
+	return out
+}
 
 // New builds a Subscriber.
 func New(cfg Config, log zerolog.Logger, listener Listener) *Subscriber {
@@ -248,6 +297,9 @@ func (s *Subscriber) setLive(live bool) {
 	if was && !live && s.onDrop != nil {
 		s.onDrop()
 	}
+	if !was && live && s.onConnect != nil {
+		s.onConnect(s.Positions())
+	}
 }
 
 // handle parses one replication command.
@@ -285,15 +337,88 @@ func (s *Subscriber) handleRDATA(payload string) {
 		pos = n
 	}
 
-	roomIDs, userIDs := rowSubjects(stream, row)
+	detail := rowDetails(stream, row)
 	if stream == StreamTyping {
 		s.updateTyping(row, pos)
 	}
+
+	// Invalidation runs before the position is advanced and before anything is
+	// woken. A sync that starts between the two would find the cache already
+	// dropped and the position not yet raised, which costs a query; the other
+	// order costs a stale answer.
+	if s.invalidator != nil {
+		if stream == StreamCaches {
+			s.handleCacheInvalidation(row)
+		} else {
+			s.invalidator.OnRow(stream, pos, detail)
+		}
+	}
+
 	if pos > 0 {
 		s.advance(stream, pos)
 	}
 	if s.listener != nil {
-		s.listener.OnStreamAdvance(stream, pos, roomIDs, userIDs)
+		s.listener.OnStreamAdvance(stream, pos, detail.RoomIDs, detail.UserIDs)
+	}
+}
+
+// Synapse's sentinel names for the invalidations that mean data has been
+// destroyed rather than merely changed
+// (storage/databases/main/cache.py). The row is
+// [cache_func, keys, invalidation_ts].
+const (
+	cacheNamePurgeHistory = "ph_cache_fake"
+	cacheNameDeleteRoom   = "dr_cache_fake"
+	cacheNameCurrentState = "cs_cache_fake"
+)
+
+// handleCacheInvalidation acts on the `caches` stream.
+//
+// Only three names matter, and every other row is ignored on purpose. This
+// stream is NOT quiet -- 24 rows in 45 seconds on this deployment -- and it is
+// almost entirely Synapse invalidating its own caches for things this worker
+// does not hold: get_server_key_json_for_remote, _get_server_keys_json,
+// get_destination_retry_timings, _get_bare_e2e_cross_signing_keys. Treating
+// any row as a reason to purge threw the state caches away every two seconds,
+// which measured as 4,910 extra state-group queries on a single initial sync.
+//
+// An unparseable row is ignored rather than treated as destructive, for the
+// same reason: if the row format ever changes, every row becomes unparseable,
+// and a purge on each one is far more damaging than missing the invalidation
+// of a room that has been deleted -- which the next restart or reconnect
+// clears anyway.
+func (s *Subscriber) handleCacheInvalidation(row string) {
+	r := gjson.Parse(row)
+	if !r.IsArray() {
+		metrics.CacheInvalidationRows.WithLabelValues("unparsed").Inc()
+		return
+	}
+	a := r.Array()
+	if len(a) == 0 {
+		metrics.CacheInvalidationRows.WithLabelValues("unparsed").Inc()
+		return
+	}
+
+	name := a[0].String()
+	switch name {
+	case cacheNamePurgeHistory, cacheNameDeleteRoom:
+		// Events and state groups have been deleted. Nothing here can map a
+		// cached state group back to a room, so this is the one case that
+		// genuinely has to drop everything -- and both are rare.
+		metrics.CacheInvalidationRows.WithLabelValues("purge").Inc()
+		s.invalidator.OnPurge(name)
+
+	case cacheNameCurrentState:
+		// A room's current state changed. Keyed by room, so this is targeted.
+		metrics.CacheInvalidationRows.WithLabelValues("room").Inc()
+		if len(a) >= 2 {
+			for _, k := range a[1].Array() {
+				s.invalidator.OnRoomInvalidated(k.String())
+			}
+		}
+
+	default:
+		metrics.CacheInvalidationRows.WithLabelValues("ignored").Inc()
 	}
 }
 

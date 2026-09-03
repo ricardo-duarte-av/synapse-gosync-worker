@@ -59,6 +59,15 @@ func initialSync(r *http.Request, d Deps, verdict auth.Verdict) ([]byte, int, *m
 	if mxErr != nil {
 		return nil, http.StatusBadRequest, mxErr
 	}
+
+	// The guarded caches may only answer for a token that replication has
+	// caught up to. Set once per pass, from the token this response will
+	// actually report; without it every guarded cache falls through to the
+	// database, which is the correct default for anything with no token.
+	ctx = store.WithHorizon(ctx, store.Horizon{
+		Events:      now.Room.MaxStreamPos(),
+		AccountData: now.AccountData,
+	})
 	timeNow, mxErr := nowMillis(r, d)
 	if mxErr != nil {
 		return nil, http.StatusBadRequest, mxErr

@@ -175,7 +175,32 @@ type SummaryMember struct {
 // Mirrors get_room_summary. The ordering is load-bearing: heroes are taken from
 // this list in order, so an unstable sort would rename a room between two
 // otherwise identical syncs.
+// Cached per room, invalidated by any event in that room, and served only
+// when replication has caught up to the token (see derived.go).
+//
+// A summary is a snapshot rather than a delta, so it is the safest of the
+// guarded caches: a stale one is corrected the next time the room appears in
+// a sync. The guard is still applied, because "corrected next time" is not the
+// same as "correct", and this is the cache that runs on every room of an
+// initial sync.
 func (s *Store) RoomSummary(ctx context.Context, roomID string) (MemberSummary, error) {
+	use := s.derived.fresh(ctx, streamEvents)
+	if use {
+		if sum, ok := s.derived.roomSummary.Get(roomID); ok {
+			return copyMemberSummary(sum), nil
+		}
+	}
+	sum, err := s.roomSummary(ctx, roomID)
+	if err != nil {
+		return MemberSummary{}, err
+	}
+	if use {
+		s.derived.roomSummary.Add(roomID, sum)
+	}
+	return copyMemberSummary(sum), nil
+}
+
+func (s *Store) roomSummary(ctx context.Context, roomID string) (MemberSummary, error) {
 	out := MemberSummary{Counts: map[string]int{}}
 
 	const countQ = `

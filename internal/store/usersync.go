@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // RoomForUser is one room the user has a membership in.
@@ -28,7 +29,34 @@ type RoomForUser struct {
 // local_current_membership rather than current_state_events: it is Synapse's
 // own index for this question, and it is maintained for local users only, which
 // is all /initialSync ever asks about.
+// Cached per user and invalidated by that user's membership events.
+//
+// The most dangerous cache here, and the reason the horizon guard exists at
+// all. This list decides which rooms a sync even considers. Serve a stale one
+// under a token that already covers the join and the room is not late -- it is
+// gone, because the client's next `since` starts after the join and no window
+// will ever contain it again.
 func (s *Store) RoomsForUser(ctx context.Context, userID string, memberships []string) ([]RoomForUser, error) {
+	set := strings.Join(memberships, "\x01")
+	use := s.derived.fresh(ctx, streamEvents)
+	if use {
+		if bySet, ok := s.derived.roomsForUser.Get(userID); ok {
+			if rooms, ok := bySet[set]; ok {
+				return copyRoomsForUser(rooms), nil
+			}
+		}
+	}
+	rooms, err := s.roomsForUser(ctx, userID, memberships)
+	if err != nil {
+		return nil, err
+	}
+	if use {
+		s.derived.addRoomsForUser(userID, set, rooms)
+	}
+	return copyRoomsForUser(rooms), nil
+}
+
+func (s *Store) roomsForUser(ctx context.Context, userID string, memberships []string) ([]RoomForUser, error) {
 	const q = `
 		SELECT c.room_id, r.room_version, c.membership, c.event_id, e.sender,
 		       e.stream_ordering, COALESCE(r.is_public, FALSE)

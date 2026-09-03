@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 
 	"github.com/jackc/pgx/v5"
 
@@ -22,7 +23,24 @@ var ErrNoSuchFilter = errors.New("store: no such filter")
 // Keyed on `full_user_id`, not `user_id`: the latter is a legacy localpart
 // column that a background migration is still backfilling the other way round,
 // and two users on different servers could collide on it.
+// Cached without invalidation: `user_filters` is append-only. A client
+// uploads a filter, gets an id back and reuses that id for the life of the
+// login; the row for an id is never rewritten. Only deletion could make this
+// wrong, which is what the `caches` stream and the drop purge cover.
 func (s *Store) UserFilter(ctx context.Context, userID string, filterID int64) ([]byte, error) {
+	key := userID + "\x00" + strconv.FormatInt(filterID, 10)
+	if raw, ok := s.derived.userFilter.Get(key); ok {
+		return copyBytes(raw), nil
+	}
+	raw, err := s.userFilter(ctx, userID, filterID)
+	if err != nil {
+		return nil, err
+	}
+	s.derived.userFilter.Add(key, raw)
+	return copyBytes(raw), nil
+}
+
+func (s *Store) userFilter(ctx context.Context, userID string, filterID int64) ([]byte, error) {
 	const q = `
 		SELECT filter_json
 		  FROM user_filters

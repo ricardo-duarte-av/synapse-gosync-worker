@@ -222,6 +222,27 @@ type Caches struct {
 	// question that can be answered rather than argued about.
 	StateGroupCacheSize    int `yaml:"state_group_cache_size"`
 	FilteredStateCacheSize int `yaml:"filtered_state_cache_size"`
+
+	// Enabled is the master switch for the derived caches -- the ones holding
+	// data that can change, invalidated over replication.
+	//
+	// It exists to be turned OFF. Two builds of one commit, one with caches
+	// and one without, compared against each other with cmd/syncdiff, is the
+	// only way to test a cache: both sides are this worker, so every
+	// legitimate reason two /sync answers differ falls away and what is left
+	// is a cache bug. Defaults to true; set false for that comparison, and to
+	// answer "is the cache hiding this?" about anything else.
+	Enabled bool `yaml:"enabled"`
+
+	// Per-cache sizes in entries. Zero takes a default; negative disables one
+	// cache without disabling the rest.
+	UserFilterCacheSize        int `yaml:"user_filter_cache_size"`
+	RoomInfoCacheSize          int `yaml:"room_info_cache_size"`
+	AccessTokenCacheSize       int `yaml:"access_token_cache_size"`
+	RoomSummaryCacheSize       int `yaml:"room_summary_cache_size"`
+	HistoryVisibilityCacheSize int `yaml:"history_visibility_cache_size"`
+	IgnoredUsersCacheSize      int `yaml:"ignored_users_cache_size"`
+	RoomsForUserCacheSize      int `yaml:"rooms_for_user_cache_size"`
 }
 
 // Testing gates behaviour that exists only to make the comparator possible.
@@ -270,6 +291,10 @@ func Parse(data []byte) (*Config, error) {
 		Listen:  Listen{SocketMode: "0660"},
 		Metrics: Metrics{Addr: ":9201"},
 		Log:     Log{Level: "info"},
+		// Caches on unless the document says otherwise. Set before decoding
+		// rather than after, so an explicit `enabled: false` still wins: the
+		// decoder only writes fields the document actually contains.
+		Caches: Caches{Enabled: true},
 	}
 
 	dec := yaml.NewDecoder(strings.NewReader(string(data)))

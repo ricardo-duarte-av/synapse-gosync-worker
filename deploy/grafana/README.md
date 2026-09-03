@@ -98,6 +98,24 @@ Two changes, and the second is the one that matters:
   too. A panel that silently sums the whole host does not look broken -- it
   looks like a memory leak.
 
+**Cache hit rate is the next panel that will mislead you**, and in the same
+shape as the Process row did. `gosync_cache_hits_total` and
+`gosync_cache_misses_total` are both zero for a cache that is *disarmed*, which
+is indistinguishable on a ratio panel from a cache nothing asks for. Read
+`gosync_cache_armed` beside it: while that is 0 the derived caches are refusing
+to answer, which happens whenever replication is down -- so it is a replication
+alert wearing a cache label.
+
+Two more things about those numbers that look like faults and are not. A cache
+shows misses with no hits for a moment after every reconnect, because a derived
+cache only answers once replication has caught up to the token the response
+will report. And `gosync_cache_invalidation_rows_total{action="purge"}` should
+sit at or near zero: that stream carries roughly a row every two seconds, almost
+all of it Synapse invalidating caches this worker does not have, and an earlier
+version treated all of them as destructive -- which emptied the state caches
+continuously and cost 4,910 extra queries on a single initial sync. A rising
+`purge` means that is back.
+
 ## What this dashboard cannot tell you
 
 Two blind spots, both known and neither instrumented yet:

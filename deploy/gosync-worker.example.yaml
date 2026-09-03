@@ -173,6 +173,42 @@ experimental:
 filter_timeline_limit: 1000
 
 caches:
+  # Master switch for the DERIVED caches -- the ones holding data that can
+  # change, kept fresh by invalidations arriving over replication.
+  #
+  # It exists to be turned off. Two builds of one commit, one with caches and
+  # one without, compared with cmd/syncdiff, is the only way to test a cache:
+  # both sides are this worker, so every legitimate reason two /sync answers
+  # differ falls away and what is left is a cache bug. Also the first thing to
+  # try when a response looks wrong.
+  #
+  # Defaults to true. It does not affect the state-group caches below, which
+  # hold immutable data and are always on.
+  enabled: true
+
+  # Per-cache bounds, in entries. Zero takes the default shown; negative
+  # disables one cache without disabling the rest, which is how to bisect a
+  # suspected cache without rebuilding.
+  #
+  # A derived cache answers only when replication has caught up to the token
+  # the response will report -- see internal/store/derived.go. That is why a
+  # cold worker shows misses with no hits for the first moments after a
+  # reconnect, and why gosync_cache_armed is worth a panel: while it is 0 the
+  # caches are refusing to answer because invalidations are not arriving.
+  #user_filter_cache_size: 5000
+  #room_info_cache_size: 20000
+  #access_token_cache_size: 20000
+  #room_summary_cache_size: 20000
+  #history_visibility_cache_size: 20000
+  #ignored_users_cache_size: 5000
+  #rooms_for_user_cache_size: 5000
+
+  # The immutable state caches. A state group's contents are fixed once
+  # written, so these need no invalidation -- only the purge that happens when
+  # replication drops and rooms could be deleted unseen.
+  #state_group_cache_size: 50000
+  #filtered_state_cache_size: 20000
+
   # How many member events one device's lazy-loading cache remembers, which
   # decides how often a lazy-loading client is re-sent members it already has.
   #

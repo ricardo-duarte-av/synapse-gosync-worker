@@ -77,6 +77,18 @@ var (
 		Help: "Entries held in the immutable state caches.",
 	}, []string{"cache"})
 
+	// CacheInvalidationRows counts rows on Synapse's `caches` stream by what
+	// we did with them.
+	//
+	// Watch `purge`: it should be near zero. This stream is busy with rows
+	// that concern other workers' caches, and an earlier version treated all
+	// of them as destructive, which quietly emptied the state caches every two
+	// seconds. A rising `purge` means that has come back.
+	CacheInvalidationRows = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "gosync_cache_invalidation_rows_total",
+		Help: "Rows seen on Synapse's caches replication stream, by action taken.",
+	}, []string{"action"})
+
 	// DatabaseReadOnly is 1 when the connected role cannot write.
 	//
 	// A gauge rather than a startup check alone, so that a role changed

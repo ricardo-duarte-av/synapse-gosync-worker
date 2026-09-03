@@ -98,6 +98,14 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 		ConnectTimeout:              cfg.Database.ConnectTimeout(),
 		EventStateGroupCacheEntries: cfg.Caches.StateGroupCacheSize,
 		FilteredStateCacheEntries:   cfg.Caches.FilteredStateCacheSize,
+
+		UserFilterCacheEntries:        cacheSize(cfg.Caches.Enabled, cfg.Caches.UserFilterCacheSize),
+		RoomInfoCacheEntries:          cacheSize(cfg.Caches.Enabled, cfg.Caches.RoomInfoCacheSize),
+		AccessTokenCacheEntries:       cacheSize(cfg.Caches.Enabled, cfg.Caches.AccessTokenCacheSize),
+		RoomSummaryCacheEntries:       cacheSize(cfg.Caches.Enabled, cfg.Caches.RoomSummaryCacheSize),
+		HistoryVisibilityCacheEntries: cacheSize(cfg.Caches.Enabled, cfg.Caches.HistoryVisibilityCacheSize),
+		IgnoredUsersCacheEntries:      cacheSize(cfg.Caches.Enabled, cfg.Caches.IgnoredUsersCacheSize),
+		RoomsForUserCacheEntries:      cacheSize(cfg.Caches.Enabled, cfg.Caches.RoomsForUserCacheSize),
 	})
 	if err != nil {
 		return err
@@ -108,6 +116,8 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 	// would be the wrong trade in a deployment that has not run
 	// readonly-role.sql yet, but running against one unknowingly is exactly the
 	// situation the SQL file exists to prevent.
+	metrics.RegisterCaches(db.DerivedCacheStats)
+
 	readOnly, err := db.IsReadOnly(openCtx)
 	if err != nil {
 		return err
@@ -184,9 +194,23 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 	sub.SetOnDrop(func() {
 		groups, filtered := db.CacheLen()
 		db.PurgeCaches()
+		// The derived caches are DISARMED, not merely emptied. Their
+		// invalidations arrive over the connection that has just gone: while
+		// it is down, every answer they could give is a guess about what has
+		// changed since, and a guess is not a fallback.
+		db.DisarmDerivedCaches()
 		log.Warn().Int("state_groups", groups).Int("filtered_state", filtered).
-			Msg("replication dropped; discarded state caches")
+			Msg("replication dropped; discarded state caches and disarmed derived caches")
 	})
+	sub.SetOnConnect(func(positions map[string]int64) {
+		db.ArmDerivedCaches(positions)
+		log.Info().Msg("replication live; derived caches armed")
+	})
+	if cfg.Caches.Enabled {
+		sub.SetInvalidator(&cacheInvalidator{db: db, log: log})
+	} else {
+		log.Warn().Msg("caches.enabled is false: every derived cache is disabled, and this worker will query the database for everything")
+	}
 
 	// Seed from the database so the worker has an answer before any traffic
 	// arrives. Every seeded value is a lower bound that the first row on that
@@ -331,4 +355,16 @@ func newLogger(cfg config.Log) zerolog.Logger {
 		log = zerolog.New(os.Stderr)
 	}
 	return log.Level(level).With().Timestamp().Logger()
+}
+
+// cacheSize resolves one derived cache's bound.
+//
+// A negative size disables a cache in internal/lru, so the master switch is
+// expressed the same way rather than as a second mechanism the caches would
+// each have to check.
+func cacheSize(enabled bool, configured int) int {
+	if !enabled {
+		return -1
+	}
+	return configured
 }
