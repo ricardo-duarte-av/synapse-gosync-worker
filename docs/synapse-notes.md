@@ -43,6 +43,59 @@ literally, or was found only by querying the live database.
   serve a stale sync. `bound_future_token` (`streams/events.py:110`) clamps
   tokens from the future rather than trusting them.
 
+## Sliding sync: `_required_state_changes` (2026-09-03)
+
+### A leaked loop variable decides which members are remembered
+
+At the end of `_required_state_changes`
+(`synapse/handlers/sliding_sync/__init__.py`):
+
+```python
+    for event_type, changed_state_keys in changed_types_to_state_keys.items():
+        old_state_keys = prev_required_state_map.get(event_type, set())
+        request_state_keys = request_required_state_map.get(event_type, set())
+        ...
+
+    # ...after the loop:
+    membership_changes = changes.get(EventTypes.Member, set())
+    if membership_changes and StateValues.LAZY in request_state_keys:
+```
+
+`request_state_keys` is not rebound after the loop. It holds whatever the LAST
+iteration left — the required state of an arbitrary event type, decided by dict
+insertion order, and undefined entirely if the loop body never ran. The evident
+intent is `request_required_state_map.get(EventTypes.Member, set())`.
+
+**We implement the intent and record the deviation.** Reproducing a Python
+scoping accident is not possible in Go in any meaningful way, and it is not
+worth trying: the value only gates `extra_users_to_add_to_lazy_cache`, which is
+a cache of "this member has already been sent". Its worst failure in either
+direction is one member event sent twice.
+
+Flagged rather than fixed upstream because this worker's job is to match
+Synapse, not to correct it — but a difference that cannot be reproduced is not a
+difference that can be matched.
+
+### `$LAZY` reaches the fetch switch only for non-membership types
+
+The `case state_key == StateValues.LAZY` arm inside the "what was added" loop
+looks unreachable: adding `$LAZY` to `m.room.member` is caught by an earlier
+branch that records the change and `continue`s. It is reachable, and only for a
+client that writes `$LAZY` as the state key of some OTHER type —
+`["m.room.topic", "$LAZY"]`, which is meaningless but legal. Without the arm we
+would go looking for a state event whose state key is the literal `$LAZY`.
+Synapse's own test table does not cover it; ours does.
+
+### The remembered-keys cap bounds memory, never the request
+
+`MAX_NUMBER_PREVIOUS_STATE_KEYS_TO_REMEMBER` (100) limits how many state keys
+the effective config carries forward from earlier requests. It never drops a key
+the client has just asked for: past the cap the requested set is kept whole and
+the remainder backfilled from what was previously sent. Getting that backwards
+would silently stop sending state a client explicitly requested, in exactly the
+rooms busy enough to hit the cap.
+
+
 ## Found by the comparator, on 2026-09-01
 
 Four defects that unit tests could never have caught, because each needed a real

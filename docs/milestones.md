@@ -531,15 +531,54 @@ nothing — the metadata is already fetched, so it is an in-memory sort of a few
 hundred entries — and would make our own answers irreproducible, which costs us
 more than it costs a client that has the whole list and `bump_stamp` to sort by.
 
+### `_required_state_changes` — done
+
+The ~380-line pure function that decides what must be re-sent when a room's
+required state changes. One idea repeated in several places holds it together:
+
+> A state key is only forgotten when the client removes it **and** the state
+> behind it changed.
+
+Drop `m.room.topic` from `required_state` and add it back, and the server must
+not re-send a topic the client already has. Everything in there that looks like
+over-complication is a version of that rule.
+
+**It is tested against Synapse's own test table**, extracted mechanically from
+`tests/handlers/test_sliding_sync.py` into
+`internal/slidingsync/testdata/required_state_changes.json` — 31 cases, each run
+twice (with the state deltas and without, as Synapse runs them), 62 assertions.
+Copying the reference implementation's tests rather than writing our own from a
+reading of its source is deliberate: tests we wrote would mostly encode our
+reading of the code, which is the thing that needs checking. The extractor is
+committed beside the fixture so it can be re-run on a Synapse upgrade.
+
+All 62 passed on the first run. Seven mutations were then tried, and **three
+survived the table** — each a real gap, each now covered by a test of our own:
+
+| Mutation the table missed | Now caught by |
+|---|---|
+| The remembered-keys cap removed entirely | `TestRememberedStateKeysAreCapped` |
+| The cap dropping previously-sent keys instead of backfilling | same |
+| `$LAZY` fetched as if it were a state key | `TestLazyIsIgnoredForNonMembershipTypes` |
+
+The cap is covered by two *procedural* tests beside Synapse's table, which
+generate their inputs rather than listing them; those are ported by hand. The
+`$LAZY` case Synapse's tests do not cover at all: the branch looks unreachable
+and is reachable only for a client writing `$LAZY` as the state key of a
+non-membership type.
+
+Three findings are recorded in [synapse-notes.md](synapse-notes.md), including a
+**leaked Python loop variable** that decides which members get remembered as
+lazily loaded. We implement the evident intent and record the deviation:
+reproducing a scoping accident is not possible in Go, and the value only gates a
+cache whose worst failure in either direction is one member event sent twice.
+
 ### Not done, and none of it silently
 
 - **The per-room result**: timeline, `required_state` resolution,
   `prev_batch`, `bump_stamp`, membership counts, notification counts, heroes,
   `invite_state`, `num_live`, `unstable_expanded_timeline`. This is
   `get_room_sync_data`, ~950 lines upstream and the largest single piece.
-- **`_required_state_changes`**, the ~380-line pure function that decides what
-  has to be re-sent when a room's required state changes. Ported next, and
-  unit-tested exhaustively before it is wired to anything.
 - **The membership rewind** (`_get_rewind_changes_to_current_membership_to_token`)
   and **newly-joined/newly-left rooms**. Without them the room list is computed
   from CURRENT membership rather than membership as of the token. That is
