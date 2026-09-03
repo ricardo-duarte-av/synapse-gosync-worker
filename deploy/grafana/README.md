@@ -71,6 +71,33 @@ connected and `to_device.enabled: true`, deletions should track how fast
 messages arrive for that device. Zero means the section is disabled — and that
 client will never receive its room keys.
 
+**The Process row is scoped to this worker, and that took fixing.** Every
+Prometheus client on the server exports `process_resident_memory_bytes` and
+`process_cpu_seconds_total` -- Synapse's Python workers included -- and every
+Go process exports `go_goroutines` and the heap metrics. The `$job` variable
+was declared with `allValue: ".*"`, so selecting *All*, which is the default,
+turned each of those panels into a sum over **all 31 exporters on the host**.
+It read as 4.5GB resident and 50% of a core; the worker was actually using
+23MB and 10%. Nothing else on the dashboard was affected, because every other
+panel reads a `gosync_`-prefixed metric that only this worker exports -- which
+is exactly what made it convincing.
+
+Two changes, and the second is the one that matters:
+
+- The `job` variable no longer sets `allValue`, so *All* expands to the jobs
+  that actually export `gosync_build_info` rather than to `.*`.
+- Every panel reading a metric this worker does not have to itself is joined
+  against `gosync_build_info`:
+
+  ```promql
+  sum(process_resident_memory_bytes{job=~"$job"} and on(instance, job) gosync_build_info)
+  ```
+
+  which cannot report another service's numbers whatever the variable is set
+  to. If you add a panel using any `process_*` or `go_*` metric, add the join
+  too. A panel that silently sums the whole host does not look broken -- it
+  looks like a memory leak.
+
 ## What this dashboard cannot tell you
 
 Two blind spots, both known and neither instrumented yet:

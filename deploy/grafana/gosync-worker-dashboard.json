@@ -56,7 +56,6 @@
         },
         "sort": 1,
         "description": "Populated from the data, so any scrape job name works.",
-        "allValue": ".*",
         "options": []
       },
       {
@@ -1582,7 +1581,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(process_cpu_seconds_total{job=~\"$job\"}[$bucket]))",
+          "expr": "sum(rate(process_cpu_seconds_total{job=~\"$job\"}[$bucket]) and on(instance, job) gosync_build_info)",
           "legendFormat": "",
           "range": false,
           "instant": true,
@@ -1644,7 +1643,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(process_resident_memory_bytes{job=~\"$job\"})",
+          "expr": "sum(process_resident_memory_bytes{job=~\"$job\"} and on(instance, job) gosync_build_info)",
           "legendFormat": "",
           "range": false,
           "instant": true,
@@ -1706,7 +1705,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(go_goroutines{job=~\"$job\"})",
+          "expr": "sum(go_goroutines{job=~\"$job\"} and on(instance, job) gosync_build_info)",
           "legendFormat": "",
           "range": false,
           "instant": true,
@@ -1768,7 +1767,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(go_memstats_heap_inuse_bytes{job=~\"$job\"})",
+          "expr": "sum(go_memstats_heap_inuse_bytes{job=~\"$job\"} and on(instance, job) gosync_build_info)",
           "legendFormat": "",
           "range": false,
           "instant": true,
@@ -1893,7 +1892,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(process_open_fds{job=~\"$job\"})",
+          "expr": "sum(process_open_fds{job=~\"$job\"} and on(instance, job) gosync_build_info)",
           "legendFormat": "",
           "range": false,
           "instant": true,
@@ -1964,7 +1963,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(process_resident_memory_bytes{job=~\"$job\"})",
+          "expr": "sum(process_resident_memory_bytes{job=~\"$job\"} and on(instance, job) gosync_build_info)",
           "legendFormat": "resident",
           "range": true,
           "instant": false,
@@ -1976,7 +1975,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(go_memstats_heap_inuse_bytes{job=~\"$job\"})",
+          "expr": "sum(go_memstats_heap_inuse_bytes{job=~\"$job\"} and on(instance, job) gosync_build_info)",
           "legendFormat": "heap in use",
           "range": true,
           "instant": false,
@@ -1988,7 +1987,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(go_memstats_heap_alloc_bytes{job=~\"$job\"})",
+          "expr": "sum(go_memstats_heap_alloc_bytes{job=~\"$job\"} and on(instance, job) gosync_build_info)",
           "legendFormat": "heap allocated",
           "range": true,
           "instant": false,
@@ -2058,7 +2057,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(go_goroutines{job=~\"$job\"})",
+          "expr": "sum(go_goroutines{job=~\"$job\"} and on(instance, job) gosync_build_info)",
           "legendFormat": "goroutines",
           "range": true,
           "instant": false,
