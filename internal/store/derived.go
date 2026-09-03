@@ -9,6 +9,13 @@ import (
 
 // Derived caches hold answers that survive a request.
 //
+// Sizes are bounds on ENTRIES, not bytes, and what an entry costs differs by a
+// factor of thirty-five across these caches -- an access token id is a few
+// dozen bytes, a 654-room user's room list is 139KB. So the entry counts below
+// are not comparable with each other, and the one to think about before
+// raising is rooms_for_user. A byte bound would express this better; it is not
+// here yet.
+//
 // Two kinds live here, and the difference is the whole design:
 //
 //   - Immutable by construction. A filter is never edited (`user_filters` is
@@ -104,7 +111,12 @@ func newDerivedCaches(cfg Config) *derivedCaches {
 		roomSummary:  lru.New[string, MemberSummary](size(cfg.RoomSummaryCacheEntries, 20000)),
 		historyVis:   lru.New[string, string](size(cfg.HistoryVisibilityCacheEntries, 20000)),
 		ignoredUsers: lru.New[string, map[string]bool](size(cfg.IgnoredUsersCacheEntries, 5000)),
-		roomsForUser: lru.New[string, map[string][]RoomForUser](size(cfg.RoomsForUserCacheEntries, 5000)),
+		// 1000, not 5000 like its neighbours, because its entries are the
+		// only large ones here: measured, a 20-room user costs ~3.9KB, a
+		// 100-room user ~21KB and a 654-room user ~139KB. At 5000 that is
+		// two thirds of a gigabyte for an account like the one this was
+		// built against, in a worker that otherwise runs in 20MB.
+		roomsForUser: lru.New[string, map[string][]RoomForUser](size(cfg.RoomsForUserCacheEntries, 1000)),
 		applied:      map[string]int64{},
 	}
 }

@@ -89,13 +89,18 @@
         "name": "bucket",
         "label": "Bucket",
         "type": "interval",
-        "query": "30s,1m,2m,5m,10m,15m,30m,1h",
+        "query": "30s,1m,2m,5m,10m,15m,30m,1h,2h,3h,6h,12h,1d",
         "current": {
           "text": "5m",
           "value": "5m",
           "selected": true
         },
         "options": [
+          {
+            "text": "auto",
+            "value": "$__auto_interval_bucket",
+            "selected": false
+          },
           {
             "text": "30s",
             "value": "30s",
@@ -135,13 +140,38 @@
             "text": "1h",
             "value": "1h",
             "selected": false
+          },
+          {
+            "text": "2h",
+            "value": "2h",
+            "selected": false
+          },
+          {
+            "text": "3h",
+            "value": "3h",
+            "selected": false
+          },
+          {
+            "text": "6h",
+            "value": "6h",
+            "selected": false
+          },
+          {
+            "text": "12h",
+            "value": "12h",
+            "selected": false
+          },
+          {
+            "text": "1d",
+            "value": "1d",
+            "selected": false
           }
         ],
-        "auto": false,
+        "auto": true,
         "auto_count": 30,
         "auto_min": "30s",
         "hide": 0,
-        "description": "Range window for rate() and histogram_quantile(). rate() needs two samples, so with a 15s scrape 30s is the floor; a single client generates one request every 30 seconds, which is why the default is 5m."
+        "description": "Range window for rate() and histogram_quantile(). rate() needs two samples, so with a 15s scrape 30s is the floor; a single client generates one request every 30 seconds, which is why the default is 5m rather than the floor. `auto` divides the dashboard's time range into 30 buckets and never goes below 30s, which is the right choice when zooming out past a day -- a fixed 5m window over a week asks Prometheus for thousands of points per series and the panel gets slow long before it gets unreadable."
       }
     ]
   },

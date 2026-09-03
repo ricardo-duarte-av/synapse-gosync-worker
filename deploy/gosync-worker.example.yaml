@@ -186,9 +186,39 @@ caches:
   # hold immutable data and are always on.
   enabled: true
 
-  # Per-cache bounds, in entries. Zero takes the default shown; negative
-  # disables one cache without disabling the rest, which is how to bisect a
-  # suspected cache without rebuilding.
+  # Per-cache bounds, in ENTRIES -- not bytes, and that distinction matters
+  # here more than it usually does, because what an entry costs differs by a
+  # factor of thirty-five between these caches. Measured:
+  #
+  #     rooms_for_user      a  20-room user ~3.9KB
+  #                         a 100-room user  ~21KB
+  #                         a 654-room user ~139KB
+  #     everything else     tens of bytes to ~1KB
+  #
+  # So these numbers are not comparable with one another. Raising
+  # room_summary to 50000 costs a few tens of megabytes; raising
+  # rooms_for_user to 5000 costs two thirds of a gigabyte on an account like
+  # the one this was built against, in a worker that otherwise runs in 20MB.
+  #
+  # WHAT DRIVES EACH ONE. Devices are mostly not the answer -- a user with a
+  # hundred logins still has one entry in the caches that hold real memory:
+  #
+  #     per DEVICE   access_token  (one token per login)
+  #                  user_filter   (each client uploads its own)
+  #     per USER     rooms_for_user, ignored_users
+  #     per ROOM     room_summary, history_visibility, room_info,
+  #                  and the state caches below
+  #
+  # A hundred devices on one account therefore adds ~200 small entries and no
+  # meaningful memory. A hundred *users*, or a user in six hundred rooms, is
+  # what moves the number. Size room-keyed caches to the rooms on the server;
+  # size rooms_for_user to the number of local users who actually sync here,
+  # and downwards if they are in many rooms.
+  #
+  # Zero takes the default shown; negative disables one cache without
+  # disabling the rest, which is how to bisect a suspected cache without
+  # rebuilding. Watch gosync_cache_evictions_total to tell a cache that is too
+  # small from one that is simply not asked.
   #
   # A derived cache answers only when replication has caught up to the token
   # the response will report -- see internal/store/derived.go. That is why a
@@ -201,7 +231,7 @@ caches:
   #room_summary_cache_size: 20000
   #history_visibility_cache_size: 20000
   #ignored_users_cache_size: 5000
-  #rooms_for_user_cache_size: 5000
+  #rooms_for_user_cache_size: 1000
 
   # The immutable state caches. A state group's contents are fixed once
   # written, so these need no invalidation -- only the purge that happens when
