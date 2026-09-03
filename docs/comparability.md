@@ -158,6 +158,20 @@ Nine independent sources of divergence:
     validates the sort — `internal/slidingsync/parity_live_test.go` does exactly
     this split.
 
+11. **Clock-derived fields nest.** `unsigned.age` is the obvious one, and each
+    side recomputes it from its own clock. What is easy to miss is that a
+    bundled aggregation contains **whole events** -- a thread's `latest_event`,
+    a `redacted_because` -- each carrying its own `unsigned.age`. A comparator
+    that strips only the outer one reports three differences that are nothing of
+    the kind, which is exactly what the first sliding sync comparison did.
+
+    MSC4354's `unsigned.msc4354_sticky_duration_ttl_ms` is the same shape: it is
+    a *remaining* lifetime, so it too is computed per request. Measured drift
+    between the two sides on this deployment: 85 ms for `age`, 86 ms for the
+    sticky TTL.
+
+    **Strip clock-derived fields recursively, not at the top level.**
+
 **Consequence.** The proxy/shadow/canary ladder is *not* built first: it depends
 on comparing two answers to the same live request, which sources 1–4 make
 unsound. The replay comparator comes first; the ladder is retrofitted at M9, and

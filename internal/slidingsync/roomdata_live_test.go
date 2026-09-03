@@ -80,9 +80,9 @@ func eventIDsOf(events []json.RawMessage) []string {
 func TestLiveRoomDataParity(t *testing.T) {
 	d, _, now, ctx := liveDeps(t)
 	nowMS := time.Now().UnixMilli()
-	userID := os.Getenv("GOSYNC_PARITY_USER")
-	if userID == "" {
-		t.Skip("GOSYNC_PARITY_USER not set")
+	userID, deviceID := refWhoami(t)
+	if want := os.Getenv("GOSYNC_PARITY_USER"); want != "" && want != userID {
+		t.Fatalf("the token belongs to %s, not %s", userID, want)
 	}
 
 	const timelineLimit = 5
@@ -92,9 +92,17 @@ func TestLiveRoomDataParity(t *testing.T) {
 		{"m.room.encryption", ""},
 	}
 
+	// A wide window on purpose. With five rooms the sample was every room the
+	// test account has at `shared` history visibility, and a build that threw
+	// the visibility filter's results away compared clean -- verified by
+	// mutation, 2026-09-03. The rooms that can tell the difference are the ones
+	// further down the list.
+	//
+	// Order is irrelevant here: rooms are matched by ID, not by position, so the
+	// full-range sort skip (comparability.md, source 10) does not apply.
 	body := map[string]any{
 		"lists": map[string]any{"all": map[string]any{
-			"ranges":         [][2]int{{0, 4}},
+			"ranges":         [][2]int{{0, 49}},
 			"required_state": required,
 			"timeline_limit": timelineLimit,
 		}},
@@ -108,7 +116,7 @@ func TestLiveRoomDataParity(t *testing.T) {
 		CommonRoomParameters: CommonRoomParameters{
 			RequiredState: required, TimelineLimit: timelineLimit,
 		},
-		Ranges: [][2]int{{0, 4}},
+		Ranges: [][2]int{{0, 49}},
 	}}}
 	lists, err := ComputeRoomLists(ctx, d, userID, req, now)
 	if err != nil {
@@ -120,7 +128,7 @@ func TestLiveRoomDataParity(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	compared := 0
+	compared, tolerated := 0, 0
 	for _, roomID := range lists.Lists["all"].Ops[0].RoomIDs {
 		theirRoom, ok := theirs[roomID]
 		if !ok {
@@ -140,6 +148,7 @@ func TestLiveRoomDataParity(t *testing.T) {
 			From:     nil,
 			To:       now,
 			NowMS:    nowMS,
+			DeviceID: deviceID,
 			Previous: &slidingstore.PerConnectionState{},
 			New:      newState,
 			IsDM:     lists.DMRooms[roomID],
@@ -190,8 +199,8 @@ func TestLiveRoomDataParity(t *testing.T) {
 				// this path yet. Recorded in docs/milestones.md; this
 				// comparison tightens to include `unsigned` when they are.
 				for i := range gotIDs {
-					g := withoutUnsigned(t, ours.Timeline[i])
-					w := withoutUnsigned(t, theirRoom.Timeline[i])
+					g, w, leaked := normalise(t, ours.Timeline[i], theirRoom.Timeline[i])
+					tolerated += leaked
 					if g != w {
 						t.Errorf("timeline event %s differs:\n  ours %s\n  ref  %s", gotIDs[i], g, w)
 					}
@@ -207,9 +216,10 @@ func TestLiveRoomDataParity(t *testing.T) {
 					if !ok {
 						continue
 					}
-					if withoutUnsigned(t, g) != withoutUnsigned(t, w) {
-						t.Errorf("required_state %s differs:\n  ours %s\n  ref  %s",
-							k, withoutUnsigned(t, g), withoutUnsigned(t, w))
+					gs, ws, leaked := normalise(t, g, w)
+					tolerated += leaked
+					if gs != ws {
+						t.Errorf("required_state %s differs:\n  ours %s\n  ref  %s", k, gs, ws)
 					}
 				}
 			}
@@ -240,7 +250,8 @@ func TestLiveRoomDataParity(t *testing.T) {
 			t.Errorf("%s: no room config recorded for the connection", roomID)
 		}
 	}
-	t.Logf("compared %d rooms", compared)
+	t.Logf("compared %d rooms, tolerated %d prev_content/prev_sender cache leaks (either side)",
+		compared, tolerated)
 }
 
 // Lazy-loaded members are what a real client asks for, and the selection
@@ -256,7 +267,7 @@ func TestLiveRoomDataParityWithLazyMembers(t *testing.T) {
 	required := [][2]string{{"m.room.member", "$LAZY"}, {"m.room.name", ""}}
 	body := map[string]any{
 		"lists": map[string]any{"all": map[string]any{
-			"ranges": [][2]int{{0, 2}}, "required_state": required, "timeline_limit": 5,
+			"ranges": [][2]int{{0, 49}}, "required_state": required, "timeline_limit": 5,
 		}},
 	}
 	theirs := refRooms(t, body)
@@ -266,7 +277,7 @@ func TestLiveRoomDataParityWithLazyMembers(t *testing.T) {
 
 	req := &Request{Lists: map[string]List{"all": {
 		CommonRoomParameters: CommonRoomParameters{RequiredState: required, TimelineLimit: 5},
-		Ranges:               [][2]int{{0, 2}},
+		Ranges:               [][2]int{{0, 49}},
 	}}}
 	lists, err := ComputeRoomLists(ctx, d, userID, req, now)
 	if err != nil {
@@ -378,20 +389,83 @@ func equalStrings(a, b []string) bool {
 
 var _ = store.StateKey{}
 
-// withoutUnsigned normalises an event for comparison by dropping `unsigned`.
+// normalise prepares two events for comparison and reports how many tolerated
+// differences it removed.
 //
-// `age` could never match -- it is recomputed from the wall clock on each side
-// (comparability.md, source 1) -- and `membership` and `transaction_id` are not
-// populated on this path yet. Dropping the whole object rather than three named
-// fields keeps the reason in one place: when the visibility filter is wired in,
-// this becomes withoutAge again and the comparison tightens.
-func withoutUnsigned(t *testing.T, raw json.RawMessage) string {
+// Two things are dropped, and only two:
+//
+//   - `unsigned.age`, from both sides. It is recomputed from the wall clock on
+//     each side and can never match (comparability.md, source 1).
+//   - `unsigned.prev_content` and `prev_sender`, from BOTH sides. Synapse
+//     writes these into its shared cached event -- its own comment says "This
+//     mutates the cached event, but that's fine" -- so whether they appear
+//     depends on whether some other request happened to load that event first.
+//
+// Both sides, and that is a correction to what synapse-notes.md said. It
+// recorded the leak as upstream-only, because that is the only direction
+// classic sync can show: classic sync calls AttachPrevContent deliberately, so
+// OUR side is never the surprising one there. Sliding sync does not, and over
+// 30 rooms of the second account this produced 128 events where the reference
+// had the fields and we did not, and ONE where we had them and it did not
+// ($15131056291173STGyq:t2l.io, an m.room.topic). The non-determinism runs both
+// ways; asserting one direction would make this test flake.
+func normalise(t *testing.T, ours, ref json.RawMessage) (string, string, int) {
+	t.Helper()
+	a, b := decode(t, ours), decode(t, ref)
+	dropClockDerived(a)
+	dropClockDerived(b)
+
+	leaked := dropPrevContent(a) + dropPrevContent(b)
+	return encodeJSON(t, a), encodeJSON(t, b), leaked
+}
+
+func decode(t *testing.T, raw json.RawMessage) map[string]any {
 	t.Helper()
 	var v map[string]any
 	if err := json.Unmarshal(raw, &v); err != nil {
 		t.Fatal(err)
 	}
-	delete(v, "unsigned")
+	return v
+}
+
+// clockDerived are the `unsigned` fields each side recomputes from its own wall
+// clock, so they can never match: `age`, and MSC4354's remaining sticky
+// lifetime. Measured drift between the two sides on this deployment: 85 ms and
+// 86 ms respectively -- small, and unbounded in principle.
+var clockDerived = []string{"age", "msc4354_sticky_duration_ttl_ms"}
+
+// dropClockDerived removes those fields RECURSIVELY.
+//
+// Recursively because a bundle nests whole events: a thread's latest reply and
+// a `redacted_because` each carry their own `unsigned`, computed from the same
+// clock and differing by the same handful of milliseconds. Dropping only the
+// outer one leaves three "differences" that are nothing of the kind -- which is
+// exactly what the first version of this test reported.
+func dropClockDerived(v map[string]any) {
+	for key, val := range v {
+		switch t := val.(type) {
+		case map[string]any:
+			if key == "unsigned" {
+				for _, f := range clockDerived {
+					delete(t, f)
+				}
+			}
+			dropClockDerived(t)
+			if key == "unsigned" && len(t) == 0 {
+				delete(v, key)
+			}
+		case []any:
+			for _, item := range t {
+				if m, ok := item.(map[string]any); ok {
+					dropClockDerived(m)
+				}
+			}
+		}
+	}
+}
+
+func encodeJSON(t *testing.T, v map[string]any) string {
+	t.Helper()
 	out, err := json.Marshal(v)
 	if err != nil {
 		t.Fatal(err)
@@ -406,4 +480,22 @@ func byStateKey(events []json.RawMessage) map[string]json.RawMessage {
 		out[k] = e
 	}
 	return out
+}
+
+func dropPrevContent(v map[string]any) int {
+	u, ok := v["unsigned"].(map[string]any)
+	if !ok {
+		return 0
+	}
+	n := 0
+	for _, field := range []string{"prev_content", "prev_sender"} {
+		if _, present := u[field]; present {
+			delete(u, field)
+			n++
+		}
+	}
+	if len(u) == 0 {
+		delete(v, "unsigned")
+	}
+	return n
 }

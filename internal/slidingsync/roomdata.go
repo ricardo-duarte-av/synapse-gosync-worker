@@ -7,6 +7,7 @@ import (
 	"github.com/tidwall/gjson"
 
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/clientevent"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/eventfilter"
 
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/slidingstore"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/store"
@@ -307,6 +308,7 @@ func buildTimeline(
 		limited bool
 		err     error
 	)
+
 	if timelineFrom == nil {
 		events, newKey, limited, err = d.Store.PaginateBackwards(
 			ctx, req.RoomID, req.Room.RoomVersion, req.Config.TimelineLimit, toBound)
@@ -318,17 +320,95 @@ func buildTimeline(
 		return out, nil, nil, nil, err
 	}
 
+	// Visibility. Synapse calls filter_and_transform_events_for_client here, and
+	// skipping it does not merely lose a field -- it serves history the caller
+	// may not be entitled to. It is invisible in a room with `shared` history
+	// visibility, which is most of them, so it has to be structural rather than
+	// remembered: the same internal/eventfilter both endpoints use.
+	//
+	// is_peeking is "not joined": someone reading a world-readable room they
+	// are not in gets the rules for an outsider.
+	filtered, err := eventfilter.ForClient(ctx, d.Store, req.RoomID, req.UserID,
+		events, req.Room.Membership != "join", req.NowMS, nil)
+	if err != nil {
+		return out, nil, nil, nil, err
+	}
+	events = filtered.Events
+
+	// Redactions. A redacted event must be served pruned, with
+	// `unsigned.redacted_because` explaining why -- Synapse applies this on
+	// READ rather than rewriting the stored event, so an endpoint that skips it
+	// serves the ORIGINAL CONTENT. Not a cosmetic difference, and invisible
+	// until a compared room happens to have a redaction in its recent timeline.
+	ids := make([]string, len(events))
+	for i, e := range events {
+		ids[i] = e.EventID
+	}
+	redactions, err := d.Store.Redactions(ctx, ids)
+	if err != nil {
+		return out, nil, nil, nil, err
+	}
+
+	// Bundled aggregations, for a limited timeline only -- which an initial
+	// room always is. A client given the whole history can aggregate for
+	// itself; one given a window cannot see the replies that fall outside it.
+	var aggs map[string]eventfilter.Aggregation
+	var nested map[string]store.StateEvent
+	if limited {
+		vis, err := d.Store.VisibilityExtras(ctx, req.RoomID, req.UserID, nil)
+		if err != nil {
+			return out, nil, nil, nil, err
+		}
+		var nestedIDs []string
+		aggs, nestedIDs, err = eventfilter.BundleAggregations(
+			ctx, d.Store, req.UserID, events, vis.IgnoredSenders)
+		if err != nil {
+			return out, nil, nil, nil, err
+		}
+		if len(aggs) > 0 {
+			// A bundle carries whole events -- a thread's latest reply, an
+			// edit -- so they have to be loaded and serialised too.
+			want := append([]string(nil), nestedIDs...)
+			for _, a := range aggs {
+				if a.ReplaceID() != "" {
+					want = append(want, a.ReplaceID())
+				}
+			}
+			nested, err = d.Store.EventsByID(ctx, want, req.Room.RoomVersion)
+			if err != nil {
+				return out, nil, nil, nil, err
+			}
+		}
+	}
+
 	out.events = events
-	for _, e := range events {
+	for i, e := range events {
 		// The stored PDU is not a client event. Room version 3 and later derive
 		// the event ID from a hash rather than storing it, `unsigned` is rebuilt
 		// from an allowlist rather than passed through, and a redacted event has
 		// to be pruned on read. Every one of those is invisible until compared
 		// against Synapse -- the first version of this emitted stored JSON and
 		// produced five timeline events with empty event IDs.
-		body, err := clientevent.Serialize(e.Stored, req.NowMS, d.EventConfig(req.UserID))
+		stored := e.Stored
+		// MSC4115: the caller's membership at this event, which the visibility
+		// decision has just worked out. Reading it from anywhere else would
+		// mean resolving the same state a second time.
+		if i < len(filtered.Memberships) {
+			stored.Membership = filtered.Memberships[i]
+		}
+		cfg := d.EventConfig(req.UserID, req.DeviceID, req.TokenID)
+		if err := eventfilter.AttachRedaction(&stored, redactions, req.NowMS, cfg); err != nil {
+			return out, nil, nil, nil, err
+		}
+		body, err := clientevent.Serialize(stored, req.NowMS, cfg)
 		if err != nil {
 			return out, nil, nil, nil, err
+		}
+		if agg, ok := aggs[e.EventID]; ok {
+			body, err = eventfilter.AttachAggregations(body, agg, aggs, nested, req.NowMS, cfg)
+			if err != nil {
+				return out, nil, nil, nil, err
+			}
 		}
 		out.raw = append(out.raw, json.RawMessage(body))
 	}

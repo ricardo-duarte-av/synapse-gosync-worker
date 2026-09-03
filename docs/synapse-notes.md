@@ -140,8 +140,16 @@ state read of that cached event carries it.
 
 Whether it appears depends on whether some other request happened to load that
 event first. It is not reproducible and not ours to imitate. `syncdiff`
-tolerates it **upstream-only** and counts it; emitting it where Synapse does not
-would still be our bug, and is still reported.
+tolerates it **upstream-only** and counts it.
+
+**Correction, 2026-09-03: the leak runs both ways.** "Upstream-only" was true of
+everything classic sync could show, because classic sync calls
+`AttachPrevContent` deliberately -- our side is never the surprising one there.
+Sliding sync does not, and comparing 30 rooms of the second account produced
+**128** events where the reference had the fields and we did not, and **one**
+where we had them and it did not (`$15131056291173STGyq:t2l.io`, an
+`m.room.topic`). So a sliding sync comparison has to tolerate it symmetrically;
+asserting either direction makes the test flake rather than catch anything.
 
 This is the same hazard gopro's CLAUDE.md §4 recorded from the federation side.
 

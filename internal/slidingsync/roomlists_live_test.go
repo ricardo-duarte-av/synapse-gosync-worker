@@ -45,7 +45,10 @@ func liveDeps(t *testing.T) (Deps, string, streamtoken.Token, context.Context) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return Deps{Store: db}, userID, now, ctx
+	// The deployment has MSC4354 on, and a sticky event then carries its
+	// remaining lifetime. Leaving it off here made every sticky event differ
+	// from the reference for a reason that was ours, not the code's.
+	return Deps{Store: db, MSC4354Enabled: true}, userID, now, ctx
 }
 
 func allRoomsList(limit int) *Request {

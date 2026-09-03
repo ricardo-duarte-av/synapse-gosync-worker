@@ -116,31 +116,6 @@ func timelineEventIDs(messages []store.TimelineEvent) []string {
 	return out
 }
 
-// attachRedaction marks an event as redacted and renders the redaction event
-// that explains it.
-//
-// `redacted_because` is a fully serialised client event, not an id, so it goes
-// through the same serialiser -- which is why this cannot live in the store.
-func attachRedaction(stored *clientevent.Stored, redactions map[string]store.Redaction,
-	timeNow int64, cfg clientevent.Config) error {
-
-	r, ok := redactions[stored.EventID]
-	if !ok {
-		return nil
-	}
-	eventID, roomID, eventType, body, meta := r.RedactionEvent()
-	because, err := clientevent.Serialize(clientevent.Stored{
-		EventID: eventID, RoomID: roomID, Type: eventType,
-		JSON: body, InternalMetadata: meta, RoomVersion: stored.RoomVersion,
-	}, timeNow, cfg)
-	if err != nil {
-		return err
-	}
-	stored.RedactedBy = eventID
-	stored.RedactedBecause = because
-	return nil
-}
-
 // accountDataEvents renders account data entries as client events.
 func accountDataEvents(entries []store.AccountDataEntry) ([]json.RawMessage, error) {
 	out := make([]json.RawMessage, 0, len(entries))

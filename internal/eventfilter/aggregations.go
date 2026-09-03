@@ -1,4 +1,4 @@
-package handlers
+package eventfilter
 
 import (
 	"context"
@@ -10,8 +10,8 @@ import (
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/store"
 )
 
-// aggregation is the bundle attached to one event's `unsigned.m.relations`.
-type aggregation struct {
+// Aggregation is the bundle attached to one event's `unsigned.m.relations`.
+type Aggregation struct {
 	thread     *threadAggregation
 	replaceID  string
 	references []string
@@ -23,7 +23,7 @@ type threadAggregation struct {
 	participated  bool
 }
 
-// bundleAggregations works out the relations to bundle into a timeline.
+// BundleAggregations works out the relations to bundle into a timeline.
 //
 // Synapse only does this for a `limited` timeline (an initial sync always is):
 // when a client receives the whole history it can aggregate for itself, but
@@ -37,8 +37,8 @@ type threadAggregation struct {
 //     just its presence.
 //   - Threads are only computed for events that are not themselves a relation,
 //     so a reply inside a thread does not sprout a nested thread summary.
-func bundleAggregations(ctx context.Context, d Deps, userID string,
-	messages []store.TimelineEvent, ignored map[string]bool) (map[string]aggregation, []string, error) {
+func BundleAggregations(ctx context.Context, db *store.Store, userID string,
+	messages []store.TimelineEvent, ignored map[string]bool) (map[string]Aggregation, []string, error) {
 
 	candidates := make([]string, 0, len(messages))
 	for _, ev := range messages {
@@ -51,7 +51,7 @@ func bundleAggregations(ctx context.Context, d Deps, userID string,
 		return nil, nil, nil
 	}
 
-	relTypes, err := d.Store.RelationTypesOf(ctx, candidates)
+	relTypes, err := db.RelationTypesOf(ctx, candidates)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -73,9 +73,9 @@ func bundleAggregations(ctx context.Context, d Deps, userID string,
 		return nil, nil, nil
 	}
 
-	out := map[string]aggregation{}
+	out := map[string]Aggregation{}
 
-	summaries, err := d.Store.ThreadSummaries(ctx, threadRoots)
+	summaries, err := db.ThreadSummaries(ctx, threadRoots)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -88,7 +88,7 @@ func bundleAggregations(ctx context.Context, d Deps, userID string,
 		for id := range summaries {
 			roots = append(roots, id)
 		}
-		participated, err := d.Store.ThreadsParticipated(ctx, roots, userID)
+		participated, err := db.ThreadsParticipated(ctx, roots, userID)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -99,7 +99,7 @@ func bundleAggregations(ctx context.Context, d Deps, userID string,
 			for u := range ignored {
 				senders = append(senders, u)
 			}
-			ignoredCounts, err = d.Store.ThreadRepliesBySender(ctx, roots, senders)
+			ignoredCounts, err = db.ThreadRepliesBySender(ctx, roots, senders)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -133,7 +133,7 @@ func bundleAggregations(ctx context.Context, d Deps, userID string,
 	// own edits.
 	withExtra := append(append([]string(nil), bundled...), extra...)
 
-	edits, err := d.Store.ApplicableEdits(ctx, withExtra)
+	edits, err := db.ApplicableEdits(ctx, withExtra)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -143,7 +143,7 @@ func bundleAggregations(ctx context.Context, d Deps, userID string,
 		out[id] = agg
 	}
 
-	refs, err := d.Store.References(ctx, withExtra, ignored)
+	refs, err := db.References(ctx, withExtra, ignored)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -159,12 +159,19 @@ func bundleAggregations(ctx context.Context, d Deps, userID string,
 	return out, extra, nil
 }
 
-// attachAggregations writes `unsigned.m.relations` onto a serialised event.
+// ReplaceID is the event ID of the latest edit, or empty if there is none.
+//
+// Exported alone rather than the whole struct: the only thing a caller outside
+// this package needs is which extra events to load, and the rest of the bundle
+// is assembled by AttachAggregations.
+func (a Aggregation) ReplaceID() string { return a.replaceID }
+
+// AttachAggregations writes `unsigned.m.relations` onto a serialised event.
 //
 // The nested events -- a thread's latest reply and an edit -- are full client
 // events, serialised with the same config, so this runs after the outer event
 // has been rendered rather than inside the serialiser.
-func attachAggregations(body json.RawMessage, agg aggregation, extra map[string]aggregation,
+func AttachAggregations(body json.RawMessage, agg Aggregation, extra map[string]Aggregation,
 	events map[string]store.StateEvent, timeNow int64, cfg clientevent.Config) (json.RawMessage, error) {
 
 	relations := map[string]any{}
@@ -195,7 +202,7 @@ func attachAggregations(body json.RawMessage, agg aggregation, extra map[string]
 			}
 			// The latest reply carries its own aggregations, one level deep.
 			if nested, ok := extra[agg.thread.latestEventID]; ok {
-				serialised, err = attachAggregations(serialised, nested, nil, events, timeNow, cfg)
+				serialised, err = AttachAggregations(serialised, nested, nil, events, timeNow, cfg)
 				if err != nil {
 					return nil, err
 				}

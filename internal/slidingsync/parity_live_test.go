@@ -242,3 +242,36 @@ func TestLiveListParityOnTheFullSet(t *testing.T) {
 			len(refRooms))
 	}
 }
+
+// refWhoami asks the reference who the token belongs to.
+//
+// The device ID is needed for `unsigned.transaction_id`: a client sees its OWN
+// transaction ids and nobody else's, so a comparison run without it silently
+// drops the field on every event the test account sent. Asked over HTTP rather
+// than read from `access_tokens`, for the reason in docs/auth.md.
+func refWhoami(t *testing.T) (userID, deviceID string) {
+	t.Helper()
+	c, token := refClient(t)
+	req, err := http.NewRequest(http.MethodGet,
+		"http://localhost/_matrix/client/v3/account/whoami", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatalf("whoami: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Skipf("whoami returned %d on the reference socket", resp.StatusCode)
+	}
+	var parsed struct {
+		UserID   string `json:"user_id"`
+		DeviceID string `json:"device_id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		t.Fatal(err)
+	}
+	return parsed.UserID, parsed.DeviceID
+}

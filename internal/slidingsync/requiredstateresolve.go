@@ -6,6 +6,7 @@ import (
 	"sort"
 
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/clientevent"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/eventfilter"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/slidingstore"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/store"
 )
@@ -285,6 +286,12 @@ func (d Deps) serialiseState(
 	if err != nil {
 		return err
 	}
+	// State is as redactable as a message: an m.room.topic in current state can
+	// have been redacted just as a message can.
+	redactions, err := d.Store.Redactions(ctx, wanted)
+	if err != nil {
+		return err
+	}
 
 	ordered := make([]store.StateKey, 0, len(stateIDs))
 	for k := range stateIDs {
@@ -306,7 +313,12 @@ func (d Deps) serialiseState(
 		// Serialised the same way the timeline is, and for the same reasons:
 		// a v3+ PDU carries no event_id of its own, `unsigned` is rebuilt from
 		// an allowlist, and a redacted event is pruned on read.
-		body, err := clientevent.Serialize(ev.Stored, req.NowMS, d.EventConfig(req.UserID))
+		stored := ev.Stored
+		cfg := d.EventConfig(req.UserID, req.DeviceID, req.TokenID)
+		if err := eventfilter.AttachRedaction(&stored, redactions, req.NowMS, cfg); err != nil {
+			return err
+		}
+		body, err := clientevent.Serialize(stored, req.NowMS, cfg)
 		if err != nil {
 			return err
 		}

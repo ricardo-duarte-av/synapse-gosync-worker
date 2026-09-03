@@ -9,6 +9,7 @@ import (
 
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/auth"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/clientevent"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/eventfilter"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/filter"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/matrixerr"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/server"
@@ -729,7 +730,7 @@ func incrementalRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, u
 		return nil, err
 	}
 
-	var aggs map[string]aggregation
+	var aggs map[string]eventfilter.Aggregation
 	var nestedIDs []string
 	var nested map[string]store.StateEvent
 	if limited {
@@ -744,8 +745,8 @@ func incrementalRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, u
 		if len(aggs) > 0 {
 			want := append([]string(nil), nestedIDs...)
 			for _, a := range aggs {
-				if a.replaceID != "" {
-					want = append(want, a.replaceID)
+				if a.ReplaceID() != "" {
+					want = append(want, a.ReplaceID())
 				}
 			}
 			nested, err = d.Store.EventsByID(ctx, want, room.RoomVersion)

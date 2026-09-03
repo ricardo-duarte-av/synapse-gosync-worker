@@ -75,14 +75,19 @@ type Deps struct {
 // room version 3 and later. Sharing internal/clientevent rather than writing a
 // second serialiser is the whole reason the two endpoints agree byte for byte
 // on an event body.
-func (d Deps) EventConfig(userID string) clientevent.Config {
+func (d Deps) EventConfig(userID, deviceID string, tokenID int64) clientevent.Config {
 	return clientevent.Config{
 		// The same shape /sync emits: `room_id` is stripped, because the room
 		// is the key of the map the event sits in. Verified against the
 		// reference, whose timeline events carry exactly content, event_id,
 		// origin_server_ts, sender, state_key, type and unsigned.
-		Format:         clientevent.FormatV2NoRoomID,
-		Requester:      clientevent.Requester{UserID: userID},
+		Format: clientevent.FormatV2NoRoomID,
+		// The device and token identify the caller's SESSION, which is what
+		// `unsigned.transaction_id` is keyed on: a client sees its own
+		// transaction ids and nobody else's.
+		Requester: clientevent.Requester{
+			UserID: userID, DeviceID: deviceID, TokenID: tokenID,
+		},
 		MSC4354Enabled: d.MSC4354Enabled,
 	}
 }

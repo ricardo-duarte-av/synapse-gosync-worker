@@ -15,6 +15,7 @@ import (
 
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/auth"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/clientevent"
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/eventfilter"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/filter"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/matrixerr"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/metrics"
@@ -511,7 +512,7 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 	// Bundled aggregations, for a limited timeline only -- which an initial
 	// sync always is. A client given the whole history can aggregate for
 	// itself; one given a window cannot see the replies outside it.
-	var aggs map[string]aggregation
+	var aggs map[string]eventfilter.Aggregation
 	var nestedIDs []string
 	if limited {
 		vis, err := d.Store.VisibilityExtras(ctx, room.RoomID, userID, nil)
@@ -529,8 +530,8 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 	if len(aggs) > 0 {
 		want := append([]string(nil), nestedIDs...)
 		for _, a := range aggs {
-			if a.replaceID != "" {
-				want = append(want, a.replaceID)
+			if a.ReplaceID() != "" {
+				want = append(want, a.ReplaceID())
 			}
 		}
 		nested, err = d.Store.EventsByID(ctx, want, room.RoomVersion)

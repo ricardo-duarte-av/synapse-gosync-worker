@@ -606,24 +606,70 @@ Two things worth carrying forward:
   and sharing it is why the two endpoints agree byte for byte on an event body.
   The parity test caught this immediately; nothing else would have.
 
+### `internal/eventfilter`, and three gaps the widened comparison found
+
+Closing the visibility gap meant lifting `filterVisible` out of
+`internal/handlers`, where sliding sync could not reach it. Two more things came
+with it once the comparison could see far enough: **redactions** and **bundled
+aggregations**. All three now live in `internal/eventfilter` and are used by
+both endpoints; `internal/handlers` keeps thin wrappers so fifteen call sites
+are untouched and the move's diff is readable.
+
+**Redaction was the serious one.** Synapse applies redactions on READ rather
+than rewriting the stored event, so an endpoint that skips that step serves the
+**original content** of a redacted event. Not cosmetic, and invisible until a
+compared room happened to have a redaction in its recent timeline.
+
+`unsigned.membership` (MSC4115) and `unsigned.transaction_id` fell out of the
+same change — membership is what the visibility decision produces, and
+`transaction_id` needs the requester's device, now asked for over `/whoami`
+rather than read from `access_tokens`.
+
+The parity comparison now covers **all of `unsigned`** except what genuinely
+cannot match, and runs on all three accounts.
+
+#### What the widened window taught
+
+The first version compared the top five rooms and found nothing. Five rooms was
+every room the test account has at `shared` history visibility, so a build that
+threw the visibility filter's results away compared **clean**. Widening to fifty
+found five real differences in one run: three bundled aggregations, one
+redaction, and one `prev_content`.
+
+Two of those five turned out to be the comparator's fault, and both are now in
+[comparability.md](comparability.md) as source 11:
+
+- **Clock-derived fields nest.** A bundle contains whole events — a thread's
+  `latest_event`, a `redacted_because` — each with its own `unsigned.age`.
+  Stripping only the outer one reports three differences that are nothing of the
+  kind. MSC4354's sticky TTL is the same shape. Drift measured here: 85 ms and
+  86 ms.
+- **The `prev_content` cache leak runs BOTH ways.** synapse-notes.md recorded it
+  as upstream-only, which was true of everything classic sync could show —
+  classic sync calls `AttachPrevContent` deliberately, so our side is never the
+  surprising one there. Sliding sync does not: 128 events where the reference
+  had it and we did not, and one where we had it and it did not. The note is
+  corrected.
+
+#### What is still not exercised
+
+**The filter's event-DROPPING path.** Its membership output is verified against
+Synapse event by event, so the call is exercised and its result used. But no
+room on any of the three accounts actually withholds anything from these users:
+the `history_visibility: invited` rooms are ones the account has been in from
+the start, and the deepest such room holds 15 events, all of which the reference
+returns. Discarding the filter's event list still compares clean.
+
+That is a property of the available rooms, not evidence. What makes it
+acceptable is that the dropping rules have unit tests in `internal/visibility`
+and the same `eventfilter.ForClient` is on classic sync's path, which syncdiff
+exercises — verified after the lift: `sync`, `incremental_sync` and
+`initial_sync` all still match, with only the documented tolerated categories.
+Sharing one implementation is the entire argument; a second copy is what would
+make this untested.
+
 ### Not done, and none of it silently
 
-- **History-visibility filtering on the sliding sync timeline.** The single
-  most important gap, and a correctness one rather than a missing field:
-  `filter_and_transform_events_for_client` decides per event what a caller may
-  see, and we do not call it here. Classic sync does — `filterVisible` in
-  `internal/handlers/visibility.go` — but that function takes `handlers.Deps`
-  and cannot be reached from `internal/slidingsync`. Lifting it into a package
-  both can use is the next change. The parity tests pass without it only
-  because the compared rooms are all `shared` history visibility; that is a
-  property of the sample, not evidence the path is right. The endpoint stays
-  unregistered until this is done.
-
-- **`unsigned.membership` (MSC4115) and `unsigned.transaction_id`** on timeline
-  events. Both fall out of the change above: membership is attached by the
-  visibility filter, and `transaction_id` needs the requester's device. The
-  parity test drops `unsigned` from both sides for now and says so; it tightens
-  to comparing everything but `age` once they are populated.
 - **The membership rewind** (`_get_rewind_changes_to_current_membership_to_token`)
   and **newly-joined/newly-left rooms**. Without them the room list is computed
   from CURRENT membership rather than membership as of the token. That is
