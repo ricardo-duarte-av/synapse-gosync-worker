@@ -324,3 +324,89 @@ func (s *Store) LastEventPosBefore(
 	}
 	return out, rows.Err()
 }
+
+// LastBumpEventPosBefore returns the stream position of the newest event of one
+// of the given types at or below a position.
+//
+// The fallback path for a room's bump_stamp: the precomputed
+// sliding_sync_joined_rooms.bump_stamp is the answer whenever it is safely
+// below the sync's token, and this is what runs when it is not. Rejected and
+// outlier events are excluded, because a client cannot see them and would
+// otherwise have a room sorted by an event that does not exist for it.
+func (s *Store) LastBumpEventPosBefore(
+	ctx context.Context, roomID string, eventTypes []string, maxStream int64,
+) (int64, bool, error) {
+	const q = `
+		SELECT e.stream_ordering FROM events e
+		  LEFT JOIN rejections USING (event_id)
+		 WHERE e.room_id = $1 AND e.type = ANY($2)
+		   AND e.stream_ordering <= $3
+		   AND NOT e.outlier AND rejection_reason IS NULL
+		 ORDER BY e.stream_ordering DESC LIMIT 1`
+	var pos int64
+	err := s.queryRow(ctx, "LastBumpEventPosBefore", q, roomID, eventTypes, maxStream).Scan(&pos)
+	if isNoRows(err) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("store: last bump event: %w", err)
+	}
+	return pos, true, nil
+}
+
+// MemberCounts returns the number of members in each membership state.
+//
+// Cheaper than RoomSummary when only the counts are wanted: the summary orders
+// members so that heroes are stable, and that ordering is the expensive part.
+func (s *Store) MemberCounts(ctx context.Context, roomID string) (map[string]int, error) {
+	const q = `
+		SELECT membership, count(*) FROM current_state_events
+		 WHERE room_id = $1 AND type = 'm.room.member'
+		 GROUP BY membership`
+	rows, err := s.query(ctx, "MemberCounts", q, roomID)
+	if err != nil {
+		return nil, fmt.Errorf("store: member counts: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var membership *string
+		var n int
+		if err := rows.Scan(&membership, &n); err != nil {
+			return nil, fmt.Errorf("store: member counts: %w", err)
+		}
+		if membership != nil {
+			out[*membership] = n
+		}
+	}
+	return out, rows.Err()
+}
+
+// InviteOrKnockStrippedState returns the stripped state a client is given for a
+// room it has been invited to or knocked on, plus the membership event itself.
+//
+// Such a room has no timeline and no resolvable state for this user -- they are
+// not in it -- so `unsigned.invite_room_state` (or `knock_room_state`) is all
+// there is to identify it by. Synapse appends a stripped copy of the membership
+// event to that list, which is what tells the client who invited them.
+func (s *Store) InviteOrKnockStrippedState(
+	ctx context.Context, eventID string,
+) (stripped []byte, membershipEvent []byte, err error) {
+	const q = `SELECT json FROM event_json WHERE event_id = $1`
+	var raw string
+	if err := s.queryRow(ctx, "InviteOrKnockStrippedState", q, eventID).Scan(&raw); err != nil {
+		if isNoRows(err) {
+			return nil, nil, nil
+		}
+		return nil, nil, fmt.Errorf("store: invite state: %w", err)
+	}
+	membership := gjson.Get(raw, "content.membership").String()
+	key := "unsigned.invite_room_state"
+	if membership == "knock" {
+		key = "unsigned.knock_room_state"
+	}
+	if v := gjson.Get(raw, key); v.Exists() && v.IsArray() {
+		stripped = []byte(v.Raw)
+	}
+	return stripped, []byte(raw), nil
+}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -50,6 +51,40 @@ func refClient(t *testing.T) (*http.Client, string) {
 			},
 		},
 	}, strings.TrimSpace(string(raw))
+}
+
+// refRaw posts a sliding sync request to the reference and returns the body.
+func refRaw(t *testing.T, c *http.Client, token string, body map[string]any) []byte {
+	t.Helper()
+	if _, ok := body["conn_id"]; !ok {
+		body["conn_id"] = fmt.Sprintf("gosync-parity-%d", time.Now().UnixNano())
+	}
+	enc, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost,
+		"http://localhost/_matrix/client/unstable/org.matrix.simplified_msc3575/sync?timeout=0",
+		bytes.NewReader(enc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatalf("reference: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("reference returned %d", resp.StatusCode)
+	}
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }
 
 func refList(t *testing.T, c *http.Client, token string, body map[string]any) (int, []string) {

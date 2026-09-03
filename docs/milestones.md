@@ -573,12 +573,57 @@ lazily loaded. We implement the evident intent and record the deviation:
 reproducing a scoping accident is not possible in Go, and the value only gates a
 cache whose worst failure in either direction is one member event sent twice.
 
+### `get_room_sync_data` — mostly done, and compared against Synapse
+
+The per-room result: the timeline, `required_state` resolution, heroes,
+membership counts, the room name and avatar, `bump_stamp`, `limited`,
+`num_live`, `prev_batch` and the invite/knock stripped state.
+
+**Compared field by field against a real Synapse sync worker**, five rooms on
+the test account and five on the 654-room account, for an initial request:
+`name`, `avatar`, `joined_count`, `invited_count`, `is_dm`, `heroes`,
+`limited`, `bump_stamp`, the `required_state` selection, the timeline's event
+IDs and order, and the event bodies byte for byte. Also with
+`["m.room.member","$LAZY"]`, which selects members differently.
+
+Only an *initial* request is compared. An incremental one is a delta against
+per-connection state, and the two sides keep that in different tables with
+different positions — putting them in the same place needs a lockstep driver,
+which is syncdiff's job.
+
+Two things worth carrying forward:
+
+- **`notification_count` and `highlight_count` are hard-coded zeros upstream.**
+  Synapse's own comment: *"These are just dummy values. We could potentially
+  just remove these since notifications can only really be done correctly on
+  the client anyway (encrypted rooms)."* Ours are zero for parity, not by
+  omission.
+- **The stored PDU is not a client event.** The first version emitted
+  `event_json.json` directly and produced five timeline events with **empty
+  event IDs** — room version 3 and later derive the ID from a hash rather than
+  storing it. `unsigned` also has to be rebuilt from an allowlist and a redacted
+  event pruned on read. All of that already exists in `internal/clientevent`,
+  and sharing it is why the two endpoints agree byte for byte on an event body.
+  The parity test caught this immediately; nothing else would have.
+
 ### Not done, and none of it silently
 
-- **The per-room result**: timeline, `required_state` resolution,
-  `prev_batch`, `bump_stamp`, membership counts, notification counts, heroes,
-  `invite_state`, `num_live`, `unstable_expanded_timeline`. This is
-  `get_room_sync_data`, ~950 lines upstream and the largest single piece.
+- **History-visibility filtering on the sliding sync timeline.** The single
+  most important gap, and a correctness one rather than a missing field:
+  `filter_and_transform_events_for_client` decides per event what a caller may
+  see, and we do not call it here. Classic sync does — `filterVisible` in
+  `internal/handlers/visibility.go` — but that function takes `handlers.Deps`
+  and cannot be reached from `internal/slidingsync`. Lifting it into a package
+  both can use is the next change. The parity tests pass without it only
+  because the compared rooms are all `shared` history visibility; that is a
+  property of the sample, not evidence the path is right. The endpoint stays
+  unregistered until this is done.
+
+- **`unsigned.membership` (MSC4115) and `unsigned.transaction_id`** on timeline
+  events. Both fall out of the change above: membership is attached by the
+  visibility filter, and `transaction_id` needs the requester's device. The
+  parity test drops `unsigned` from both sides for now and says so; it tightens
+  to comparing everything but `age` once they are populated.
 - **The membership rewind** (`_get_rewind_changes_to_current_membership_to_token`)
   and **newly-joined/newly-left rooms**. Without them the room list is computed
   from CURRENT membership rather than membership as of the token. That is

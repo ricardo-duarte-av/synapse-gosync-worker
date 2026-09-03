@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/clientevent"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/slidingstore"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/store"
 	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/streamtoken"
@@ -56,11 +57,34 @@ type ListOp struct {
 	RoomIDs []string
 }
 
-// Deps are what room-list computation needs from the rest of the worker.
+// Deps are what sliding sync needs from the rest of the worker.
 type Deps struct {
 	Store *store.Store
 	// ExcludedRooms are rooms configured never to appear in a sync.
 	ExcludedRooms map[string]bool
+
+	// MSC4354Enabled mirrors the experimental flag; a sticky event carries its
+	// remaining lifetime when it is on.
+	MSC4354Enabled bool
+}
+
+// EventConfig builds the serialisation config for one requester.
+//
+// Sliding sync serialises events exactly as classic sync does -- same
+// allowlisted `unsigned`, same redaction on read, same event_id insertion for
+// room version 3 and later. Sharing internal/clientevent rather than writing a
+// second serialiser is the whole reason the two endpoints agree byte for byte
+// on an event body.
+func (d Deps) EventConfig(userID string) clientevent.Config {
+	return clientevent.Config{
+		// The same shape /sync emits: `room_id` is stripped, because the room
+		// is the key of the map the event sits in. Verified against the
+		// reference, whose timeline events carry exactly content, event_id,
+		// origin_server_ts, sender, state_key, type and unsigned.
+		Format:         clientevent.FormatV2NoRoomID,
+		Requester:      clientevent.Requester{UserID: userID},
+		MSC4354Enabled: d.MSC4354Enabled,
+	}
 }
 
 // ComputeRoomLists resolves a request's lists and subscriptions into rooms.

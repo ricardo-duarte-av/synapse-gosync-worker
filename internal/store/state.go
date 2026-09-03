@@ -7,6 +7,8 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/streamtoken"
 )
 
 // StateKey identifies a piece of room state.
@@ -182,4 +184,114 @@ func (s *Store) PurgeCaches() {
 // CacheLen reports the cached entry counts, for metrics.
 func (s *Store) CacheLen() (eventGroups, filteredState int) {
 	return s.caches.eventStateGroup.Len(), s.caches.filteredState.Len()
+}
+
+// stateGroupTypeFilteredQuery is stateGroupFilteredQuery with an additional
+// wildcard clause: whole event types, not just named (type, state_key) pairs.
+//
+// Sliding sync's `required_state` can ask for every state key of a type --
+// `["m.room.member", "*"]` is the common one -- and resolving the room's whole
+// state to satisfy that would read the largest table in the database for a room
+// that may have a hundred thousand state events. Synapse pushes the same
+// wildcard down to SQL (`StateFilter` with a `None` state key); this is the
+// same idea in one more clause.
+const stateGroupTypeFilteredQuery = `
+	WITH RECURSIVE sgs(state_group) AS (
+		VALUES($1::bigint)
+	  UNION ALL
+		SELECT prev_state_group FROM state_group_edges e, sgs s
+		WHERE s.state_group = e.state_group
+	)
+	SELECT DISTINCT ON (sgs2.type, sgs2.state_key)
+	       sgs2.type, sgs2.state_key, sgs2.event_id,
+	       COALESCE(m.membership, ''),
+	       COALESCE(ej.json::jsonb -> 'content' ->> 'history_visibility', '')
+	  FROM state_groups_state sgs2
+	  INNER JOIN sgs USING (state_group)
+	  LEFT JOIN room_memberships m ON m.event_id = sgs2.event_id
+	  LEFT JOIN event_json ej ON ej.event_id = sgs2.event_id
+	 WHERE (sgs2.type, sgs2.state_key) IN (SELECT * FROM unnest($2::text[], $3::text[]))
+	    OR sgs2.type = ANY($4::text[])
+	 ORDER BY sgs2.type, sgs2.state_key, sgs2.state_group DESC`
+
+// StateForGroupWithWildcards resolves state at a group for named keys plus
+// every key of the given types.
+func (s *Store) StateForGroupWithWildcards(
+	ctx context.Context, group int64, keys []StateKey, wildcardTypes []string,
+) (map[StateKey]StateEntry, error) {
+
+	if len(wildcardTypes) == 0 {
+		return s.FilteredStateForGroup(ctx, group, keys)
+	}
+
+	cacheKey := filteredStateKey(group, keys) + "\x03" + strings.Join(sortedCopy(wildcardTypes), "\x02")
+	if state, ok := s.caches.filteredState.Get(cacheKey); ok {
+		return state, nil
+	}
+
+	types := make([]string, len(keys))
+	stateKeys := make([]string, len(keys))
+	for i, k := range keys {
+		types[i], stateKeys[i] = k.Type, k.StateKey
+	}
+
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, fmt.Errorf("store: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `SET LOCAL enable_seqscan = off`); err != nil {
+		return nil, fmt.Errorf("store: disable seqscan: %w", err)
+	}
+
+	rows, err := txQuery(ctx, tx, "StateForGroupWithWildcards",
+		stateGroupTypeFilteredQuery, group, types, stateKeys, wildcardTypes)
+	if err != nil {
+		return nil, fmt.Errorf("store: state for group with wildcards: %w", err)
+	}
+	defer rows.Close()
+
+	state := map[StateKey]StateEntry{}
+	for rows.Next() {
+		var k StateKey
+		var e StateEntry
+		if err := rows.Scan(&k.Type, &k.StateKey, &e.EventID, &e.Membership, &e.HistoryVisibility); err != nil {
+			return nil, fmt.Errorf("store: state for group with wildcards: %w", err)
+		}
+		state[k] = e
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: state for group with wildcards: %w", err)
+	}
+	s.caches.filteredState.Add(cacheKey, state)
+	return state, nil
+}
+
+// StateAtWithWildcards resolves state at a stream position for named keys plus
+// every key of the given types.
+func (s *Store) StateAtWithWildcards(
+	ctx context.Context, roomID string, key streamtoken.RoomKey,
+	keys []StateKey, wildcardTypes []string,
+) (map[StateKey]string, error) {
+
+	group, ok, err := s.stateGroupAt(ctx, roomID, key)
+	if err != nil || !ok {
+		return map[StateKey]string{}, err
+	}
+	entries, err := s.StateForGroupWithWildcards(ctx, group, keys, wildcardTypes)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[StateKey]string, len(entries))
+	for k, e := range entries {
+		out[k] = e.EventID
+	}
+	return out, nil
+}
+
+func sortedCopy(xs []string) []string {
+	out := append([]string(nil), xs...)
+	sort.Strings(out)
+	return out
 }
