@@ -34,6 +34,16 @@ type Config struct {
 	// by ID. Synapse's default is 100; -1 disables the cap.
 	FilterTimelineLimit *int `yaml:"filter_timeline_limit"`
 
+	// SynapseConfig is the path to Synapse's own homeserver.yaml, read at
+	// every start.
+	//
+	// Presence needs three facts that live there and change without anybody
+	// thinking about this worker: worker_replication_secret, which instance
+	// holds stream_writers.presence, and that instance's address in
+	// instance_map. Copying them here would create a duplicate that fails
+	// silently when it drifts. Empty disables everything that depends on it.
+	SynapseConfig string `yaml:"synapse_config"`
+
 	Listen       Listen       `yaml:"listen"`
 	Database     Database     `yaml:"database"`
 	ToDevice     ToDevice     `yaml:"to_device"`
