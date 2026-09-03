@@ -180,8 +180,70 @@ var (
 	// PresenceRelayFailures counts calls the writer refused or that never
 	// arrived. Sustained non-zero means users this worker serves are drifting
 	// offline while looking served.
-	PresenceRelayFailures = promauto.NewCounter(prometheus.CounterOpts{
+	//
+	// The reason separates the two failures that need different fixes and are
+	// otherwise indistinguishable from a flat count:
+	//
+	//	unreachable  the socket or host did not accept a connection. The
+	//	             presence writer moved, or homeserver.yaml points at a
+	//	             path this container cannot see.
+	//	refused      it answered, with something other than 200. Almost always
+	//	             a rotated worker_replication_secret.
+	//	timeout      it accepted and did not answer in time. The writer is
+	//	             overloaded, not misconfigured.
+	//	client_gone  the syncing client hung up mid-relay. Not our failure and
+	//	             not the writer's; here so it cannot inflate the others.
+	PresenceRelayFailures = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "gosync_presence_relay_failures_total",
-		Help: "Presence relays that failed.",
+		Help: "Presence relays that failed, by reason.",
+	}, []string{"reason"})
+
+	// PresenceRelayDuration times one call to the presence writer.
+	//
+	// This is the only synchronous outbound call on the sync path, so a writer
+	// that gets slow makes THIS worker slow -- once per device per relay
+	// interval, which is rare but not never. The client's own timeout bounds
+	// it; this is how you see it coming before that bound is reached.
+	PresenceRelayDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name: "gosync_presence_relay_duration_seconds",
+		Help: "Time for one presence relay to Synapse's presence writer.",
+		// A unix socket on the same host: the interesting range is sub-
+		// millisecond to a few hundred, with the tail out to the 5s timeout.
+		Buckets: []float64{
+			.0005, .001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5,
+		},
 	})
 )
+
+// Presence relay failure reasons.
+const (
+	PresenceUnreachable = "unreachable"
+	PresenceRefused     = "refused"
+	PresenceTimeout     = "timeout"
+	PresenceClientGone  = "client_gone"
+)
+
+// RegisterPresence exposes the relay throttle's size.
+//
+// It is a gauge rather than a counter because it is a live population: one
+// entry per (user, device) whose presence we have relayed recently. Compare it
+// against the number of distinct devices actually syncing -- if it climbs
+// without bound, entries are never being dropped and the map is a leak.
+func RegisterPresence(tracked func() int) {
+	// Create the failure series at zero.
+	//
+	// A CounterVec exports nothing for a label it has never seen, so without
+	// this the failures panel reads "No data" until the first failure -- which
+	// is indistinguishable from a broken scrape, on the panel whose whole job
+	// is to be zero. An alert on a series that does not exist does not fire.
+	for _, reason := range []string{
+		PresenceUnreachable, PresenceRefused, PresenceTimeout, PresenceClientGone,
+	} {
+		PresenceRelayFailures.WithLabelValues(reason)
+	}
+
+	prometheus.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "gosync_presence_devices_tracked",
+		Help: "Devices held in the presence relay throttle.",
+	}, func() float64 { return float64(tracked()) }))
+}

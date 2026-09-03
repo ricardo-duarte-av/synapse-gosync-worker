@@ -190,6 +190,7 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 			if err != nil {
 				return err
 			}
+			metrics.RegisterPresence(presenceClient.Tracked)
 			log.Info().
 				Str("writer", sc.PresenceWriter.Name).
 				Str("address", sc.PresenceWriter.Socket+sc.PresenceWriter.URL).

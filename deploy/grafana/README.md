@@ -216,3 +216,46 @@ Two blind spots, both known and neither instrumented yet:
   That is `cmd/syncdiff`'s job, and it currently prints to a terminal rather
   than exporting anything. Agreement with Synapse is measured by running the
   comparator, not by watching graphs.
+
+## The presence row
+
+Presence is the only thing this worker *tells* Synapse rather than asks it, and
+it is the only synchronous outbound call on the sync path. That makes its panels
+read differently from everything else here.
+
+**`Relays vs suppressed` should look lopsided, and that is health.** Clients
+sync in a loop; the writer's timers are far coarser; one relay per device per
+25 seconds is enough to hold a user online. Suppressed should dwarf delivered by
+one or two orders of magnitude. If the lines converge, the throttle has stopped
+working and every sync is making an HTTP call to another worker before it can
+answer. Measured on a quiet worker: 14 syncs produced **1 relay and 13
+suppressed**, which is exactly the intended shape.
+
+**`Relay failures by reason` is four series because each needs a different
+fix**, and a flat count would hide which:
+
+| reason | what it means | what to do |
+|---|---|---|
+| `refused` | the writer answered non-200 | almost always a rotated `worker_replication_secret` |
+| `unreachable` | nothing accepted the connection | the presence writer moved, or the container cannot see the socket `homeserver.yaml` names |
+| `timeout` | it accepted and never answered | the writer is overloaded, not misconfigured |
+| `client_gone` | the syncing client hung up mid-relay | nothing; it is here so it cannot inflate the other three |
+
+All four are created at zero on startup. A `CounterVec` exports nothing for a
+label it has never seen, so without that the panel would read "No data" until
+the first failure — indistinguishable from a broken scrape, on the panel whose
+entire job is to sit at zero. An alert on a series that does not exist never
+fires.
+
+**Sustained failures do not show up anywhere else.** The syncs still succeed, at
+full speed, with correct bodies. The only symptom is that users this worker
+serves drift offline to everyone else — which no other panel here can see,
+because from this worker's point of view nothing is wrong.
+
+**`Relay latency` is a unix socket on the same host**, so p99 belongs in
+single-digit milliseconds; the first call after startup is slower because it
+includes connection setup. The client's 5s timeout is the ceiling, and anything
+approaching it is already slowing the syncs that happen to land on a relay.
+
+**`Devices in the throttle` should plateau** at roughly the number of distinct
+devices syncing. Unbounded growth is a leak in the map, not a busy server.

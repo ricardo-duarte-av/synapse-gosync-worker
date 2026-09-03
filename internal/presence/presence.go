@@ -33,9 +33,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -102,6 +104,9 @@ type Config struct {
 	// Timeout bounds one call to the writer. Zero means five seconds.
 	Timeout time.Duration
 }
+
+// errWriterRefused marks a writer that answered with a non-200.
+var errWriterRefused = errors.New("presence: writer refused")
 
 type key struct {
 	userID   string
@@ -211,14 +216,17 @@ func (c *Client) SetState(ctx context.Context, userID, deviceID, state string, i
 	}
 	c.mu.Unlock()
 
-	if err := c.post(ctx, userID, deviceID, state, isSync); err != nil {
+	start := c.now()
+	err := c.post(ctx, userID, deviceID, state, isSync)
+	metrics.PresenceRelayDuration.Observe(c.now().Sub(start).Seconds())
+	if err != nil {
 		// A failed relay must not be remembered as sent, or the throttle would
 		// suppress retries for a whole interval and the user would look offline
 		// until it expired.
 		c.mu.Lock()
 		delete(c.last, k)
 		c.mu.Unlock()
-		metrics.PresenceRelayFailures.Inc()
+		metrics.PresenceRelayFailures.WithLabelValues(failureReason(err)).Inc()
 		return err
 	}
 	metrics.PresenceRelays.Inc()
@@ -286,9 +294,35 @@ func (c *Client) post(ctx context.Context, userID, deviceID, state string, isSyn
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("presence: writer answered %d", resp.StatusCode)
+		// Distinguished from a transport failure: the writer is reachable and
+		// said no, which is almost always a rotated replication secret.
+		return fmt.Errorf("%w: answered %d", errWriterRefused, resp.StatusCode)
 	}
 	return nil
+}
+
+// failureReason classifies a relay failure into something actionable.
+//
+// The three real ones need different fixes and look identical in a flat count:
+// a moved writer, a rotated secret, and an overloaded writer.
+func failureReason(err error) string {
+	switch {
+	case errors.Is(err, context.Canceled):
+		// The syncing client hung up while we were relaying. Neither our fault
+		// nor the writer's, and kept out of the counts that are.
+		return metrics.PresenceClientGone
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, os.ErrDeadlineExceeded):
+		return metrics.PresenceTimeout
+	case errors.Is(err, errWriterRefused):
+		return metrics.PresenceRefused
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return metrics.PresenceTimeout
+	}
+	// Anything left reached neither a listener nor an answer: a socket path
+	// that does not exist, a container that cannot see it, a refused dial.
+	return metrics.PresenceUnreachable
 }
 
 func quote(s string) string {
