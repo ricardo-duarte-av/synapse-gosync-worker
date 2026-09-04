@@ -18,6 +18,18 @@ listen:
   # own worker sockets are 0666 because nginx runs in another container as a
   # different uid, which does not apply to us.
   socket_mode: "0660"
+  #
+  # TCP instead. Set EXACTLY ONE of socket and addr; the worker refuses to start
+  # with both or neither, rather than silently preferring one.
+  #
+  #   addr: "127.0.0.1:8009"
+  #
+  # Bind to a loopback or private address, not to a public interface. Requests
+  # still need a valid access token -- this is not an open door -- but the
+  # worker terminates no TLS and rate-limits nothing, so anything reaching it
+  # directly has skipped the two things the reverse proxy is there for. And
+  # `testing.allow_pin_now` becomes remotely reachable, which is exactly the
+  # setting that must never face a client. `socket_mode` is ignored here.
 
 # Read-only access to Synapse's PostgreSQL.
 #
@@ -34,6 +46,14 @@ listen:
 # SELECT, and the role enforces it. The one exception is to-device deletion,
 # which gets its own role and its own pool below.
 database:
+  # A libpq connection string, so unix or TCP is just the `host` field:
+  #
+  #   host=/var/sockets                       unix socket, peer auth by uid
+  #   host=db.internal port=5432 sslmode=require password=...   TCP
+  #
+  # Peer authentication only works over a socket. Over TCP the role needs a
+  # password or another pg_hba method, and `sslmode` is worth setting explicitly
+  # -- libpq's default (`prefer`) will silently fall back to plaintext.
   dsn: "host=/var/sockets user=gopro_ro dbname=synapse-db"
   # Bounded well below Synapse's own pool so this worker cannot starve it.
   max_conns: 16
@@ -60,6 +80,9 @@ database:
 # would delete messages that client has not yet seen. Point it at test devices.
 to_device:
   enabled: false
+  # Same libpq string as `database` above; TCP works the same way. Keep it a
+  # SEPARATE role even on the same host -- that separation is the whole safety
+  # argument for this section.
   dsn: "host=/var/sockets user=gosync_inbox dbname=synapse-db"
   max_conns: 4
   connect_timeout_seconds: 10
@@ -92,6 +115,7 @@ to_device:
 # Run deploy/sliding-sync-role.sql as a superuser first.
 sliding_sync:
   enabled: false
+  # Same libpq string as `database` above; TCP works the same way.
   dsn: "host=/var/sockets user=gosync_ss dbname=synapse-db"
   max_conns: 8
   connect_timeout_seconds: 10
@@ -121,7 +145,15 @@ sliding_sync:
 # HTTP `replication` listener and instance_map entry, which only writers need.
 replication:
   enabled: true
-  # Unix socket path, or host:port.
+  # Unix socket path, or host:port. A leading "/" selects the socket, so the
+  # two forms are:
+  #
+  #   address: /var/sockets/keydb     unix socket
+  #   address: keydb.internal:6379    TCP
+  #
+  # There is NO TLS option here. A Redis that requires TLS cannot be reached;
+  # use a socket or a private network. Worth knowing before pointing this at a
+  # managed instance.
   address: /var/sockets/keydb
   # MUST equal Synapse's server_name: the channel is named after it, and one
   # Redis can carry several homeservers' streams. Subscribing to the wrong
@@ -144,6 +176,16 @@ replication:
 # whoami also returns the device_id, which /sync cannot work without: to-device
 # messages and device-list updates are per-device, not per-user.
 auth:
+  # Set EXACTLY ONE of whoami_socket and whoami_url.
+  #
+  #   whoami_socket: /var/sockets/nginx/av-request-worker-1.sock
+  #   whoami_url: "https://aguiarvieira.pt"
+  #
+  # The URL form is the whole origin, not a path -- the worker appends
+  # /_matrix/client/v3/account/whoami itself. Point it at a client-API worker or
+  # at the public host; going through the public host means every token
+  # validation is a round trip through your reverse proxy, so prefer the socket
+  # or an internal address when there is one.
   whoami_socket: /var/sockets/nginx/av-request-worker-1.sock
   positive_ttl: 5m
   # A rejection is cached too, so a bad token cannot become a stream of requests
@@ -167,6 +209,14 @@ auth:
 # under /var/sockets/nginx/ by Synapse's worker convention even though nginx
 # routes nothing to it.
 reference:
+  # Set EXACTLY ONE of socket and url -- but note that NOTHING READS THIS BLOCK
+  # today. It is validated and then ignored: cmd/syncdiff takes the reference
+  # from its own -ref-socket flag, which has no url counterpart, so the url form
+  # here has no effect anywhere. Recorded rather than quietly deleted because
+  # the validation is real and would reject a config that set both.
+  #
+  #   socket: /var/sockets/nginx/av-sync-worker-2.sock
+  #   url: "http://av-sync-worker-2:8083"   # accepted, currently unused
   socket: /var/sockets/nginx/av-sync-worker-2.sock
 
 # Parts of Synapse's experimental_features that change what a response contains.
@@ -361,6 +411,9 @@ testing:
 #
 # Leave it empty to serve no metrics at all.
 metrics:
+  # TCP ONLY -- there is no unix-socket form, because Prometheus cannot scrape
+  # one. So even an otherwise all-socket deployment opens this one port. Bind it
+  # to an internal interface: /metrics is unauthenticated.
   addr: ":9201"
 
 log:

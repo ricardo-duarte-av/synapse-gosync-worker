@@ -151,20 +151,57 @@ docker run --rm gosync-worker -version
 
 `docker-compose.yaml` runs it alongside an existing Synapse deployment, which
 is how the soak runs it. It mounts exactly two things: the config file, read
-only, and `/var/sockets`. Everything this worker talks to is a unix socket in
-that one directory — PostgreSQL, KeyDB, the client-API worker it validates
-tokens against, the reference sync worker it is compared with, and its own
-listener, which is why the mount is not read only.
+only, and `/var/sockets`. In that deployment everything this worker talks to is
+a unix socket in that one directory — PostgreSQL, KeyDB, the client-API worker
+it validates tokens against, the reference sync worker it is compared with, and
+its own listener, which is why the mount is not read only.
 
 It runs as uid 991, matching the Synapse workers. That matters twice: the
 socket it creates in the shared directory must be owned like the others, and
 PostgreSQL peer authentication over a unix socket is decided by the connecting
 uid.
 
+### Unix sockets are the deployment, not the requirement
+
+Every connection is independently either a unix socket or TCP, so a wholly
+networked deployment works too — a managed PostgreSQL, a KeyDB on another host,
+a listener on a port behind any reverse proxy.
+
+| Connection | Unix socket | TCP |
+|---|---|---|
+| Client API listener | `listen.socket` (+ `socket_mode`) | `listen.addr` |
+| PostgreSQL (read, `to_device`, `sliding_sync`) | `host=/var/sockets` in the DSN | `host=… port=…` in the DSN |
+| KeyDB / replication | `replication.address: /var/sockets/keydb` | `replication.address: host:6379` |
+| Token validation | `auth.whoami_socket` | `auth.whoami_url` |
+| Presence writer | read from Synapse's `instance_map` (`path:`) | read from `instance_map` (`host:`/`port:`/`tls:`) |
+| Metrics | — | `metrics.addr` |
+
+Three things to know before relying on the networked form:
+
+**Metrics are TCP only.** Prometheus cannot scrape a unix socket, so even an
+otherwise all-socket deployment opens this one port.
+
+**KeyDB has no TLS option.** `replication` takes `password` and `db` and nothing
+else, so a managed Redis that requires TLS cannot be reached. PostgreSQL has no
+such limit — the DSN carries `sslmode`, and it is worth setting explicitly
+because libpq's default silently falls back to plaintext.
+
+**Peer authentication is a socket feature.** Over TCP the PostgreSQL roles need
+a password or another `pg_hba` method, and the uid-991 note above stops
+applying.
+
+**The socket paths are far better tested than the TCP ones.** Every live test
+and the whole soak run over sockets; only `internal/presence` exercises TCP in
+its tests. Nothing suggests the TCP paths are broken, but they have not been
+proven the way the socket paths have — which is the inverse of the trap
+`CLAUDE.md` records from `synapse-media-worker`, where a TCP-only test run hid a
+socket bug. Test the transport you actually run.
+
 ## Metrics
 
-The client API is served on a unix socket, which Prometheus cannot scrape, so
-the worker opens a second listener for metrics alone. `/metrics` is
+The client API is normally served on a unix socket, which Prometheus cannot
+scrape, so the worker opens a second listener for metrics alone. That listener
+is TCP even when the client API is not. `/metrics` is
 unauthenticated: keep it on an internal network and never route it through the
 reverse proxy.
 
@@ -190,9 +227,10 @@ and why `gosync_replication_connected` is the gauge to alert on rather than
 ## Configuration
 
 See `deploy/gosync-worker.example.yaml`, which documents every field and why it
-is set the way it is. The worker needs a read-only PostgreSQL role
-(`deploy/readonly-role.sql`), a Redis/KeyDB socket, and a Synapse client-API
-endpoint to validate access tokens against. Serving `to_device` additionally
+is set the way it is, and shows the socket and TCP form of each connection. The
+worker needs a read-only PostgreSQL role (`deploy/readonly-role.sql`), a
+Redis/KeyDB it can reach, and a Synapse client-API endpoint to validate access
+tokens against. Serving `to_device` additionally
 needs the narrow deleting role in `deploy/device-inbox-role.sql`.
 
 ## Documentation
