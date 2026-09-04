@@ -81,3 +81,62 @@ func TestRequestLogSeverity(t *testing.T) {
 		})
 	}
 }
+
+// A CORS preflight is answered before any handler names the endpoint, so
+// without naming it here it lands under "unknown" -- which then means two
+// different things at once. On the live host preflights were 3,623 of 60,000
+// requests, all for /sync: a phantom 10% on the dashboard, and cover for
+// anything genuinely unrouted.
+func TestPreflightIsNamed(t *testing.T) {
+	var buf bytes.Buffer
+	log := zerolog.New(&buf).Level(zerolog.DebugLevel)
+
+	h := WithRequestLog(log, WithCORS(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			t.Error("a preflight reached the handler")
+		})))
+
+	req := httptest.NewRequest(http.MethodOptions, "/_matrix/client/v3/sync", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Errorf("status = %d, want 204", rec.Code)
+	}
+	var line struct {
+		Endpoint string `json:"endpoint"`
+		Level    string `json:"level"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(buf.String())), &line); err != nil {
+		t.Fatalf("log line: %v", err)
+	}
+	if line.Endpoint != "preflight" {
+		t.Errorf("endpoint = %q, want %q", line.Endpoint, "preflight")
+	}
+	if line.Level != "info" {
+		t.Errorf("level = %q, want info: a preflight is a normal request", line.Level)
+	}
+}
+
+// The counterpart: a path this worker really does not route must still be
+// "unknown", or the label stops being able to tell us anything.
+func TestAnUnroutedPathIsStillUnknown(t *testing.T) {
+	var buf bytes.Buffer
+	log := zerolog.New(&buf).Level(zerolog.DebugLevel)
+
+	h := WithRequestLog(log, WithCORS(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNotFound) })))
+
+	h.ServeHTTP(httptest.NewRecorder(),
+		httptest.NewRequest(http.MethodGet, "/_matrix/client/v3/nope", nil))
+
+	var line struct {
+		Endpoint string `json:"endpoint"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(buf.String())), &line); err != nil {
+		t.Fatalf("log line: %v", err)
+	}
+	if line.Endpoint != "unknown" {
+		t.Errorf("endpoint = %q, want unknown", line.Endpoint)
+	}
+}

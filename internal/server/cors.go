@@ -37,6 +37,15 @@ func WithCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		SetCORS(w.Header())
 		if r.Method == http.MethodOptions {
+			// Named, so that `unknown` keeps meaning "a path this worker does
+			// not route". Preflights are a real share of traffic -- 3,623 of
+			// 60,000 log lines on the live host, all for /sync -- and lumping
+			// them in with genuinely unrouted requests both invents a phantom
+			// endpoint on the dashboard and gives anything actually unrouted
+			// somewhere to hide.
+			if ann := Annotate(r.Context()); ann != nil {
+				ann.Endpoint = "preflight"
+			}
 			// 204 with no body, as Synapse answers. Go elides Content-Length
 			// on a 204 itself, so it is not set here.
 			w.WriteHeader(http.StatusNoContent)

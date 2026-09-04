@@ -930,3 +930,33 @@ session got as far as subscribing.
 The general shape is worth remembering: **a health flag that only one code path
 can set true must not be set false by any other.** Either the flag is owned by
 the lifecycle that can restore it, or clearing it has to end that lifecycle.
+
+### What the first presence soak showed
+
+Seven hours, no restarts, `gosync_replication_connected` at 1 for all 87
+samples -- the batch-overflow wedge has not recurred. 34,214 requests, zero
+`error` outcomes, and the only 5xx were 20 abandoned long polls.
+
+Presence relayed 801 times with 2,817 suppressed and **zero failures** across
+all four reasons. Relay latency p50 2.1ms, p99 19ms, mean 5.6ms over a unix
+socket on the same host.
+
+Two things in those numbers needed explaining, and both turned out to be the
+code being right:
+
+**Only 13% of syncs relay presence at all.** 3,618 relay decisions against
+28,286 syncs looked like the call being skipped. It is not: **gomuks sends
+`set_presence=offline`**, on 47,025 of 54,268 logged syncs. That is the
+documented opt-out -- `affect_presence = set_presence != offline` -- so those
+syncs correctly relay nothing. The 7,243 that send `unavailable` or `online`
+match the relay count by proportion. Worth knowing before reading this metric:
+**on this deployment the majority client opts out of presence entirely**, so the
+relay rate says as much about which clients are connected as about whether the
+feature works.
+
+**`endpoint=unknown` was 10% of traffic.** 3,621 requests, and the nginx log
+named them exactly: 3,623 CORS preflights, all `OPTIONS /_matrix/client/v3/sync`.
+They are answered by the CORS middleware before any handler names the endpoint.
+Harmless, but it made `unknown` mean two things at once -- a phantom endpoint on
+the dashboard, and somewhere for a genuinely unrouted path to hide. Preflights
+are now labelled `preflight`, with a test on each side of that line.
