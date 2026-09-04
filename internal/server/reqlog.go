@@ -123,7 +123,26 @@ func WithRequestLog(log zerolog.Logger, next http.Handler) http.Handler {
 			}
 		}
 
-		metrics.RequestsTotal.WithLabelValues(endpoint, strconv.Itoa(status), outcome).Inc()
+		// A request the caller abandoned is counted as 499, not as whatever we
+		// wrote into the closed socket.
+		//
+		// 499 is nginx's "client closed request", and nginx records these very
+		// same requests that way -- so without this our metric contradicts the
+		// proxy in front of us about the same event. It matters because the
+		// status label is what a 5xx-ratio panel filters on, and an abandoned
+		// long poll is ordinary client behaviour: on sliding sync it was 4.56%
+		// of the endpoint's traffic, every one of them healthy, and it made
+		// that panel read like a server fault.
+		//
+		// The LOG line below keeps the status we actually wrote. The metric
+		// answers "how often are we failing"; the log is the forensic record of
+		// what the handler did, and flattening a genuine 500-then-disconnect
+		// into a 499 there would hide it.
+		metricStatus := status
+		if outcome == "client_gone" {
+			metricStatus = 499
+		}
+		metrics.RequestsTotal.WithLabelValues(endpoint, strconv.Itoa(metricStatus), outcome).Inc()
 		metrics.RequestDuration.WithLabelValues(endpoint).Observe(elapsed.Seconds())
 
 		ev := log.Info()

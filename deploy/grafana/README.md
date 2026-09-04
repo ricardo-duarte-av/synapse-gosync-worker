@@ -170,6 +170,21 @@ not a metric label: this deployment sees a handful of clients, but a label whose
 values are chosen by callers is a cardinality incident waiting for one badly
 behaved bot. Group by it in the log, not in Prometheus.
 
+**The 5xx ratio counts only real failures, because an abandoned request is
+recorded as 499.** A client that hangs up mid-long-poll leaves an in-flight
+query cancelled, and the handler writes a 500 into a socket nobody is reading.
+Counting that as a 5xx made the ratio panel report ordinary client behaviour as
+a server fault -- on 2026-09-04 it was **4.56% of sliding sync's traffic**, every
+one of them healthy, against 0.068% across all endpoints. 499 is nginx's "client
+closed request" and nginx counts the same requests that way, so the two now
+agree. The log line keeps the status actually written, because it is the
+forensic record of what the handler did.
+
+Note also that a 5xx ratio computed per endpoint reads very differently from one
+computed across all of them: sliding sync's low volume makes a handful of
+abandoned polls look like a large fraction. Always check which endpoint a ratio
+panel is filtered to before believing it.
+
 **A 5xx on this worker is `outcome="error"`, and only that.** Until
 2026-09-03 `refuse` stamped `refused` on everything it wrote, so the 26 real
 internal errors this endpoint served in a week were counted as refusals --

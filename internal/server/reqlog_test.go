@@ -3,12 +3,16 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog"
+
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/metrics"
 )
 
 // The severity of a request line decides whether anybody looks at it, and the
@@ -139,4 +143,91 @@ func TestAnUnroutedPathIsStillUnknown(t *testing.T) {
 	if line.Endpoint != "unknown" {
 		t.Errorf("endpoint = %q, want unknown", line.Endpoint)
 	}
+}
+
+// An abandoned long poll must not land in the 5xx bucket.
+//
+// The status label is what a 5xx-ratio panel filters on, and these are ordinary
+// client behaviour: on the live worker they were 4.56% of sliding sync's
+// traffic, every one healthy, which made that panel read like a server fault.
+// 499 is nginx's "client closed request", and nginx counts the very same
+// requests that way.
+func TestAbandonedRequestsAreCountedAs499(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(metrics.RequestsTotal)
+
+	h := WithRequestLog(zerolog.New(io.Discard), http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			if ann := Annotate(r.Context()); ann != nil {
+				ann.Endpoint = "sliding_sync"
+				ann.Outcome = "client_gone"
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+	h.ServeHTTP(httptest.NewRecorder(),
+		httptest.NewRequest(http.MethodPost, "/_matrix/client/v4/sync", nil))
+
+	got := statusesFor(t, reg, "sliding_sync", "client_gone")
+	if _, is5xx := got["500"]; is5xx {
+		t.Error("an abandoned request was counted as 500; a 5xx-ratio panel " +
+			"will report healthy client behaviour as a server fault")
+	}
+	if _, ok := got["499"]; !ok {
+		t.Errorf("statuses = %v, want 499", got)
+	}
+}
+
+// The counterpart: a genuine server error must still be a 5xx, or the metric
+// that matters stops being able to say anything.
+func TestRealFailuresAreStill5xx(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(metrics.RequestsTotal)
+
+	h := WithRequestLog(zerolog.New(io.Discard), http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			if ann := Annotate(r.Context()); ann != nil {
+				ann.Endpoint = "sync"
+				ann.Outcome = "error"
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+	h.ServeHTTP(httptest.NewRecorder(),
+		httptest.NewRequest(http.MethodGet, "/_matrix/client/v3/sync", nil))
+
+	got := statusesFor(t, reg, "sync", "error")
+	if _, ok := got["500"]; !ok {
+		t.Errorf("statuses = %v, want a real failure to stay 500", got)
+	}
+}
+
+// statusesFor returns the status labels recorded for one endpoint and outcome.
+func statusesFor(t *testing.T, reg *prometheus.Registry, endpoint, outcome string) map[string]float64 {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]float64{}
+	for _, f := range families {
+		if f.GetName() != "gosync_requests_total" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			var ep, oc, st string
+			for _, l := range m.GetLabel() {
+				switch l.GetName() {
+				case "endpoint":
+					ep = l.GetValue()
+				case "outcome":
+					oc = l.GetValue()
+				case "status":
+					st = l.GetValue()
+				}
+			}
+			if ep == endpoint && oc == outcome && m.GetCounter().GetValue() > 0 {
+				out[st] = m.GetCounter().GetValue()
+			}
+		}
+	}
+	return out
 }
