@@ -325,7 +325,7 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 		lastChange[c.RoomID] = c
 	}
 	for roomID, c := range lastChange {
-		if c.Membership != "invite" {
+		if incrementalSection(c.Membership) != "invite" {
 			continue
 		}
 		// An invite from an ignored user is not reported at all. The sender of
@@ -352,14 +352,8 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 	archivedRooms := map[string]any{}
 	knockedRooms := map[string]any{}
 	for roomID, c := range lastChange {
-		switch c.Membership {
-		case "leave", "ban":
-			// A room the caller left of their own accord is omitted unless the
-			// filter asks for it; a kick or a ban is always reported, because
-			// the client would otherwise have no way to learn it happened.
-			if !f.IncludeLeave && c.Membership == "leave" && c.Sender == verdict.UserID {
-				continue
-			}
+		switch incrementalSection(c.Membership) {
+		case "leave":
 			if _, stillJoined := timelines[roomID]; stillJoined {
 				continue
 			}
@@ -1035,6 +1029,34 @@ func calculateState(start, end, previous map[store.StateKey]string,
 		}
 	}
 	return out
+}
+
+// incrementalSection names the response section the caller's own membership
+// change belongs in on an INCREMENTAL sync: "invite", "knock", "leave", or ""
+// for a membership the joined path reports instead.
+//
+// A leave or a ban always lands in "leave" -- whoever sent it, and whatever the
+// filter says. It is tempting to skip a self-leave when the filter does not ask
+// for `include_leave`, because that is what Synapse does; but Synapse does it
+// ONLY in _get_room_changes_for_initial_sync. The incremental path
+// (_get_room_changes_for_incremental_sync) is explicit: "Always include
+// leave/ban events. Just take the last one."
+//
+// We had the check here for a week, and the symptom is not obviously a sync
+// bug: the client is never told it left, so the room stays in its room list,
+// and an invite back into the same room does not render as an invite, because
+// to the client it never left. Everybody else sees the leave normally, which
+// points the finger anywhere but here.
+func incrementalSection(membership string) string {
+	switch membership {
+	case "invite":
+		return "invite"
+	case "knock":
+		return "knock"
+	case "leave", "ban":
+		return "leave"
+	}
+	return ""
 }
 
 // userChangesFromRooms works out who joined and who left, from the membership

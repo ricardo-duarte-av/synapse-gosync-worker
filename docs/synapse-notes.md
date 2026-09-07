@@ -1288,3 +1288,43 @@ where we did.
 come back non-monotonic in its own room order — 12727541 at position 10,
 12727189 at 18, 13977570 at 19. Any change that makes them monotonic has
 replaced the sort key with the wrong one.
+
+## `include_leave` applies to an initial sync only (2026-09-07)
+
+`filter_collection.include_leave` is read in exactly one place —
+`_get_room_changes_for_initial_sync`, and only there:
+
+```python
+elif event.membership in (Membership.LEAVE, Membership.BAN):
+    # Always send down rooms we were banned from or kicked from.
+    if not sync_config.filter_collection.include_leave:
+        if event.membership == Membership.LEAVE:
+            if user_id == event.sender:
+                continue
+```
+
+`_get_room_changes_for_incremental_sync` has no equivalent. It says the
+opposite, in a comment: *"Always include leave/ban events. Just take the last
+one."* The filter's name suggests a rule about the `leave` section; it is a rule
+about which rooms an INITIAL sync enumerates, and the two paths reach the
+section by different routes.
+
+The symmetry is very inviting and it is wrong, so it is worth knowing what
+breaking it looks like, because none of it points at `/sync`:
+
+- The room stays in the client's room list after leaving it. The client is
+  never told, so it keeps the room joined.
+- Everybody else in the room sees the leave immediately — it is an ordinary
+  timeline event for them — which makes it look like a client bug on one
+  device.
+- An invite back into the same room does not render as an invite. It arrives in
+  `rooms.invite` correctly, but the client still holds the room as joined and
+  shows the stale joined room instead.
+
+The comparator cannot see this: `cmd/syncdiff` never leaves a room, so the
+membership change it would have to compare never happens in a run. Found by
+leaving a room in a real client on 2026-09-07.
+
+Our initial-sync path is a separate matter and still incomplete: it asks the
+store for `["invite", "join"]` only, so it never emits `rooms.leave` at all —
+including for a kick or a ban, which Synapse sends unconditionally.

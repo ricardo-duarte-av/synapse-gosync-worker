@@ -1149,3 +1149,24 @@ over 654 rooms costs us. Synapse spends less because it answers "has this room
 changed since X?" from in-memory stream-change caches before touching the
 database; we ask the database every time. That is the next optimisation if one is
 wanted, and it is not a correctness problem.
+
+## The room you left is still in the list (2026-09-07)
+
+Visible symptom: leaving a room changed nothing in the client that left it.
+Everyone else received the leave; the room stayed in the room list; and being
+invited back showed the old joined room rather than an invite.
+
+Cause: `incrementalSync` skipped a self-leave unless the filter asked for
+`include_leave`, so the leave never reached `rooms.leave` and the client went on
+believing it was joined. Synapse applies `include_leave` only on the
+initial-sync path — the incremental path always reports a leave or a ban. M6
+generalised the rule from one path to both; see synapse-notes.md.
+
+The decision now lives in `incrementalSection`, with the reasoning next to it
+and a test that fails if a leave ever stops being reported. `cmd/syncdiff` never
+leaves a room, so nothing it can send would have caught this — the fifth defect
+found by pointing a real client at the worker rather than the comparator.
+
+Still open, and separate: an initial sync enumerates `["invite", "join"]` only,
+so it emits no `rooms.leave` at all. Synapse sends kicks and bans there
+unconditionally, and self-left rooms when `include_leave` is set.
