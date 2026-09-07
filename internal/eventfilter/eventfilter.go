@@ -132,8 +132,22 @@ func ForClient(ctx context.Context, db *store.Store, roomID, userID string,
 				Type: "m.room.member", StateKey: userID}].Membership
 		}
 
-		verdict := visibility.Check(vctx, timelineToVisibilityEvent(ev), state)
+		vev := timelineToVisibilityEvent(ev)
+		verdict := visibility.Check(vctx, vev, state)
 		if alwaysInclude[ev.EventID] {
+			// Synapse's always_include_ids returns early from
+			// _check_client_allowed_to_see_event, and the membership is
+			// annotated afterwards, in `allowed` -- so a rescued event still
+			// carries unsigned.membership. Check has no membership to report
+			// for an event it rejected, so it is computed here instead.
+			//
+			// This is not a corner: a room with history visibility `invited`
+			// and a leave whose stored JSON has no prev_content (which is most
+			// of them -- Synapse does not persist prev_content) fails the
+			// membership check and reaches the client only by this path.
+			if !verdict.Visible {
+				verdict.Membership = visibility.MembershipAfter(vctx, vev, state)
+			}
 			verdict.Visible = true
 			verdict.Pruned = false
 		}

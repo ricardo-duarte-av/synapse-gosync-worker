@@ -163,7 +163,7 @@ func Check(ctx Context, ev Event, state StateAtEvent) Verdict {
 		// never sees the invite that is the only reason they know the room
 		// exists.
 		if ev.Type == "m.room.member" && ev.StateKey == ctx.UserID {
-			return Verdict{Visible: true, Membership: membershipAfter(ctx, ev, state)}
+			return Verdict{Visible: true, Membership: MembershipAfter(ctx, ev, state)}
 		}
 		return Verdict{}
 	}
@@ -177,7 +177,7 @@ func Check(ctx Context, ev Event, state StateAtEvent) Verdict {
 	// Skipped when the sender is erased, because then the membership check
 	// decides whether the event is returned whole or pruned.
 	if !ctx.ErasedSenders[ev.Sender] && laxAllows(ev, visibility, ctx.IsPeeking) {
-		return Verdict{Visible: true, Membership: membershipAfter(ctx, ev, state)}
+		return Verdict{Visible: true, Membership: MembershipAfter(ctx, ev, state)}
 	}
 
 	allowed, joined := checkMembership(ctx, ev, visibility, state)
@@ -187,7 +187,7 @@ func Check(ctx Context, ev Event, state StateAtEvent) Verdict {
 	return Verdict{
 		Visible:    true,
 		Pruned:     ctx.ErasedSenders[ev.Sender] && !joined,
-		Membership: membershipAfter(ctx, ev, state),
+		Membership: MembershipAfter(ctx, ev, state),
 	}
 }
 
@@ -297,12 +297,18 @@ func checkMembership(ctx Context, ev Event, visibility string, state StateAtEven
 	return true, false
 }
 
-// membershipAfter is MSC4115's unsigned.membership: the caller's membership
+// MembershipAfter is MSC4115's unsigned.membership: the caller's membership
 // *after* this event.
 //
 // For the caller's own membership event that is the event's own membership;
 // otherwise it comes from the resolved state, defaulting to leave.
-func membershipAfter(ctx Context, ev Event, state StateAtEvent) string {
+//
+// Exported because Synapse annotates the membership AFTER deciding whether the
+// event may be seen, and independently of HOW that was decided: an event let
+// through by `always_include_ids` is annotated like any other. Check reports
+// nothing for an event it rejects, so the caller doing the rescuing has to ask
+// for the annotation itself.
+func MembershipAfter(ctx Context, ev Event, state StateAtEvent) string {
 	if ev.Type == "m.room.member" && ev.StateKey == ctx.UserID {
 		if ev.Membership != "" {
 			return ev.Membership
