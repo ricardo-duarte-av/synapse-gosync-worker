@@ -1170,3 +1170,53 @@ found by pointing a real client at the worker rather than the comparator.
 Still open, and separate: an initial sync enumerates `["invite", "join"]` only,
 so it emits no `rooms.leave` at all. Synapse sends kicks and bans there
 unconditionally, and self-left rooms when `include_leave` is set.
+
+## The initial sync had no `leave` section at all (2026-09-07)
+
+Following the leave that never arrived, the other half of the same hole: a full
+sync asked the store for `["invite", "join"]`, so it could not report a left
+room even when the filter asked for one -- and never reported a kick or a ban,
+which Synapse sends unconditionally. It had no `knock` section either, for the
+same reason.
+
+Now the full sync enumerates every membership, as
+`_get_room_changes_for_initial_sync` does, and `syncRoomEntry` grew an
+`archived` mode: the same timeline and the same state block, bounded by the
+leave rather than by `now`, and none of what describes a room you are in.
+Synapse shares one function between joined and archived and drops the difference
+at the serialiser -- computing a summary for an archived room and discarding it.
+We skip the work instead, because each discarded field is a query.
+
+`include_leave` applies here and only here, which is the point: `enumeratesArchived`
+and `incrementalSection` now sit next to each other, each documented against the
+other, with tests in both directions.
+
+### What the comparison found
+
+Verified against `@test` (30 joined, 9 left, 1 ban) with and without
+`include_leave`, and against the main account. Two defects, both ours, neither
+guessable:
+
+- **Forgotten rooms came back.** Synapse filters them inside the membership
+  query, and only for a list that reaches past join and invite -- so the filter
+  arrived with this section. 7 of the account's 10 left rooms were forgotten
+  ones. `store.ForgottenRooms` now excludes them.
+- **`unsigned.membership` was missing** on an event rescued by
+  `always_include_ids`. Synapse annotates after the allow decision and
+  regardless of how it was reached. A rejected invite in an `invited`-visibility
+  room reaches the client by no other path, so this was not academic.
+
+Both are in synapse-notes.md. After them, `/sync` matches exactly on both
+filters, and the incremental endpoint still does.
+
+### Two things this could not check
+
+The reference is no longer `av-sync-worker-2`: none of the Synapse sync workers
+are running, so the comparison ran against `av-synapse-main`, whose
+`sync_response_cache_duration` is 2m rather than 0. A unique `not_senders` entry
+per run keeps every reference request out of that cache -- a cache key it has
+never seen cannot be a hit -- but it is a workaround, and starting worker 2
+would be better than repeating it.
+
+`knock` on the initial sync is implemented and untested: no local account is
+knocking on anything.

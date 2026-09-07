@@ -126,9 +126,33 @@ func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter 
 		ann.NextBatch = now.String()
 	}
 
-	rooms, err := d.Store.RoomsForUser(ctx, verdict.UserID, []string{"invite", "join"})
+	// Every membership, as Synapse's _get_room_changes_for_initial_sync asks
+	// for (`membership_list=Membership.LIST`). A full sync is the only chance
+	// the client has to learn about a room it is no longer in: there is no
+	// earlier token to have carried the news.
+	rooms, err := d.Store.RoomsForUser(ctx, verdict.UserID,
+		[]string{"invite", "join", "knock", "leave", "ban"})
 	if err != nil {
 		return nil, http.StatusInternalServerError, internalError(d, "rooms for user", err)
+	}
+	// Forgetting a room is how a client says it never wants to see one again,
+	// and it is the leave section that makes that necessary: without this, an
+	// account with a history of left rooms is handed all of them, with their
+	// full state, on every initial sync. Synapse filters them inside the same
+	// query, but only when the membership list reaches past join and invite --
+	// which is why this arrived with that list and not before it.
+	forgotten, err := d.Store.ForgottenRooms(ctx, verdict.UserID)
+	if err != nil {
+		return nil, http.StatusInternalServerError, internalError(d, "forgotten rooms", err)
+	}
+	if len(forgotten) > 0 {
+		kept := rooms[:0]
+		for _, room := range rooms {
+			if !forgotten[room.RoomID] {
+				kept = append(kept, room)
+			}
+		}
+		rooms = kept
 	}
 
 	requester := clientevent.Requester{
@@ -207,17 +231,20 @@ func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter 
 
 	joinedRooms := map[string]any{}
 	invitedRooms := map[string]any{}
+	knockedRooms := map[string]any{}
+	archivedRooms := map[string]any{}
 
-	// Invites first, and sequentially: there are few of them and each is one
-	// event, so there is nothing to parallelise.
-	var toBuild []store.RoomForUser
+	// Invites and knocks first, and sequentially: there are few of them and
+	// each is one event, so there is nothing to parallelise.
+	var toBuild, toArchive []store.RoomForUser
 	for _, room := range rooms {
 		// A filter naming no rooms drops the whole section, which is cheaper
 		// than building it and discarding every entry.
 		if f.BlocksAllRooms() {
 			break
 		}
-		if room.Membership == "invite" {
+		switch room.Membership {
+		case "invite":
 			if ignored[room.Sender] {
 				continue
 			}
@@ -232,9 +259,34 @@ func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter 
 			invitedRooms[room.RoomID] = map[string]any{
 				"invite_state": map[string]any{"events": []json.RawMessage{body}},
 			}
-			continue
+		case "knock":
+			knock, err := d.Store.InviteEvent(ctx, room.EventID, room.RoomID, room.RoomVersion)
+			if err != nil {
+				return nil, http.StatusInternalServerError, internalError(d, "knock event", err)
+			}
+			body, err := clientevent.Serialize(knock.Stored, timeNow, strippedCfg)
+			if err != nil {
+				return nil, http.StatusInternalServerError, internalError(d, "serialise knock", err)
+			}
+			// As on the incremental path: the stripped state a knock carries
+			// lives in the event's unsigned block, and the response lifts it
+			// out into knock_state.
+			events := []json.RawMessage{}
+			gjson.GetBytes(body, `unsigned.knock_room_state`).ForEach(func(_, v gjson.Result) bool {
+				events = append(events, json.RawMessage(v.Raw))
+				return true
+			})
+			knockedRooms[room.RoomID] = map[string]any{
+				"knock_state": map[string]any{"events": events},
+			}
+		case "leave", "ban":
+			if !enumeratesArchived(room.Membership, room.Sender, verdict.UserID, f.IncludeLeave) {
+				continue
+			}
+			toArchive = append(toArchive, room)
+		default:
+			toBuild = append(toBuild, room)
 		}
-		toBuild = append(toBuild, room)
 	}
 
 	// Receipts for every room in one query rather than one per room.
@@ -273,12 +325,35 @@ func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter 
 			entry, err := syncRoomEntry(gctx, d, room, verdict.UserID, now.Room, timeNow, cfg,
 				accountDataByRoom[room.RoomID], now, useStateAfter, f, verdict.DeviceID, true,
 				timelineSource{upto: now}, sticky[room.RoomID], typingRooms[room.RoomID],
-				receiptsByRoom[room.RoomID])
+				receiptsByRoom[room.RoomID], false)
 			if err != nil {
 				return err
 			}
 			mu.Lock()
 			joinedRooms[room.RoomID] = entry
+			mu.Unlock()
+			return nil
+		})
+	}
+	// Rooms the caller has left, been kicked from or banned from. Built in the
+	// same pool as the joined ones, and bounded by the LEAVE rather than by
+	// `now`: a departed member is not entitled to what happened after they
+	// went. Synapse expresses that by setting both upto_token and end_token to
+	// the leave position.
+	for _, room := range toArchive {
+		group.Go(func() error {
+			leaveKey := streamtoken.Live(room.StreamOrdering)
+			entry, err := syncRoomEntry(gctx, d, room, verdict.UserID, leaveKey, timeNow, cfg,
+				accountDataByRoom[room.RoomID], now, useStateAfter, f, verdict.DeviceID, true,
+				timelineSource{upto: now.WithRoomKey(leaveKey)}, nil, false, nil, true)
+			if err != nil {
+				return err
+			}
+			if entry == nil {
+				return nil
+			}
+			mu.Lock()
+			archivedRooms[room.RoomID] = entry
 			mu.Unlock()
 			return nil
 		})
@@ -366,6 +441,12 @@ func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter 
 	if len(invitedRooms) > 0 {
 		roomsOut["invite"] = invitedRooms
 	}
+	if len(knockedRooms) > 0 {
+		roomsOut["knock"] = knockedRooms
+	}
+	if len(archivedRooms) > 0 {
+		roomsOut["leave"] = archivedRooms
+	}
 	if len(roomsOut) > 0 {
 		resp["rooms"] = roomsOut
 	}
@@ -375,6 +456,25 @@ func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter 
 		return nil, http.StatusInternalServerError, internalError(d, "encode response", err)
 	}
 	return body, http.StatusOK, nil
+}
+
+// enumeratesArchived says whether a room the caller is no longer in belongs in
+// an INITIAL sync's `leave` section.
+//
+// Here, and only here, `include_leave` applies: _get_room_changes_for_initial_sync
+// is the filter's one reader in the whole of Synapse. A room the caller left of
+// their own accord is enumerated only when the filter asks for it; a kick or a
+// ban is always sent, because the client would otherwise have no way to learn it
+// happened.
+//
+// The incremental path has no such check and must not grow one -- see
+// incrementalSection, and the room that stayed in a client's room list for a
+// week because this rule was applied there too.
+func enumeratesArchived(membership, sender, userID string, includeLeave bool) bool {
+	if includeLeave {
+		return true
+	}
+	return !(membership == "leave" && sender == userID)
 }
 
 // syncPresenceEvents renders presence for /sync, which differs from the legacy
@@ -426,13 +526,23 @@ type timelineSource struct {
 	newlyJoined bool
 }
 
-// syncRoomEntry builds one joined room's full-state section.
+// syncRoomEntry builds one room's full-state section.
+//
+// `archived` makes it a room the caller is no longer in, which is the same
+// timeline and the same state block bounded by the leave rather than by `now`,
+// and none of what describes a room you are in. Synapse shares
+// _generate_room_entry between the two and drops the difference at the
+// serialiser: ArchivedSyncResult carries only timeline, state and account data,
+// so the summary it computed for an archived room is thrown away unused. We
+// skip computing it instead -- the summary, the unread counts, the receipts and
+// the sticky events are each a query, and an account with a long history of
+// left rooms would pay for all of them to have the answer discarded.
 func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID string,
 	endKey streamtoken.RoomKey, timeNow int64, cfg clientevent.Config,
 	accountData []store.AccountDataEntry, now streamtoken.Token,
 	useStateAfter bool, f *filter.Collection, deviceID string, initial bool,
 	src timelineSource, stickyIDs []string, typingChanged bool,
-	receiptRows []store.ReceiptRow) (map[string]any, error) {
+	receiptRows []store.ReceiptRow, archived bool) (map[string]any, error) {
 
 	// No `since` in either case: a newly joined room is paginated as history,
 	// exactly as an initial sync is, because the client has none of it.
@@ -486,7 +596,7 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 	// to render.
 	summary := map[string]any{}
 	var summaryValue any = summary
-	if wantSummary(f, messages, stateIDs, limited, initial) {
+	if !archived && wantSummary(f, messages, stateIDs, limited, initial) {
 		computed, err := roomSummary(ctx, d, room.RoomID, userID, deviceID, f, stateIDs,
 			messages, endKey)
 		if err != nil {
@@ -602,7 +712,7 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 	}
 
 	ephemeral := []json.RawMessage{}
-	if !f.BlocksAllRoomEphemeral() {
+	if !archived && !f.BlocksAllRoomEphemeral() {
 		// withThreads: /sync uses the multi-room receipt path, which selects
 		// thread_id and applies MSC4102 -- unlike /rooms/{id}/initialSync.
 		if ev, err := receiptEvent(room.RoomID, receiptRows, userID, true); err != nil {
@@ -625,6 +735,25 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 		// The filter sees the room_id, which is stripped only afterwards:
 		// Synapse filters the dict it built and removes the key on the way out.
 		ephemeral = stripRoomIDs(filterEphemeral(f, room.RoomID, ephemeral))
+	}
+
+	// A left room is timeline, state and account data, and nothing else --
+	// and it is reported only when it has one of them, as ArchivedSyncResult's
+	// __bool__ decides. In practice the full state block always makes it
+	// non-empty; the check is here because Synapse's is.
+	if archived {
+		if len(timeline) == 0 && len(stateJSON) == 0 && len(adEvents) == 0 {
+			return nil, nil
+		}
+		return map[string]any{
+			"timeline": map[string]any{
+				"events":     timeline,
+				"prev_batch": prevBatch.String(),
+				"limited":    limited,
+			},
+			stateKeyName(useStateAfter): map[string]any{"events": stateJSON},
+			"account_data":              map[string]any{"events": adEvents},
+		}, nil
 	}
 
 	unread, err := d.Store.UnreadNotifications(ctx, room.RoomID, userID)

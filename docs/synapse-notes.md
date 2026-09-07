@@ -1328,3 +1328,65 @@ leaving a room in a real client on 2026-09-07.
 Our initial-sync path is a separate matter and still incomplete: it asks the
 store for `["invite", "join"]` only, so it never emits `rooms.leave` at all —
 including for a kick or a ban, which Synapse sends unconditionally.
+
+## Forgotten rooms, and where they are filtered (2026-09-07)
+
+`get_rooms_for_local_user_where_membership_is` drops forgotten rooms -- but only
+when the membership list reaches past join and invite:
+
+```python
+# Users can't forget joined/invited rooms, so we skip the check for such look ups.
+if any(m not in (Membership.JOIN, Membership.INVITE) for m in membership_list):
+    rooms_to_exclude = await self.get_forgotten_rooms_for_user(user_id)
+```
+
+So the filter arrives with the `leave` section and not before it: a query for
+join and invite never needed it. Without it, an initial sync hands back every
+room the account ever forgot, with its full state -- 7 of the second test
+account's 10 left rooms, and 20 of the main account's 310.
+
+A room counts as forgotten only when EVERY membership row for that user in it
+has `forgotten = 1`. Forgetting flags all of them at once, so a later re-join
+leaves an unflagged row and the room is remembered again. Synapse's query is
+shaped around the partial index on `forgotten = 1`; `internal/store`'s copy
+keeps that shape for the same reason.
+
+## MSC4115's membership survives `always_include_ids` (2026-09-07)
+
+Synapse annotates `unsigned.membership` in `allowed()`, AFTER
+`_check_client_allowed_to_see_event` has said yes -- and independently of WHY it
+said yes. An event let through by `always_include_ids` is annotated like any
+other.
+
+Our `visibility.Check` returns a bare `Verdict{}` for an event it rejects, so
+rescuing it at the call site produced an event with no membership at all. It is
+not a corner case: a room whose history visibility is `invited`, and a leave
+whose stored JSON carries no `prev_content` -- which is most of them, since
+Synapse does not persist `prev_content` -- fails `_check_membership` outright and
+reaches the client only by the always-include path. The second test account had
+one: a rejected invite, in `rooms.leave`, missing the field Synapse sent.
+
+## `compute_summary` writes into the state block AFTER the filter (2026-09-07)
+
+An extension of the note above on summaries adding to state: the addition
+happens after `filter_room_state`, so the heroes it adds are NOT subject to the
+client's room filter, and it happens for archived rooms too -- where the summary
+itself is then discarded, because ArchivedSyncResult has no summary field, and
+only the state it injected survives.
+
+Visible with a `rooms` filter on the main account: Synapse returned 69 joined
+and 2 left rooms that the filter excludes, each holding nothing but one or two
+hero membership events.
+
+**Two open differences, both found this way and neither yet fixed.** They belong
+to the joined path and to summaries; they predate the `leave` work that found
+them, and they are only reachable with a `rooms`/`not_rooms` filter, which no
+comparator run had ever sent:
+
+1. We do not inject heroes past the filter, so we omit those rooms entirely.
+2. We keep a joined room whose every section came back empty; Synapse drops it.
+   `JoinedSyncResult.__bool__` is timeline OR state OR ephemeral OR account_data
+   OR sticky -- the notification counts and the summary deliberately do not
+   count. On an initial sync `full_state` gets a room past the FIRST gate in
+   `_generate_room_entry` but not past this one. With the filter above we
+   returned 646 joined rooms where Synapse returned 69.

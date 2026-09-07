@@ -31,9 +31,11 @@ real client's `/sync` request actually looks like.
 Both are answered with `501` rather than approximated, on the principle that a
 loud failure beats a quiet wrong answer:
 
-- **Rooms the user has left**, including `/initialSync?archived=true`. Synapse
-  serves a snapshot of the room state as it was at the leave event. The state
-  resolver can now answer that; the handler has not been wired to it.
+- **`/initialSync?archived=true`.** Synapse serves a snapshot of each left
+  room's state as it was at the leave event. The state resolver can answer that,
+  and `/sync` now uses it for both its initial and its incremental `leave`
+  section; this one legacy handler has not been wired to it, and nothing asks
+  for it (0 requests in 21h of production logs).
 - **An erased sender's event that should be served pruned.** When the caller was
   not joined at the time, Synapse returns a redacted copy; we drop the event.
   The per-room-version prune exists, so this is a wiring job. Dropping withholds

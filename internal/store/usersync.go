@@ -86,6 +86,53 @@ func (s *Store) roomsForUser(ctx context.Context, userID string, memberships []s
 	return out, nil
 }
 
+// ForgottenRooms lists the rooms the user has forgotten.
+//
+// Synapse filters these out of get_rooms_for_local_user_where_membership_is,
+// and only when the membership list asks for something other than join and
+// invite -- a user cannot forget a room they are still in. So this matters to
+// exactly one caller: the full sync's `leave` section, where without it a room
+// the client explicitly asked never to see again comes back on every initial
+// sync, with its whole state.
+//
+// A room counts as forgotten only when EVERY membership row for the user in it
+// is flagged, which is Synapse's own definition and not a formality: forgetting
+// sets the flag on all of them, so a later re-join leaves an unflagged row
+// behind and the room is remembered again. The shape of the query is Synapse's
+// too, for the same reason -- it exists so that the partial index on
+// `forgotten = 1` can be used.
+func (s *Store) ForgottenRooms(ctx context.Context, userID string) (map[string]bool, error) {
+	const q = `
+		SELECT room_id, (
+		         SELECT count(*) FROM room_memberships
+		          WHERE room_id = m.room_id AND user_id = m.user_id AND forgotten = 0
+		       ) AS remaining
+		  FROM room_memberships AS m
+		 WHERE user_id = $1 AND forgotten = 1
+		 GROUP BY room_id, user_id`
+	rows, err := s.query(ctx, "ForgottenRooms", q, userID)
+	if err != nil {
+		return nil, fmt.Errorf("store: forgotten rooms: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[string]bool{}
+	for rows.Next() {
+		var roomID string
+		var remaining int64
+		if err := rows.Scan(&roomID, &remaining); err != nil {
+			return nil, fmt.Errorf("store: forgotten rooms: %w", err)
+		}
+		if remaining == 0 {
+			out[roomID] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: forgotten rooms: %w", err)
+	}
+	return out, nil
+}
+
 // GlobalAccountData loads a user's account data that is not tied to a room.
 //
 // msc3391 treats an entry with empty content as deleted and omits it. Synapse

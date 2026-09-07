@@ -269,7 +269,7 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 				// nil receipts: this path replaces the whole ephemeral block
 				// below, bounding it by `since` rather than by the now token,
 				// so anything built here would be discarded.
-				src, sticky[room.RoomID], typingRooms[room.RoomID], nil)
+				src, sticky[room.RoomID], typingRooms[room.RoomID], nil, false)
 			if err != nil {
 				return nil, http.StatusInternalServerError, internalError(d, "room entry", err)
 			}
