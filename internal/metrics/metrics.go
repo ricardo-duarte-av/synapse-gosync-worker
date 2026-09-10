@@ -133,6 +133,31 @@ var (
 		Help: "1 while the replication subscription is healthy.",
 	})
 
+	// StreamDiscontinuities counts the two ways a stream position stops being
+	// a continuation of the one before it.
+	//
+	// Both are invisible in every other metric here, and that is the reason
+	// this one exists: when the typing writer restarted under a running worker
+	// on 2026-09-09, rows kept arriving, wakeups kept firing, the connection
+	// stayed healthy, and typing was silently unreportable for a day. A
+	// discontinuity is the only evidence such a thing happened.
+	//
+	//   reason="reset" -- the position went BACKWARDS on a stream whose serial
+	//     lives in a writer's memory (see resettableStreams), which is that
+	//     writer restarting. Only those streams are counted: on a
+	//     database-backed one a lower position is Synapse announcing
+	//     max(writer position, persisted-up-to) and is ordinary traffic.
+	//   reason="gap" -- a POSITION says the stream moved further than the rows
+	//     we saw. We were disconnected, or a row could not be parsed. Whatever
+	//     claims completeness below that position has to give up its horizon.
+	//
+	// Labelled by stream so a restart of one writer is not read as a restart
+	// of Synapse.
+	StreamDiscontinuities = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "gosync_replication_stream_discontinuities_total",
+		Help: "Replication positions that were not a continuation of the last, by stream and kind.",
+	}, []string{"stream", "reason"})
+
 	// SyncWaiters reports how many long polls are currently parked.
 	//
 	// On a worker serving real clients this is the workload: an idle /sync is

@@ -3433,12 +3433,206 @@
       ]
     },
     {
+      "type": "stat",
+      "title": "Writer restarts",
+      "description": "Replication positions that went BACKWARDS, in the dashboard range. A stream whose serial lives in a writer's memory -- typing is the only one served here -- restarts at zero when that worker does, and this is the only evidence it happened: rows keep arriving, wakeups keep firing, the connection stays healthy. Expect one per typing writer restart and none otherwise. Database-backed streams are not counted: a lower position from one of those is Synapse announcing max(writer position, persisted-up-to) and is ordinary traffic.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 76,
+        "w": 4,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(gosync_replication_stream_discontinuities_total{job=~\"$job\", reason=\"reset\"}[$__range])) or vector(0)",
+          "legendFormat": "",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Replication gaps",
+      "description": "POSITION commands claiming the stream had moved further than the rows we saw, in the dashboard range. Means rows were missed -- a disconnect, or a row that could not be parsed -- rather than merely being behind. Responses are read from the database so none of them is wrong because of this, but every stream-change cache below that position gives up its horizon, so a burst is followed by a burst of queries the gates would otherwise have skipped.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 20,
+        "y": 76,
+        "w": 4,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(gosync_replication_stream_discontinuities_total{job=~\"$job\", reason=\"gap\"}[$__range])) or vector(0)",
+          "legendFormat": "",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Position discontinuities, by stream",
+      "description": "Where a restart or a gap actually landed. reset on `typing` is an EDU worker restart and is handled: the position is adopted and the typist map cleared; the other two resettable streams are a federation sender's business and this worker holds nothing from either. gap on any stream lines up with `gosync_replication_connected` dropping, or with an unparseable row -- if it does not, the row shapes in rowDetails have drifted from Synapse's.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 88,
+        "w": 24,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (stream, reason) (increase(gosync_replication_stream_discontinuities_total{job=~\"$job\"}[$bucket]))",
+          "legendFormat": "{{stream}} {{reason}}",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        }
+      ]
+    },
+    {
       "type": "row",
       "title": "Stream-change caches (the query gates)",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 89,
+        "y": 97,
         "w": 24,
         "h": 1
       },
@@ -3454,7 +3648,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 90,
+        "y": 98,
         "w": 12,
         "h": 8
       },
@@ -3573,7 +3767,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 90,
+        "y": 98,
         "w": 12,
         "h": 8
       },
@@ -3668,7 +3862,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 98,
+        "y": 106,
         "w": 8,
         "h": 8
       },
@@ -3751,7 +3945,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 98,
+        "y": 106,
         "w": 8,
         "h": 8
       },
@@ -3834,7 +4028,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 98,
+        "y": 106,
         "w": 8,
         "h": 8
       },
@@ -3912,7 +4106,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 107,
+        "y": 115,
         "w": 24,
         "h": 1
       },
@@ -3928,7 +4122,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 108,
+        "y": 116,
         "w": 12,
         "h": 8
       },
@@ -3999,7 +4193,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 108,
+        "y": 116,
         "w": 12,
         "h": 8
       },
@@ -4082,7 +4276,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 116,
+        "y": 124,
         "w": 12,
         "h": 8
       },
@@ -4177,7 +4371,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 116,
+        "y": 124,
         "w": 12,
         "h": 8
       },
@@ -4272,7 +4466,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 124,
+        "y": 132,
         "w": 12,
         "h": 8
       },
@@ -4355,7 +4549,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 124,
+        "y": 132,
         "w": 12,
         "h": 8
       },
@@ -4423,7 +4617,7 @@
       "panels": [],
       "gridPos": {
         "x": 0,
-        "y": 132,
+        "y": 140,
         "w": 24,
         "h": 1
       }
@@ -4438,7 +4632,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 133,
+        "y": 141,
         "w": 12,
         "h": 8
       },
@@ -4515,7 +4709,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 133,
+        "y": 141,
         "w": 12,
         "h": 8
       },
@@ -4583,7 +4777,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 141,
+        "y": 149,
         "w": 12,
         "h": 8
       },
@@ -4660,7 +4854,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 141,
+        "y": 149,
         "w": 12,
         "h": 8
       },

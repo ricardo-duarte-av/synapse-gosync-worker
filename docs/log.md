@@ -1220,3 +1220,89 @@ would be better than repeating it.
 
 `knock` on the initial sync is implemented and untested: no local account is
 knocking on anything.
+
+## The typist who was never seen (2026-09-10)
+
+Reported from real clients: no typing indicator renders, on classic `/sync` or
+sliding sync. The two paths share one source, so one cause was likely.
+
+The metrics said the rows were arriving — 76,499 on the `typing` stream,
+159,602 wakeups from it — and said what was wrong right next to it:
+
+```
+gosync_replication_position{stream="typing"} 59314
+```
+
+while the live stream on Redis was issuing serials around 29,500:
+
+```
+RDATA typing av-edu-worker 29497 ["!wLPorXtsrvdGFGqsmu:aguiarvieira.pt",["@test:aguiarvieira.pt"]]
+```
+
+The EDU worker had restarted at 13:30 the day before, under a sync worker that
+had been up since 2026-09-07. Typing's serial is a counter in that worker's
+memory, so it restarted at zero. `advance` clamps every position to a maximum —
+correct for every stream backed by a table — so ours stayed at the pre-restart
+peak, every `next_batch` carried it as the typing key, and
+`TypingChangedSince(since.Typing)` never found a room whose serial had passed
+it. Silent in both paths, and permanent until a restart.
+
+Synapse handles the same event explicitly, and its comment names the cause:
+`TypingHandler.process_replication_rows` resets its caches and takes the token
+as given when it goes backwards. We now do the same, and the typing branch of
+`handleRDATA` advances the position before applying the rows so the reset does
+not eat the rows that came with it. See docs/tokens.md.
+
+Verified live on a second instance of the fixed build: `/sync` returned
+`m.typing` with the typist, and the sliding-sync `typing` extension returned
+both the typist and the empty `user_ids` that follows them stopping. The three
+legacy endpoints share `TypingIn` and are fixed by the same change.
+
+**The lesson is about the metric, not the bug.** A position that only ever goes
+up is an invariant everywhere else here, and this is the one stream where it is
+false. Nothing else in the worker asks a writer's in-memory counter for a
+number, so nothing else has this failure available to it.
+
+### Then the class, rather than the instance (2026-09-10)
+
+Typing was one instance of "Synapse restarted and we did not notice", so the
+rest of that class went in behind it.
+
+**The classification is Synapse's, not ours.** `resettableStreams` is the set
+of stream classes that do not override `can_discard_position` -- `typing`,
+`federation`, `presence_federation` -- and everything else keeps the clamp. Two
+of the three are streams this worker holds nothing from; listing them anyway is
+what stops a federation sender's restart being reported as an anomaly.
+
+**Backwards is judged per writer.** `events` has two persisters and the one
+behind reports a lower position constantly, so a per-stream comparison would
+have cried restart every few seconds. `lastByInstance` holds the last position
+from each writer of each stream, and it is kept across reconnects on purpose: a
+writer that restarted while we were disconnected is precisely the case worth
+catching.
+
+**POSITION's `prev` was being thrown away.** It says where the writer thinks we
+were; above ours, rows happened that we never saw. Nothing here has to act on
+that -- responses come from the database, and the stream-change caches already
+drop their horizon on a subject-less notification -- but it separates a worker
+that is behind from one that has lost rows, which nothing else did.
+
+**The first version of that classification cried wolf within fifteen minutes.**
+It warned on any backwards position, and `caches` produced one:
+`av-inbound-federation-worker-1` announced 85749540 and then 85749539. That is
+not a fault -- a writer of a multi-writer stream announces `max(its own
+position, persisted-up-to)`, which can fall, and Synapse discards such a
+position without comment. So only the resettable streams are counted, and the
+finding is pinned by a test named after it. A counter that ticks on ordinary
+traffic is worse than no counter, because it trains everyone to ignore it.
+
+**Two counters and a panel**, because that is the actual fix. The clamp being
+wrong cost a day of no typing while every indicator stayed green:
+`gosync_replication_stream_discontinuities_total{stream,reason}` with a
+`Writer restarts` and a `Replication gaps` stat, and a per-stream breakdown
+under them.
+
+Verified live: with the fixed build following the real channel, typing renders
+in both `/sync` and sliding sync, and neither counter moved during normal
+operation -- which is the false-positive test that mattered, since more than
+one stream here was reporting two writers' positions the whole time.

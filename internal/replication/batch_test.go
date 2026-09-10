@@ -36,7 +36,7 @@ func TestBatchRowsAreHeldUntilThePositionArrives(t *testing.T) {
 	s := newTestSub()
 	rec := &posListener{}
 	s.listener = rec
-	s.advance(StreamEvents, 500)
+	s.advance(StreamEvents, "av-event-persister-1", 500)
 
 	s.handle(`RDATA events p1 batch ` + eventRow("!a:e"))
 	s.handle(`RDATA events p1 batch ` + eventRow("!b:e"))
@@ -56,7 +56,7 @@ func TestBatchRowsAreAppliedAtTheFinalPosition(t *testing.T) {
 	s := newTestSub()
 	rec := &posListener{}
 	s.listener = rec
-	s.advance(StreamEvents, 500)
+	s.advance(StreamEvents, "av-event-persister-1", 500)
 
 	s.handle(`RDATA events p1 batch ` + eventRow("!a:e"))
 	s.handle(`RDATA events p1 batch ` + eventRow("!b:e"))

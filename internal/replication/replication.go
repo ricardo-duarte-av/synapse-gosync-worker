@@ -63,7 +63,41 @@ const (
 	// StreamPresenceFederation carries [destination, user_id]: presence to be
 	// sent to a remote server. Federation sender business, not ours.
 	StreamPresenceFederation = "presence_federation"
+	// StreamFederation carries the federation sender's outbound queue. Named
+	// only so it can be classified below; nothing here consumes it.
+	StreamFederation = "federation"
 )
+
+// resettableStreams are the streams whose position may legitimately go DOWN,
+// and what each one's serial actually is.
+//
+// This is Synapse's own classification, read off `can_discard_position`
+// (replication/tcp/streams/_base.py). A stream class that overrides it with
+// "these streams can't go backwards" is backed by a database sequence and
+// survives any restart; the three that do NOT override it keep their serial in
+// a writer's memory, where a restart puts it back to zero. Synapse names the
+// same set in `_process_position`: "to handle the case where the stream gets
+// reset (e.g. for `caches` and `typing` after the writer's restart)" -- caches
+// has since become database-backed, typing has not.
+//
+// For a stream in this map a lower position is news about a writer that
+// restarted: the position is adopted as given and anything derived from the
+// old serials is dropped, because those serials now name nothing. For every
+// other stream a lower position is clamped away as it always was, in silence
+// -- moving one backwards would ask a client to replay, and a writer
+// announcing one is ordinary traffic rather than a fault. See advance.
+//
+// Adopting the position wholesale is safe for the one that matters: typing has
+// a single writer by construction (Synapse refuses more than one entry in
+// stream_writers.typing). The other two feed nothing here -- no token field,
+// no derived state -- so their aggregate position is never read, and they are
+// in this map to keep a federation sender's restart from being reported as
+// something it is not.
+var resettableStreams = map[string]string{
+	StreamTyping:             "the typing handler's in-memory serial",
+	StreamFederation:         "the federation sender's in-memory queue",
+	StreamPresenceFederation: "the presence federation queue",
+}
 
 // silentStreams never wake a sync, with the reason each is here.
 //
@@ -143,6 +177,21 @@ type Subscriber struct {
 	// it in a counter on the typing worker and never writes it down.
 	typing map[string][]string
 
+	// lastByInstance is the last position seen from each writer of each
+	// stream, as stream -> instance -> position.
+	//
+	// Separate from `positions`, which is one number per stream because that
+	// is what a token wants. Whether a position went BACKWARDS can only be
+	// judged per writer: a stream with several instances -- events, with two
+	// persisters -- routinely reports a position below the maximum simply
+	// because the other writer is ahead, and reading that as a reset would
+	// cry restart on every second POSITION.
+	//
+	// Kept across reconnects on purpose. A writer that restarted while we were
+	// disconnected is exactly the case worth catching, and the sample from
+	// before the outage is the only evidence of it.
+	lastByInstance map[string]map[string]int64
+
 	// pending buffers the rows of a batch until the row that names the
 	// batch's position arrives. See handleRDATA.
 	pending map[string][]pendingRow
@@ -203,13 +252,14 @@ func (s *Subscriber) Positions() map[string]int64 {
 // New builds a Subscriber.
 func New(cfg Config, log zerolog.Logger, listener Listener) *Subscriber {
 	return &Subscriber{
-		cfg:          cfg,
-		log:          log,
-		listener:     listener,
-		positions:    map[string]int64{},
-		typing:       map[string][]string{},
-		typingSerial: map[string]int64{},
-		pending:      map[string][]pendingRow{},
+		cfg:            cfg,
+		log:            log,
+		listener:       listener,
+		positions:      map[string]int64{},
+		typing:         map[string][]string{},
+		typingSerial:   map[string]int64{},
+		lastByInstance: map[string]map[string]int64{},
+		pending:        map[string][]pendingRow{},
 	}
 }
 
@@ -452,7 +502,7 @@ func (s *Subscriber) handleRDATA(payload string) {
 	if len(parts) < 5 {
 		return
 	}
-	stream, token, row := parts[1], parts[3], parts[4]
+	stream, instance, token, row := parts[1], parts[2], parts[3], parts[4]
 
 	detail := rowDetails(stream, row)
 
@@ -514,6 +564,12 @@ func (s *Subscriber) handleRDATA(payload string) {
 	batch = append(batch, pendingRow{row: row, detail: detail})
 
 	if stream == StreamTyping {
+		// The position moves BEFORE the rows are applied, unlike every other
+		// stream below. A writer that has restarted announces itself by
+		// sending a position lower than the one we hold, and the reset that
+		// triggers must not discard the rows that arrived with it. Synapse
+		// orders it the same way.
+		s.advance(stream, instance, pos)
 		for _, r := range batch {
 			s.updateTyping(r.row, pos)
 		}
@@ -533,8 +589,8 @@ func (s *Subscriber) handleRDATA(payload string) {
 		}
 	}
 
-	if pos > 0 {
-		s.advance(stream, pos)
+	if pos > 0 && stream != StreamTyping {
+		s.advance(stream, instance, pos)
 	}
 	// A silent stream reaches nobody. See silentStreams for why each is there.
 	if silent {
@@ -611,22 +667,124 @@ func (s *Subscriber) handlePosition(payload string) {
 	if len(parts) < 5 {
 		return
 	}
+	stream, instance := parts[1], parts[2]
+	prev, prevErr := strconv.ParseInt(parts[3], 10, 64)
 	pos, err := strconv.ParseInt(parts[4], 10, 64)
 	if err != nil {
 		return
 	}
-	s.advance(parts[1], pos)
+
+	// `prev` is the position the writer believes we were at. If it is above
+	// what we hold, the stream moved further than the rows we saw and we
+	// cannot say what happened in between: we were disconnected, or a row was
+	// unparseable. Synapse decides the same thing on the same two numbers --
+	// `missing_updates = not (prev_token <= current_token <= new_token)` in
+	// _process_position -- and then fetches the missing rows over HTTP. We
+	// have no such path, and do not need one: everything served here is read
+	// from the database at request time, and the one cache that claims to
+	// know what changed gives up its horizon below, where the notification
+	// naming no subjects reaches it.
+	//
+	// So this is recorded rather than acted on. It is the difference between
+	// a worker that is behind and one that has quietly lost rows, and no
+	// other metric can tell them apart.
+	if ours := s.bestKnown(stream, instance); prevErr == nil && prev > ours {
+		metrics.StreamDiscontinuities.WithLabelValues(stream, "gap").Inc()
+		s.log.Info().Str("stream", stream).Str("instance", instance).
+			Int64("their_prev", prev).Int64("ours", ours).
+			Msg("replication gap; rows were missed and caches below this position are dropped")
+	}
+
+	s.advance(stream, instance, pos)
 	// No room or user is named, so this reaches every listener as "we do not
 	// know what changed" -- the notifier wakes everybody, and a stream-change
 	// cache must reset its horizon rather than assume it saw the rows in
 	// between.
-	s.notify(parts[1], pos, nil, nil)
+	s.notify(stream, pos, nil, nil)
 }
 
-func (s *Subscriber) advance(stream string, pos int64) {
+// bestKnown is the highest position we can claim to have seen for one writer
+// of one stream.
+//
+// The per-writer sample when there is one, and the stream's aggregate
+// otherwise -- which is the case at startup, where the aggregate is the
+// database seed and no writer has spoken yet. Falling back to it rather than
+// to zero keeps a fresh worker from reporting a gap on every stream in its
+// first seconds.
+func (s *Subscriber) bestKnown(stream, instance string) int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if pos, ok := s.lastByInstance[stream][instance]; ok {
+		return pos
+	}
+	return s.positions[stream]
+}
+
+// advance records a position reported by one writer of one stream.
+//
+// Three outcomes, and which one applies is decided by resettableStreams:
+//
+//   - The position moved forwards. The ordinary case.
+//   - It moved backwards on a stream whose serial lives in a writer's memory.
+//     That writer restarted; adopt the position and drop what we derived from
+//     the serials it has forgotten.
+//   - It moved backwards on a database-backed stream. Clamp it and say nothing:
+//     a token that moves backwards would ask clients to replay, and a writer
+//     announcing a lower position is ordinary traffic rather than a fault.
+func (s *Subscriber) advance(stream, instance string, pos int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if pos > s.positions[stream] {
-		s.positions[stream] = pos
+
+	last, seen := s.lastByInstance[stream][instance]
+	backwards := seen && pos < last
+	if s.lastByInstance[stream] == nil {
+		s.lastByInstance[stream] = map[string]int64{}
 	}
+	// The highest this writer has claimed, not the latest -- see the redundant
+	// case below. A writer that has restarted replaces it outright, further
+	// down, because its old high-water mark now names nothing.
+	if pos > last || !seen {
+		s.lastByInstance[stream][instance] = pos
+	}
+
+	what, resettable := resettableStreams[stream]
+	if !backwards || !resettable {
+		// The ordinary case, and also the redundant one. A writer of a
+		// multi-writer stream announces max(its own position, the position
+		// everything is persisted up to), so the number it sends can be BELOW
+		// one it sent a moment ago without anything being wrong: measured on
+		// this deployment as av-inbound-federation-worker-1 announcing
+		// caches 85749540 and then 85749539, fifteen minutes after a restart.
+		// Synapse discards those silently -- can_discard_position, "we already
+		// know the stream ID for the instance has advanced" -- so this cannot
+		// be logged or counted as an anomaly without crying wolf on ordinary
+		// traffic.
+		if pos > s.positions[stream] {
+			s.positions[stream] = pos
+		}
+		return
+	}
+
+	metrics.StreamDiscontinuities.WithLabelValues(stream, "reset").Inc()
+	s.log.Info().Str("stream", stream).Str("instance", instance).
+		Int64("from", last).Int64("to", pos).Str("serial", what).
+		Msg("stream went backwards; the writer restarted, resetting")
+	s.lastByInstance[stream][instance] = pos
+	s.dropDerivedStateLocked(stream)
+	s.positions[stream] = pos
+}
+
+// dropDerivedStateLocked forgets whatever a restarted writer's old serials
+// described. Called with the lock held.
+//
+// Only typing has any: the other two resettable streams are a federation
+// sender's business, and this worker keeps nothing from either. Their entry in
+// resettableStreams is still worth having -- it is what stops a backwards
+// position from them being reported as an anomaly.
+func (s *Subscriber) dropDerivedStateLocked(stream string) {
+	if stream != StreamTyping {
+		return
+	}
+	s.typing = map[string][]string{}
+	s.typingSerial = map[string]int64{}
 }

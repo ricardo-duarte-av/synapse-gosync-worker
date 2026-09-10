@@ -4,7 +4,10 @@ import (
 	"reflect"
 	"testing"
 
+	dto "github.com/prometheus/client_model/go"
 	"github.com/rs/zerolog"
+
+	"github.com/ricardo-duarte-av/synapse-gosync-worker/internal/metrics"
 )
 
 // Rows captured from the live replication channel. Getting a shape wrong costs
@@ -150,8 +153,8 @@ func TestTypingIsClearedWhenNotLive(t *testing.T) {
 // backwards, which would ask a client to replay what it already has.
 func TestPositionsOnlyAdvance(t *testing.T) {
 	s := newTestSub()
-	s.advance(StreamEvents, 100)
-	s.advance(StreamEvents, 90)
+	s.advance(StreamEvents, "av-event-persister-1", 100)
+	s.advance(StreamEvents, "av-event-persister-1", 90)
 	if got := s.Position(StreamEvents); got != 100 {
 		t.Errorf("position = %d, want 100", got)
 	}
@@ -162,6 +165,152 @@ func TestPositionsOnlyAdvance(t *testing.T) {
 	if got := s.Position(StreamTyping); got != 7 {
 		t.Errorf("typing seed = %d, want 7", got)
 	}
+}
+
+// Typing is the exception to the rule above, and has to be: its serial is a
+// counter in the typing writer's memory, so it restarts at zero when that
+// worker does. Holding the pre-restart maximum leaves every token's typing key
+// above every serial the new writer will issue, and typing is then never
+// reported again -- which is exactly what happened in production after the EDU
+// worker restarted under a running sync worker.
+func TestTypingPositionFollowsTheWriterBackwards(t *testing.T) {
+	s := newTestSub()
+	s.setLive(true)
+	s.handle(`RDATA typing av-edu-worker 59314 ["!r:e",["@a:e"]]`)
+	if got := s.Position(StreamTyping); got != 59314 {
+		t.Fatalf("typing position = %d, want 59314", got)
+	}
+
+	// The writer restarts and its counter begins again.
+	s.handle(`RDATA typing av-edu-worker 1 ["!other:e",["@b:e"]]`)
+	if got := s.Position(StreamTyping); got != 1 {
+		t.Errorf("typing position = %d, want 1 after the writer restarted", got)
+	}
+	// Serials from before the restart mean nothing now, so what they described
+	// is dropped -- but the row that came WITH the lower position survives.
+	if got := s.TypingIn("!r:e"); got != nil {
+		t.Errorf("pre-restart typists survived the reset: %v", got)
+	}
+	if got := s.TypingIn("!other:e"); len(got) != 1 || got[0] != "@b:e" {
+		t.Errorf("typing = %v, want @b:e", got)
+	}
+	if got := s.TypingChangedSince(0); len(got) != 1 || got[0] != "!other:e" {
+		t.Errorf("changed since 0 = %v, want only !other:e", got)
+	}
+
+	// A POSITION carries the same news when the restart happens while this
+	// process is between rows.
+	s.handle(`POSITION typing av-edu-worker 0 2`)
+	if got := s.Position(StreamTyping); got != 2 {
+		t.Errorf("typing position = %d, want 2", got)
+	}
+}
+
+// The classification, rather than one stream's symptom. Every stream backed by
+// a database sequence must ignore a lower position; the three whose serial
+// lives in a writer's memory must take it.
+func TestOnlyResettableStreamsFollowAWriterBackwards(t *testing.T) {
+	for _, stream := range []string{StreamEvents, StreamReceipts, StreamToDevice, StreamCaches} {
+		s := newTestSub()
+		s.advance(stream, "writer-1", 500)
+		s.advance(stream, "writer-1", 100)
+		if got := s.Position(stream); got != 500 {
+			t.Errorf("%s: position = %d, want 500 -- a table-backed stream may not go backwards", stream, got)
+		}
+	}
+	for stream := range resettableStreams {
+		s := newTestSub()
+		s.advance(stream, "writer-1", 500)
+		s.advance(stream, "writer-1", 100)
+		if got := s.Position(stream); got != 100 {
+			t.Errorf("%s: position = %d, want 100 -- its writer restarted", stream, got)
+		}
+	}
+}
+
+// A lower position on a database-backed stream is ORDINARY, not an anomaly, so
+// it must not be counted as one. A writer of a multi-writer stream announces
+// max(its own position, the position everything is persisted up to), which can
+// legitimately fall: av-inbound-federation-worker-1 announced caches 85749540
+// and then 85749539 within fifteen minutes on this deployment. Synapse
+// discards those silently and so must we -- a counter that ticks on ordinary
+// traffic is a counter nobody will look at when it matters.
+func TestARedundantLowerPositionIsNotADiscontinuity(t *testing.T) {
+	s := newTestSub()
+	before := discontinuities(t, StreamCaches, "reset")
+
+	s.advance(StreamCaches, "av-inbound-federation-worker-1", 85749540)
+	s.advance(StreamCaches, "av-inbound-federation-worker-1", 85749539)
+	if got := discontinuities(t, StreamCaches, "reset") - before; got != 0 {
+		t.Errorf("a redundant lower position counted %v discontinuities", got)
+	}
+	if got := s.Position(StreamCaches); got != 85749540 {
+		t.Errorf("position = %d, want 85749540", got)
+	}
+	// And it did not lower this writer's high-water mark either, or the next
+	// POSITION continuing from 85749540 would be reported as a gap.
+	before = discontinuities(t, StreamCaches, "gap")
+	s.handle(`POSITION caches av-inbound-federation-worker-1 85749540 85749541`)
+	if got := discontinuities(t, StreamCaches, "gap") - before; got != 0 {
+		t.Errorf("a continuation counted %v gaps", got)
+	}
+}
+
+// A stream with two writers reports a position below the maximum every time
+// the other one is ahead. That is not a reset, and reading it as one would
+// throw away typing -- or cry restart on every second POSITION -- on a
+// perfectly healthy deployment.
+func TestASecondWriterIsNotARestart(t *testing.T) {
+	s := newTestSub()
+	s.advance(StreamEvents, "av-event-persister-1", 500)
+	s.advance(StreamEvents, "av-event-persister-2", 100)
+	if got := s.Position(StreamEvents); got != 500 {
+		t.Errorf("position = %d, want 500", got)
+	}
+	s.advance(StreamEvents, "av-event-persister-2", 501)
+	if got := s.Position(StreamEvents); got != 501 {
+		t.Errorf("position = %d, want 501", got)
+	}
+}
+
+// A POSITION says where the writer thinks we were. If that is above where we
+// are, rows happened that we never saw -- which is a different failure from
+// merely being behind, and the only place the two are distinguishable.
+func TestAPositionGapIsCountedButStillAdvances(t *testing.T) {
+	s := newTestSub()
+	// Seeded from the database at startup, as the real one is.
+	s.Seed(map[string]int64{StreamReceipts: 150})
+	before := discontinuities(t, StreamReceipts, "gap")
+
+	s.handle(`POSITION receipts av-edu-worker 100 200`)
+	if got := discontinuities(t, StreamReceipts, "gap") - before; got != 0 {
+		t.Errorf("a first POSITION above the database seed counted %v gaps; the seed is what we know", got)
+	}
+	// Now we have a sample from this writer, and the next POSITION claims we
+	// were further along than we ever saw.
+	s.handle(`POSITION receipts av-edu-worker 300 400`)
+	if got := discontinuities(t, StreamReceipts, "gap") - before; got != 1 {
+		t.Errorf("gap count = %v, want 1", got)
+	}
+	if got := s.Position(StreamReceipts); got != 400 {
+		t.Errorf("position = %d, want 400: a gap is recorded, not acted on", got)
+	}
+	// A POSITION that continues from where we are is not a gap.
+	s.handle(`POSITION receipts av-edu-worker 400 500`)
+	if got := discontinuities(t, StreamReceipts, "gap") - before; got != 1 {
+		t.Errorf("a continuous POSITION counted a gap; total %v", got)
+	}
+}
+
+// discontinuities reads one counter. Written out rather than reached for via
+// prometheus/testutil, which would add a module to go.mod for four lines.
+func discontinuities(t *testing.T, stream, reason string) float64 {
+	t.Helper()
+	var m dto.Metric
+	if err := metrics.StreamDiscontinuities.WithLabelValues(stream, reason).Write(&m); err != nil {
+		t.Fatalf("reading the counter: %v", err)
+	}
+	return m.GetCounter().GetValue()
 }
 
 func TestHandleParsesLiveCommands(t *testing.T) {
@@ -190,7 +339,7 @@ func TestHandleParsesLiveCommands(t *testing.T) {
 // position. Parsing it as a number and failing would drop the row's wakeup.
 func TestBatchTokenIsAccepted(t *testing.T) {
 	s := newTestSub()
-	s.advance(StreamEvents, 500)
+	s.advance(StreamEvents, "av-event-persister-1", 500)
 	s.handle(`RDATA events av-event-persister-1 batch ["ev",["$x","!r:e","m.room.message",null,null,null,null,false,false]]`)
 	if got := s.Position(StreamEvents); got != 500 {
 		t.Errorf("a batch row moved the position to %d", got)

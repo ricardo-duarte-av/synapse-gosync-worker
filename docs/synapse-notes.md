@@ -37,6 +37,20 @@ literally, or was found only by querying the live database.
   never learns of a new event by persisting one. Without the Redis subscription
   `/sync` would still answer correctly, but only ever on timeout — it would look
   merely slow, not broken.
+- **Three replication streams can go BACKWARDS, and the source says which.**
+  `Stream.can_discard_position` (`replication/tcp/streams/_base.py:177`) is the
+  classification: every stream that overrides it does so with a comment saying
+  it "can't go backwards", and those are exactly the ones backed by a database
+  sequence. The three that do NOT override it -- `typing`, `federation`,
+  `presence_federation` -- keep their serial in a writer's memory, so it
+  restarts at zero when that worker does. `_process_position` names the
+  consequence directly: `missing_updates = not (prev_token <= current_token <=
+  new_token)`, "to handle the case where the stream gets reset (e.g. for
+  `caches` and `typing` after the writer's restart)". The comment is one
+  version out of date -- `caches` has since become database-backed and now
+  overrides `can_discard_position` -- and `typing` has not moved. Clamping a
+  position to a maximum, which is right for the other sixteen, silently
+  disables typing for as long as the process lives. See docs/tokens.md.
 - **`wait_for_stream_token` exists for a reason** (`notifier.py:835`). A `since`
   minted by a worker ahead of us must be waited for — polling
   `get_current_token()` every 500ms, capped at 10s — before answering, or we

@@ -91,3 +91,82 @@ that followed.
 Losing the connection empties the view rather than keeping it: a stale list
 would leave a room showing somebody typing forever, which is worse than showing
 nobody.
+
+## Three positions may go DOWN, and have to be allowed to
+
+Every other stream here is backed by a table, and its position may only ever
+move forwards: dragging one backwards would ask a client to replay what it
+already has. `advance` clamps to a maximum for exactly that reason.
+
+Typing is the exception, because its serial is not a sequence but a counter in
+the typing writer's memory (`TypingHandler._latest_room_serial`). When that
+worker restarts, the counter restarts at zero and the serials it issues are
+suddenly far below the ones it issued yesterday.
+
+Clamping then breaks typing completely, and quietly. The worker keeps the
+pre-restart maximum, every `next_batch` carries it as the typing key, and
+`TypingChangedSince(since.Typing)` compares live serials against a number none
+of them will reach for days — so no room is ever reported as having changed.
+Both `/sync` and the sliding-sync `typing` extension go silent, no error is
+logged, and nothing recovers until this process is restarted.
+
+Synapse takes the token as given and throws away what it knows, because serials
+from before the restart no longer mean anything:
+
+```python
+if self._latest_room_serial > token:
+    # The typing worker has gone backwards (e.g. it may have restarted).
+    # To prevent inconsistent data, just clear everything.
+    self._reset()
+self._latest_room_serial = token
+```
+
+We do the same, and by Synapse's own classification rather than by naming
+typing: `resettableStreams` is the set of streams whose class does not override
+`can_discard_position`, and for those `advance` takes the position as given and
+drops whatever the old serials described. The typing branch of `handleRDATA`
+advances the position BEFORE applying the rows, so the reset does not discard
+the rows that arrived with the lower position.
+
+Two details that are easy to get wrong:
+
+- **Backwards is judged per WRITER, not per stream.** `positions` is one number
+  per stream because that is what a token wants, but several streams here have
+  more than one writer, and the one that is behind reports a position below the
+  maximum as a matter of course. Reading that as a reset would throw typing
+  away on ordinary traffic, so the judgement uses `lastByInstance`, which is
+  per (stream, writer).
+- **A lower position on a database-backed stream is clamped and ignored, in
+  silence.** It is not an anomaly: a writer of a multi-writer stream announces
+  `max(its own position, the position everything is persisted up to)`, which
+  can fall -- `av-inbound-federation-worker-1` announced `caches` 85749540 and
+  then 85749539 within fifteen minutes here. Synapse discards those without
+  comment (`can_discard_position`), and an earlier version of this change
+  logged and counted them, which produced its first false alarm inside a
+  quarter of an hour.
+
+Found in production on 2026-09-10: the EDU worker had restarted under a running
+sync worker, which held 59,314 while the writer had climbed back to only
+29,500. No typing indicator had rendered in any client since.
+
+## POSITION carries what we were supposed to have seen
+
+`POSITION <stream> <instance> <prev> <new>` names two positions, and the first
+one is the interesting one: it is where the writer believes we were. Synapse
+tests both at once --
+
+```python
+missing_updates = not (cmd.prev_token <= current_token <= cmd.new_token)
+```
+
+-- and on a gap fetches the missing rows over HTTP. We have no such path and
+need none: every response here is read from the database at request time, and
+the one thing that claims to know what changed without asking is a
+stream-change cache, which already gives up its horizon when a notification
+names no room and no user (`cmd/gosync-worker/streamfeed.go`).
+
+So `prev` is recorded rather than acted on:
+`gosync_replication_stream_discontinuities_total{reason="gap"}`. It is the
+difference between a worker that is BEHIND and one that has quietly lost rows,
+and no other metric here separates them. `reason="reset"` on the same counter
+is the case above.

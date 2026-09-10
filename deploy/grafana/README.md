@@ -217,6 +217,62 @@ stopped: `reaped` flat at zero for days is the reaper, positions far above
 connections is the prune. `store_up` at 0 means the scrape could not reach the
 database, so the rest of that row is stale rather than zero.
 
+## The two discontinuity panels
+
+`Writer restarts` and `Replication gaps` count the two ways a stream position
+stops being a continuation of the one before it. Both are new, and both exist
+because of a failure that every other panel here reported as healthy.
+
+**`Writer restarts` is normally zero, and one is normally fine.** Typing's
+serial is a counter in the EDU worker's memory, so it restarts at zero whenever
+that worker does, and the position we hold has to follow it down. On
+2026-09-09 it did not: the worker restarted under a sync worker that clamps
+positions to a maximum, every `next_batch` kept carrying the pre-restart peak,
+and no typing indicator rendered in any client for a day. Rows kept arriving,
+wakeups kept firing, `gosync_replication_connected` stayed at 1. This counter is
+the only thing that would have shown it.
+
+So read it by stream, in `Position discontinuities`:
+
+| Where a `reset` lands | What it means |
+|---|---|
+| `typing` | the EDU worker restarted. Expected, handled, one per restart |
+| `federation`, `presence_federation` | a federation sender restarted. Nothing here consumes either |
+| anything else | cannot happen: only those three are counted |
+
+**Database-backed streams are deliberately not counted here, and that is not an
+oversight.** A writer of a multi-writer stream announces `max(its own position,
+the position everything is persisted up to)`, so the number it sends can be
+below one it sent a moment ago with nothing wrong --
+`av-inbound-federation-worker-1` announced `caches` 85749540 and then 85749539
+within fifteen minutes of a restart on this deployment. Synapse discards those
+silently. Counting them would tick this metric on ordinary traffic, which is
+the fastest way to make a panel nobody reads.
+
+**`Replication gaps` is about rows we never saw**, not about being behind. A
+POSITION carries the position the writer thinks we were at; when that is above
+ours, something happened in between — a disconnect, or a row whose shape we
+could not parse. No response is wrong because of it, since everything served
+here is read from the database at request time, but every stream-change cache
+below that position gives up its horizon. Expect a burst of gaps to be followed
+by a burst on `Queries the gates skipped` going the other way.
+
+A gap with `gosync_replication_connected` flat at 1 is the interesting case:
+nothing was disconnected, so a row shape in `rowDetails` has drifted from
+Synapse's.
+
+**To alert on gaps, keep the `or vector(0)`.** Neither series exists until the
+first discontinuity, and an alert on a series that does not exist does not fire
+-- the same trap the presence failure panels were built around:
+
+```
+sum(increase(gosync_replication_stream_discontinuities_total{reason="gap"}[1h]))
+  or vector(0)
+```
+
+`reset` is not worth alerting on: one per EDU worker restart is correct, and
+the failure it stands for is now handled rather than merely visible.
+
 ## What this dashboard cannot tell you
 
 Two blind spots, both known and neither instrumented yet:
