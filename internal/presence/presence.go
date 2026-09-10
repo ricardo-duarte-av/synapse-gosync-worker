@@ -40,6 +40,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -103,6 +104,22 @@ type Config struct {
 	RelayInterval time.Duration
 	// Timeout bounds one call to the writer. Zero means five seconds.
 	Timeout time.Duration
+	// Resolve re-reads Socket, URL and Secret from Synapse's own config.
+	//
+	// Optional, and the reason it exists is that all three change without
+	// anybody thinking about this worker: the presence writer moves between
+	// instances, its socket path moves with it, and the replication secret
+	// rotates. synapsecfg reads them at every start, but "every start" is not
+	// often enough -- the failure is silent, and presence simply stops working
+	// until somebody notices and restarts us.
+	//
+	// Called only when a relay fails in a way configuration could explain,
+	// never on the sync path's happy case, and no more than once per
+	// ResolveCooldown. RelayInterval in what it returns is ignored: the
+	// throttle is ours, not the writer's.
+	Resolve func() (Config, error)
+	// ResolveCooldown bounds how often Resolve runs. Zero means 30s.
+	ResolveCooldown time.Duration
 }
 
 // errWriterRefused marks a writer that answered with a non-200.
@@ -118,16 +135,35 @@ type sent struct {
 	when  time.Time
 }
 
-// Client relays presence to the writer.
-type Client struct {
+// target is where the writer is and how to authenticate to it.
+//
+// Held behind a pointer swap rather than a lock because every relay reads it
+// and only a failed relay ever replaces it: readers on the sync path must not
+// queue behind a re-read of a file.
+type target struct {
 	http    *http.Client
 	baseURL string
 	secret  string
+	// addr is what the config named, for logging and for deciding whether a
+	// re-read actually changed anything.
+	addr string
+}
+
+// Client relays presence to the writer.
+type Client struct {
+	current atomic.Pointer[target]
+	timeout time.Duration
 	relay   time.Duration
 	log     zerolog.Logger
 
 	mu   sync.Mutex
 	last map[key]sent
+
+	// resolve re-reads the writer's address and secret. See Config.Resolve.
+	resolve         func() (Config, error)
+	resolveCooldown time.Duration
+	resolveMu       sync.Mutex
+	lastResolve     time.Time
 
 	// now is overridable for tests.
 	now func() time.Time
@@ -157,29 +193,51 @@ func New(cfg Config, log zerolog.Logger) (*Client, error) {
 		relay = DefaultRelayInterval
 	}
 
-	c := &Client{
-		secret: cfg.Secret,
-		relay:  relay,
-		log:    log,
-		last:   map[key]sent{},
-		now:    time.Now,
+	cooldown := cfg.ResolveCooldown
+	if cooldown <= 0 {
+		cooldown = DefaultResolveCooldown
 	}
 
+	c := &Client{
+		timeout:         timeout,
+		relay:           relay,
+		log:             log,
+		last:            map[key]sent{},
+		resolve:         cfg.Resolve,
+		resolveCooldown: cooldown,
+		now:             time.Now,
+	}
+	c.current.Store(newTarget(cfg.Socket, cfg.URL, cfg.Secret, timeout))
+	return c, nil
+}
+
+// DefaultResolveCooldown bounds how often a failing relay re-reads Synapse's
+// config.
+//
+// Short enough that a writer that moved is picked up within a sync loop or two,
+// long enough that a writer which is simply down does not turn every relay into
+// a file read. A relay is already rare -- one per device per 25 seconds.
+const DefaultResolveCooldown = 30 * time.Second
+
+// newTarget builds the HTTP client for one writer address.
+func newTarget(socket, url, secret string, timeout time.Duration) *target {
+	t := &target{secret: secret}
 	transport := &http.Transport{}
-	if cfg.Socket != "" {
-		socket := cfg.Socket
+	if socket != "" {
+		t.addr = socket
 		transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
 			var d net.Dialer
 			return d.DialContext(ctx, "unix", socket)
 		}
 		// The host is ignored for a unix socket but has to be syntactically
 		// present for net/http to build a request at all.
-		c.baseURL = "http://synapse-replication"
+		t.baseURL = "http://synapse-replication"
 	} else {
-		c.baseURL = strings.TrimSuffix(cfg.URL, "/")
+		t.addr = url
+		t.baseURL = strings.TrimSuffix(url, "/")
 	}
-	c.http = &http.Client{Transport: transport, Timeout: timeout}
-	return c, nil
+	t.http = &http.Client{Transport: transport, Timeout: timeout}
+	return t
 }
 
 // SetState relays a presence state for one device.
@@ -219,6 +277,18 @@ func (c *Client) SetState(ctx context.Context, userID, deviceID, state string, i
 	start := c.now()
 	err := c.post(ctx, userID, deviceID, state, isSync)
 	metrics.PresenceRelayDuration.Observe(c.now().Sub(start).Seconds())
+
+	// A relay that failed for a reason configuration could explain is the
+	// signal to go and re-read Synapse's config: the writer moves between
+	// instances and the secret rotates, and neither event announces itself.
+	// If it had in fact moved, the retry lands on the new writer and the
+	// caller never sees a failure at all.
+	if err != nil && c.reresolve(failureReason(err)) {
+		start = c.now()
+		err = c.post(ctx, userID, deviceID, state, isSync)
+		metrics.PresenceRelayDuration.Observe(c.now().Sub(start).Seconds())
+	}
+
 	if err != nil {
 		// A failed relay must not be remembered as sent, or the throttle would
 		// suppress retries for a whole interval and the user would look offline
@@ -261,6 +331,7 @@ type setStateBody struct {
 }
 
 func (c *Client) post(ctx context.Context, userID, deviceID, state string, isSync bool) error {
+	t := c.current.Load()
 	var dev *string
 	if deviceID != "" {
 		dev = &deviceID
@@ -278,16 +349,16 @@ func (c *Client) post(ctx context.Context, userID, deviceID, state string, isSyn
 	// The user ID goes in the path and contains a colon and an @, both legal
 	// in a path segment; Synapse's own client does not escape them and its
 	// route regex expects them raw.
-	url := c.baseURL + "/_synapse/replication/presence_set_state/" + userID
+	url := t.baseURL + "/_synapse/replication/presence_set_state/" + userID
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("presence: request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+c.secret)
+	req.Header.Set("Authorization", "Bearer "+t.secret)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.http.Do(req)
+	resp, err := t.http.Do(req)
 	if err != nil {
 		return fmt.Errorf("presence: set state: %w", err)
 	}
@@ -299,6 +370,74 @@ func (c *Client) post(ctx context.Context, userID, deviceID, state string, isSyn
 		return fmt.Errorf("%w: answered %d", errWriterRefused, resp.StatusCode)
 	}
 	return nil
+}
+
+// reresolve re-reads Synapse's config after a failed relay and adopts a writer
+// that has moved or a secret that has rotated. It reports whether anything
+// changed, which is the caller's cue to retry.
+//
+// Only two failures can be explained by configuration:
+//
+//	unreachable  nothing accepted a connection. The writer moved off this
+//	             socket, or moved to another instance entirely.
+//	refused      it answered with something other than 200, which for this
+//	             endpoint is almost always a rotated replication secret.
+//
+// A timeout means the writer is there and slow, and a cancelled request means
+// the syncing client hung up; re-reading a file would help neither, and doing
+// it on every timeout would turn an overloaded writer into a busy loop over
+// homeserver.yaml.
+func (c *Client) reresolve(reason string) bool {
+	if c.resolve == nil {
+		return false
+	}
+	if reason != metrics.PresenceUnreachable && reason != metrics.PresenceRefused {
+		return false
+	}
+
+	c.resolveMu.Lock()
+	defer c.resolveMu.Unlock()
+	now := c.now()
+	if !c.lastResolve.IsZero() && now.Sub(c.lastResolve) < c.resolveCooldown {
+		return false
+	}
+	c.lastResolve = now
+
+	cfg, err := c.resolve()
+	if err != nil {
+		// Not fatal, and deliberately not loud enough to drown the relay
+		// failure that prompted it: the config being unreadable is a second
+		// problem, not the one the user is having.
+		metrics.PresenceConfigReloads.WithLabelValues(metrics.PresenceReloadError).Inc()
+		c.log.Warn().Err(err).Msg("presence relay failed and Synapse's config could not be re-read")
+		return false
+	}
+
+	current := c.current.Load()
+	addr := cfg.Socket
+	if addr == "" {
+		addr = cfg.URL
+	}
+	if addr == current.addr && cfg.Secret == current.secret {
+		metrics.PresenceConfigReloads.WithLabelValues(metrics.PresenceReloadUnchanged).Inc()
+		return false
+	}
+	if addr == "" || cfg.Secret == "" {
+		// Refusing an empty answer rather than adopting it: half a config is
+		// how a running worker loses a working writer to a file that was being
+		// rewritten as we read it.
+		metrics.PresenceConfigReloads.WithLabelValues(metrics.PresenceReloadError).Inc()
+		c.log.Warn().Msg("presence: Synapse's config named no writer or no secret; keeping the current one")
+		return false
+	}
+
+	c.current.Store(newTarget(cfg.Socket, cfg.URL, cfg.Secret, c.timeout))
+	metrics.PresenceConfigReloads.WithLabelValues(metrics.PresenceReloadChanged).Inc()
+	c.log.Info().
+		Str("from", current.addr).Str("to", addr).
+		Bool("secret_changed", cfg.Secret != current.secret).
+		Msg("presence writer moved; adopted from Synapse's config")
+	return true
 }
 
 // failureReason classifies a relay failure into something actionable.

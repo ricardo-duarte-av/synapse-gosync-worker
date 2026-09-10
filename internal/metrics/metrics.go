@@ -223,6 +223,25 @@ var (
 		Help: "Presence relays that failed, by reason.",
 	}, []string{"reason"})
 
+	// PresenceConfigReloads counts re-reads of Synapse's homeserver.yaml
+	// prompted by a relay that could not be delivered.
+	//
+	// The writer moves between workers and the replication secret rotates, and
+	// neither event tells this worker anything: the symptom is presence
+	// quietly not working until somebody restarts it. A relay failure is the
+	// signal to go and look again.
+	//
+	//	changed    the config had moved on and this worker adopted it. Expect
+	//	           these in ones, next to a burst of relay failures that stops.
+	//	unchanged  the config still says what it said. The writer is down, or
+	//	           the failure was never about configuration.
+	//	error      homeserver.yaml could not be read or parsed. The mount is
+	//	           gone, or Synapse is mid-write.
+	PresenceConfigReloads = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "gosync_presence_config_reloads_total",
+		Help: "Re-reads of Synapse's config after a failed presence relay, by outcome.",
+	}, []string{"outcome"})
+
 	// PresenceRelayDuration times one call to the presence writer.
 	//
 	// This is the only synchronous outbound call on the sync path, so a writer
@@ -248,6 +267,13 @@ const (
 	PresenceClientGone  = "client_gone"
 )
 
+// Outcomes of a re-read of Synapse's config.
+const (
+	PresenceReloadChanged   = "changed"
+	PresenceReloadUnchanged = "unchanged"
+	PresenceReloadError     = "error"
+)
+
 // RegisterPresence exposes the relay throttle's size.
 //
 // It is a gauge rather than a counter because it is a live population: one
@@ -265,6 +291,11 @@ func RegisterPresence(tracked func() int) {
 		PresenceUnreachable, PresenceRefused, PresenceTimeout, PresenceClientGone,
 	} {
 		PresenceRelayFailures.WithLabelValues(reason)
+	}
+	for _, outcome := range []string{
+		PresenceReloadChanged, PresenceReloadUnchanged, PresenceReloadError,
+	} {
+		PresenceConfigReloads.WithLabelValues(outcome)
 	}
 
 	prometheus.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{

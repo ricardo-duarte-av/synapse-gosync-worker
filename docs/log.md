@@ -1306,3 +1306,35 @@ Verified live: with the fixed build following the real channel, typing renders
 in both `/sync` and sliding sync, and neither counter moved during normal
 operation -- which is the false-positive test that mattered, since more than
 one stream here was reporting two writers' positions the whole time.
+
+### The same failure, in the presence client (2026-09-10)
+
+The presence writer's address and the replication secret come out of Synapse's
+homeserver.yaml, read once at start. Both change without anybody thinking about
+this worker -- the writer moves between instances when workers are rebalanced,
+the secret rotates -- and the symptom is the same shape as the typing one:
+presence silently stops working, nothing logs an error, and it stays that way
+until somebody restarts the process.
+
+Every start is not often enough for a worker that runs for weeks, and a timer
+is the wrong instrument: the file changes twice a year, and polling it says
+nothing about whether our copy is stale. A relay that FAILED is the only
+evidence there is, so that is what triggers the re-read -- and only for the two
+failures configuration could explain:
+
+| Failure | Re-read? |
+|---|---|
+| `unreachable` | yes. Nothing accepted a connection: the writer moved |
+| `refused` | yes. It answered non-200, which here is almost always a rotated secret |
+| `timeout` | no. The writer is there and slow, and re-reading a file on every timeout turns an overloaded writer into a busy loop over homeserver.yaml |
+| `client_gone` | no. The syncing client hung up; nothing about us is wrong |
+
+Bounded to one read per 30 seconds, and the relay is retried once when the
+config had in fact moved, so the caller never sees the failure at all. A
+half-read config -- an empty address or an empty secret, which is what a file
+caught mid-write looks like -- is refused rather than adopted: losing a working
+writer to a bad read is worse than the failure it would be fixing.
+
+`gosync_presence_config_reloads_total{outcome}` records all three answers.
+Unit-tested only: presence is disabled on this homeserver, so there is no live
+path to drive it.

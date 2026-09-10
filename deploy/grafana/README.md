@@ -294,6 +294,15 @@ Presence is the only thing this worker *tells* Synapse rather than asks it, and
 it is the only synchronous outbound call on the sync path. That makes its panels
 read differently from everything else here.
 
+**`Relay failures by reason` now has a companion**, `gosync_presence_config_reloads_total`.
+A relay that fails as `unreachable` or `refused` makes this worker re-read
+Synapse's `homeserver.yaml`, because both are what a moved writer or a rotated
+secret look like. `outcome="changed"` means it had moved and we followed it --
+expect one, alongside a burst of failures that then stops. A long run of
+`unchanged` next to sustained failures means the writer is simply down, and no
+amount of re-reading will help. `error` means the file could not be read at
+all: the mount is gone, or Synapse was writing it as we looked.
+
 **`Relays vs suppressed` should look lopsided, and that is health.** Clients
 sync in a loop; the writer's timers are far coarser; one relay per device per
 25 seconds is enough to hold a user online. Suppressed should dwarf delivered by

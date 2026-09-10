@@ -234,6 +234,13 @@ replication secret rotates, the presence writer moves between workers, and its
 socket path changes, and a duplicate would not fail loudly when it drifted. The
 container must mount that file read-only.
 
+Every start is not often enough on a worker that runs for weeks, so it is also
+re-read when a relay fails as `unreachable` or `refused` — the two failures a
+moved writer or a rotated secret would produce — at most once every 30s, and
+the relay is retried once if it had in fact moved. Not on a timeout: that means
+the writer is there and slow, and re-reading a file would only make an
+overloaded writer expensive.
+
 Two behaviours to not get backwards:
 
 - `set_presence=offline` means **leave my presence alone**, not "set me

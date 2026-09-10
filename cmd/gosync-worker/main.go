@@ -186,6 +186,11 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 				Secret: sc.ReplicationSecret,
 				RelayInterval: presence.DeriveRelayInterval(
 					sc.SyncOnlineTimeout, sc.LastActiveGranularity),
+				// Read once here and again whenever a relay fails in a way
+				// this file could explain. The writer moves between instances
+				// and the secret rotates; both are silent, and "at every
+				// start" is not often enough when the worker runs for weeks.
+				Resolve: resolvePresence(cfg.SynapseConfig),
 			}, log)
 			if err != nil {
 				return err
@@ -544,5 +549,38 @@ func reapSlidingConnections(ctx context.Context, sliding *slidingstore.Store,
 				log.Info().Int64("connections", n).Msg("reaped stale sliding sync connections")
 			}
 		}
+	}
+}
+
+// resolvePresence re-reads the presence writer's address and secret out of
+// Synapse's homeserver.yaml.
+//
+// Handed to the presence client rather than called on a timer: the only moment
+// this worker has evidence that its copy is stale is a relay that failed, and
+// polling a file that changes twice a year is worse than reading it on the two
+// failures that mean it changed.
+//
+// Presence being turned off since we started is reported as an error rather
+// than as an empty writer. It leaves the existing client in place, still
+// relaying to a writer that now ignores it -- which is harmless, and strictly
+// better than this function's alternative of tearing down a working relay on
+// the strength of one unreadable read.
+func resolvePresence(path string) func() (presence.Config, error) {
+	if path == "" {
+		return nil
+	}
+	return func() (presence.Config, error) {
+		sc, err := synapsecfg.Load(path)
+		if err != nil {
+			return presence.Config{}, err
+		}
+		if !sc.PresenceEnabled {
+			return presence.Config{}, fmt.Errorf("presence is now disabled on this homeserver")
+		}
+		return presence.Config{
+			Socket: sc.PresenceWriter.Socket,
+			URL:    sc.PresenceWriter.URL,
+			Secret: sc.ReplicationSecret,
+		}, nil
 	}
 }
