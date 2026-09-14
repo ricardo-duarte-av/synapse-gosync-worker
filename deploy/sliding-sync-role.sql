@@ -57,7 +57,12 @@ CREATE SCHEMA IF NOT EXISTS gosync AUTHORIZATION gosync_ss;
 
 -- Deliberately NOT granted: USAGE on schema public. Without it this role
 -- cannot so much as name Synapse's tables, which is the guarantee the startup
--- check verifies. Note that `gosync` must therefore be the whole search_path.
+-- check verifies. The worker also pins search_path = gosync on its own
+-- connections, so this setting is belt and braces.
+--
+-- SINGLE DATABASE USER: if sliding_sync.dsn names a role Synapse also uses,
+-- replace gosync_ss with that role throughout, and DELETE the two ALTER ROLE
+-- lines below -- on Synapse's role they would redirect Synapse's own queries.
 ALTER ROLE gosync_ss SET search_path = gosync;
 ALTER ROLE gosync_ss SET statement_timeout = '60s';
 

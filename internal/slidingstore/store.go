@@ -78,6 +78,12 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if cfg.ConnectTimeout > 0 {
 		pcfg.ConnConfig.ConnectTimeout = cfg.ConnectTimeout
 	}
+	// Pinned here rather than trusted to the role. Every query below names its
+	// tables unqualified, and Synapse has tables of the SAME NAMES in `public`.
+	// A role whose search_path reaches `public` -- any role but the one from
+	// sliding-sync-role.sql, e.g. a single shared database user -- would
+	// otherwise read and write Synapse's own connection state for real clients.
+	pcfg.ConnConfig.RuntimeParams["search_path"] = "gosync"
 
 	pool, err := pgxpool.NewWithConfig(ctx, pcfg)
 	if err != nil {
