@@ -2,6 +2,7 @@ package slidingstore
 
 import (
 	"context"
+	_ "embed"
 	"errors"
 	"fmt"
 	"time"
@@ -56,7 +57,14 @@ type Store struct {
 	now  func() int64
 	// broad is why the role reaches beyond the gosync schema, or "".
 	broad string
+	// created is whether Open had to create the tables.
+	created bool
 }
+
+// schemaSQL creates the tables when they are missing. See ensureSchema.
+//
+//go:embed schema.sql
+var schemaSQL string
 
 // Open connects and verifies the role can write its own schema.
 //
@@ -98,6 +106,12 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 		pool: pool,
 		now:  func() int64 { return time.Now().UnixMilli() },
 	}
+	// Before checkGrants, which names gosync.sliding_sync_connections and
+	// errors if it does not exist.
+	if err := s.ensureSchema(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
 	if err := s.checkGrants(ctx); err != nil {
 		pool.Close()
 		return nil, err
@@ -118,6 +132,45 @@ func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 // Broad reports why the role can reach Synapse's own tables, or "" if it
 // cannot.
 func (s *Store) Broad() string { return s.broad }
+
+// Created reports whether Open created the tables.
+func (s *Store) Created() bool { return s.created }
+
+// ensureSchema creates the gosync schema and its tables if they are missing.
+//
+// Only when missing, and the schema separately from the tables: CREATE SCHEMA
+// needs CREATE on the database even with IF NOT EXISTS, which the narrow role
+// from deploy/sliding-sync-role.sql does not hold -- that script creates the
+// schema for it, and this creates the tables inside it. A single shared
+// database user usually holds both.
+func (s *Store) ensureSchema(ctx context.Context) error {
+	var complete, schemaExists bool
+	// to_regclass returns NULL, not an error, when the schema itself is absent.
+	// The lazy-members table is created last, so its presence means all of it.
+	if err := s.pool.QueryRow(ctx, `
+		SELECT to_regclass('gosync.sliding_sync_connection_lazy_members') IS NOT NULL,
+		       EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'gosync')`).
+		Scan(&complete, &schemaExists); err != nil {
+		return fmt.Errorf("slidingstore: check schema: %w", err)
+	}
+	if complete {
+		return nil
+	}
+	if !schemaExists {
+		if _, err := s.pool.Exec(ctx, `CREATE SCHEMA IF NOT EXISTS gosync`,
+			pgx.QueryExecModeSimpleProtocol); err != nil {
+			return fmt.Errorf("slidingstore: create schema gosync (the role needs CREATE "+
+				"on the database; otherwise run deploy/sliding-sync-role.sql): %w", err)
+		}
+	}
+	// Several statements in one simple-protocol message run as one implicit
+	// transaction, so a failure leaves nothing half-created.
+	if _, err := s.pool.Exec(ctx, schemaSQL, pgx.QueryExecModeSimpleProtocol); err != nil {
+		return fmt.Errorf("slidingstore: create tables in gosync: %w", err)
+	}
+	s.created = true
+	return nil
+}
 
 func (s *Store) checkGrants(ctx context.Context) error {
 	var (

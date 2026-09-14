@@ -326,6 +326,9 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 			return err
 		}
 		defer sliding.Close()
+		if sliding.Created() {
+			log.Info().Msg("sliding_sync: created the gosync schema's tables")
+		}
 		if why := sliding.Broad(); why != "" {
 			log.Warn().Str("reason", why).
 				Msg("sliding_sync role is broader than needed; see deploy/sliding-sync-role.sql")

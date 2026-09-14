@@ -116,6 +116,11 @@ to_device:
 sliding_sync:
   enabled: false
   # Same libpq string as `database` above; TCP works the same way.
+  #
+  # The worker creates the `gosync` tables at startup when they are missing,
+  # and the schema too if the role has CREATE on the database. A single shared
+  # database user therefore needs no setup; the narrow role gets its schema
+  # from deploy/sliding-sync-role.sql.
   dsn: "host=/var/sockets user=gosync_ss dbname=synapse-db"
   max_conns: 8
   connect_timeout_seconds: 10

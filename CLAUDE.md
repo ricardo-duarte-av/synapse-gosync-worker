@@ -279,7 +279,10 @@ has already been told — is not derivable from a token. Even loading it prunes
 forked positions and bumps a timestamp. `internal/slidingstore` is the only
 package that writes it, behind role `gosync_ss`, which owns the `gosync` schema
 and has **nothing in `public`**. Startup warns about (and no longer refuses) a
-role that can read `public.events`. `internal/store` is still 100% `SELECT`.
+role that can read `public.events`. `internal/store` is still 100% `SELECT`. The tables are
+created by `slidingstore.Open` when missing (`internal/slidingstore/schema.sql`,
+every name qualified, because Synapse has tables of the same names in
+`public`); the role script only makes the role and its schema.
 
 **Our `pos` is not Synapse's.** The tables are ours, so a client cannot move
 between `gosync.aguiarvieira.pt` and `aguiarvieira.pt` mid-connection; it gets
