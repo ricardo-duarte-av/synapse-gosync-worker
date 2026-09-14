@@ -429,12 +429,9 @@ func (c *Config) validate() error {
 			return fmt.Errorf("sliding_sync.enabled is set but sliding_sync.dsn is empty; " +
 				"see deploy/sliding-sync-role.sql")
 		}
-		// The same guard to_device has, for the same reason: pointing this at
-		// the read-only role fails later, at the first write, on a request.
-		if c.SlidingSync.DSN == c.Database.DSN {
-			return fmt.Errorf("sliding_sync.dsn is the same as database.dsn; " +
-				"it must name the writing role from deploy/sliding-sync-role.sql")
-		}
+		// Deliberately no check against database.dsn: a deployment with a
+		// single database user shares it. slidingstore.Open still refuses a
+		// read-only role at startup, and warns about one that can read public.
 	}
 	return nil
 }
