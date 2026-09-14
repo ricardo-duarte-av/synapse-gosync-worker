@@ -3,21 +3,18 @@
 # A Go reimplementation of Synapse's classic /sync worker. It reads Synapse's
 # PostgreSQL directly and follows Synapse's replication stream over Redis.
 #
-# Nothing is routed to this worker. It exists to be driven deliberately by
-# cmd/syncdiff and by a test account, and compared against a real Synapse sync
-# worker, until its answers are trusted.
+# It is routed to on its own hostname only (gosync.aguiarvieira.pt), and
+# compared against a real Synapse sync worker by cmd/syncdiff.
 
 server_name: aguiarvieira.pt
 
 listen:
-  # NOT under /var/sockets/nginx. Everything in that directory is an nginx
-  # upstream by convention, and this worker must never receive real client
-  # traffic by accident.
-  socket: /var/sockets/gosync-worker.sock
-  # 0660 is enough: only the comparator and the operator connect here. Synapse's
-  # own worker sockets are 0666 because nginx runs in another container as a
-  # different uid, which does not apply to us.
-  socket_mode: "0660"
+  # An nginx upstream like any Synapse worker's, so it lives alongside theirs.
+  # Only the second hostname (gosync.aguiarvieira.pt) routes here; see CLAUDE.md §2.
+  socket: /var/sockets/nginx/gosync-worker.sock
+  # 0666 because nginx runs in another container as a different uid. 0660 (the
+  # default) is enough only when nothing but cmd/syncdiff connects.
+  socket_mode: "0666"
   #
   # TCP instead. Set EXACTLY ONE of socket and addr; the worker refuses to start
   # with both or neither, rather than silently preferring one.
@@ -68,9 +65,10 @@ database:
 # omitted entirely, which is correct as long as a real Synapse worker is also
 # syncing that device.
 #
-# The dsn must name the narrow role from deploy/device-inbox-role.sql, granted
-# SELECT and DELETE on device_inbox and nothing else. The worker verifies that
-# at startup and refuses to run if the role is broader.
+# The dsn should name the narrow role from deploy/device-inbox-role.sql, granted
+# SELECT and DELETE on device_inbox and nothing else. The worker checks that at
+# startup and logs a warning if the role is broader; it refuses only a role that
+# is read-only or cannot delete.
 #
 # WARNING: enabling this makes the worker destructive for every device that
 # syncs against it. A device syncing against BOTH this worker and Synapse will
@@ -80,9 +78,10 @@ database:
 # would delete messages that client has not yet seen. Point it at test devices.
 to_device:
   enabled: false
-  # Same libpq string as `database` above; TCP works the same way. Keep it a
-  # SEPARATE role even on the same host -- that separation is the whole safety
-  # argument for this section.
+  # Same libpq string as `database` above; TCP works the same way. A SEPARATE
+  # role is strongly recommended -- that separation is the safety argument for
+  # this section -- but the same dsn as `database` is accepted when only one
+  # database user is available.
   dsn: "host=/var/sockets user=gosync_inbox dbname=synapse-db"
   max_conns: 4
   connect_timeout_seconds: 10
@@ -103,8 +102,9 @@ to_device:
 #
 # So the containment is a whole schema rather than one table. The role owns
 # `gosync` and has NOTHING in `public` -- it cannot read Synapse's tables, let
-# alone write them -- and the worker verifies that at startup and refuses a role
-# that can. internal/store keeps its read-only role and its check.
+# alone write them -- and the worker checks that at startup and warns about a
+# role that can (e.g. a single shared database user). internal/store keeps its
+# read-only role and its check.
 #
 # Consequence worth knowing: our `pos` is NOT interchangeable with Synapse's.
 # A client that switches between this host and the real one mid-connection gets
@@ -193,31 +193,6 @@ auth:
   negative_ttl: 30s
   max_entries: 20000
   timeout_seconds: 10
-
-# The Synapse sync worker that cmd/syncdiff compares against.
-#
-# It MUST have `sync_response_cache_duration: 0`. Synapse caches a sync response
-# keyed by (user, timeout, since, filter, full_state, device_id, ...) for two
-# minutes by default -- five on av-sync-worker-1. A comparator that replays a
-# request against a caching worker is handed a frozen earlier answer and told it
-# matched, which is the most dangerous possible failure mode: it reports success.
-#
-# For the same reason this must not be av-sync-worker-1, which serves real
-# clients and whose cache is deliberately longer (5m, set explicitly).
-#
-# av-sync-worker-2 is up with the cache disabled. Note that its socket lives
-# under /var/sockets/nginx/ by Synapse's worker convention even though nginx
-# routes nothing to it.
-reference:
-  # Set EXACTLY ONE of socket and url -- but note that NOTHING READS THIS BLOCK
-  # today. It is validated and then ignored: cmd/syncdiff takes the reference
-  # from its own -ref-socket flag, which has no url counterpart, so the url form
-  # here has no effect anywhere. Recorded rather than quietly deleted because
-  # the validation is real and would reject a config that set both.
-  #
-  #   socket: /var/sockets/nginx/av-sync-worker-2.sock
-  #   url: "http://av-sync-worker-2:8083"   # accepted, currently unused
-  socket: /var/sockets/nginx/av-sync-worker-2.sock
 
 # Parts of Synapse's experimental_features that change what a response contains.
 #

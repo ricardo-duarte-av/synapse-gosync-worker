@@ -59,18 +59,15 @@ type Config struct {
 
 // Listen describes where this worker serves the client API.
 //
-// Nothing in nginx routes to it. The socket lives outside the shared
-// /var/sockets/nginx directory on purpose, so that a stray upstream block
-// cannot send real client traffic here by accident.
+// nginx routes to it on its own hostname only (CLAUDE.md §2).
 type Listen struct {
 	// Socket is a unix socket path, matching the Synapse worker convention.
 	Socket string `yaml:"socket"`
 	// Addr is a TCP address such as ":8090". Exactly one of Socket or Addr.
 	Addr string `yaml:"addr"`
 	// SocketMode is the permission bits applied to Socket, as an octal string.
-	// Defaults to "0660". Synapse's own worker sockets are 0666 because nginx
-	// runs in a separate container as a different uid; nothing connects to this
-	// one but us, so the tighter default is correct here.
+	// Defaults to "0660", which suffices for cmd/syncdiff alone. Behind nginx it
+	// must be "0666": nginx runs in a separate container as a different uid.
 	SocketMode string `yaml:"socket_mode"`
 }
 
@@ -121,8 +118,9 @@ type SlidingSync struct {
 	Enabled bool `yaml:"enabled"`
 	// DSN is a libpq connection string for the role from
 	// deploy/sliding-sync-role.sql: owner of the `gosync` schema, with nothing
-	// in `public`. The worker verifies that narrowness at startup and refuses
-	// a role that can read Synapse's tables.
+	// in `public`. The worker checks that narrowness at startup and warns about
+	// a role that can read Synapse's tables; it refuses only a role that cannot
+	// write `gosync`.
 	DSN string `yaml:"dsn"`
 	// MaxConns bounds the writing pool. Zero means 8.
 	MaxConns int `yaml:"max_conns"`
@@ -406,10 +404,6 @@ func (c *Config) validate() error {
 	if c.ToDevice.Enabled {
 		if c.ToDevice.DSN == "" {
 			return fmt.Errorf("to_device: dsn is required when enabled")
-		}
-		if c.ToDevice.DSN == c.Database.DSN {
-			return fmt.Errorf("to_device: dsn must not be the read-only database dsn; " +
-				"deletion needs its own narrowly granted role")
 		}
 	}
 	if c.ToDevice.MaxConns < 0 || c.ToDevice.ConnectTimeoutSeconds < 0 {

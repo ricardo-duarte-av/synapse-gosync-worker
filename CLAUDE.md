@@ -89,9 +89,10 @@ for. Two consequences drive everything:
 - **This worker reads, with one named exception.** Every query in
   `internal/store` is a `SELECT` and the role enforces it. To-device deletion
   (`internal/deviceinbox`) is the sole write: a separate package, a separate
-  pool, a separate role granted `SELECT, DELETE` on `device_inbox` alone, and a
-  startup check that refuses a role any broader. Do not widen it, and do not
-  reach for that pool from anywhere else.
+  pool, a role that should be granted `SELECT, DELETE` on `device_inbox` alone,
+  and a startup check that warns about a role any broader. It warns rather than
+  refuses because some deployments have only one database user. Do not widen
+  the recommended grant, and do not reach for that pool from anywhere else.
 - **The comparator cannot see everything, and knowing its shape is part of
   using it.** It compares one request at a time, bodies only, with filters it
   wrote itself, and it never follows `next_batch` in a loop. So it is blind to
@@ -202,8 +203,8 @@ on a `UNIXAddress` and 500s. The `include` carries the four headers, and
 `Accept-Encoding ""` with them, which `sub_filter` needs anyway.
 
 **`socket_mode` must be `0666`.** nginx runs in another container as a different
-uid. The example config's `0660` is right for the comparator and wrong the
-moment nginx has to connect.
+uid. The code's default `0660` is right for the comparator and wrong the
+moment nginx has to connect; the example config sets `0666`.
 
 **`allow_pin_now` must be false.** It accepts a window that has not happened
 yet. It is for the comparator, never for a host a client can reach.
@@ -277,8 +278,8 @@ Four things about it differ from the rest of the worker, and each is a trap.
 has already been told — is not derivable from a token. Even loading it prunes
 forked positions and bumps a timestamp. `internal/slidingstore` is the only
 package that writes it, behind role `gosync_ss`, which owns the `gosync` schema
-and has **nothing in `public`**. Startup refuses a role that can read
-`public.events`. `internal/store` is still 100% `SELECT`.
+and has **nothing in `public`**. Startup warns about (and no longer refuses) a
+role that can read `public.events`. `internal/store` is still 100% `SELECT`.
 
 **Our `pos` is not Synapse's.** The tables are ours, so a client cannot move
 between `gosync.aguiarvieira.pt` and `aguiarvieira.pt` mid-connection; it gets

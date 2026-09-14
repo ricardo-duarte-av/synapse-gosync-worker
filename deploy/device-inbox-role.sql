@@ -6,10 +6,10 @@
 -- since_token.to_device_key). A worker that serves the to_device section
 -- without deleting hands a client the same room keys on every sync, for ever.
 --
--- The grant is deliberately narrow, and the worker VERIFIES the narrowness at
+-- The grant is deliberately narrow, and the worker CHECKS the narrowness at
 -- startup (internal/deviceinbox.Open) rather than trusting this file was run
--- as written. It refuses to start if the role can DELETE from `events`, or
--- INSERT into device_inbox, or if it is read-only.
+-- as written. It warns if the role can DELETE from `events` or INSERT into
+-- device_inbox, and refuses to start if it is read-only or cannot delete.
 --
 -- The main connection keeps using the read-only role (readonly-role.sql, or
 -- gopro_ro on aguiarvieira.pt). Only internal/deviceinbox uses this one, over

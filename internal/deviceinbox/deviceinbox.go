@@ -55,16 +55,17 @@ type Deleter struct {
 	// client polling every 30 seconds does not issue a DELETE that can match
 	// nothing. Synapse keeps the same cache for the same reason.
 	lastDeleted *lru.Cache[key, int64]
+	// broad is why the role is wider than device-inbox-role.sql grants, or "".
+	broad string
 }
 
 type key struct{ userID, deviceID string }
 
-// Open connects and verifies the role is neither read-only nor too powerful.
+// Open connects and verifies the role can delete from device_inbox.
 //
-// The second half of that check is the point. This worker runs against a
-// production Synapse database, and the argument for granting it DELETE at all
-// rests entirely on the grant being narrow. Verifying the narrowness at startup
-// turns that argument into something the process can refuse to run without.
+// It also checks whether the role is too powerful, but reports that through
+// Broad rather than refusing: some deployments have a single database user and
+// cannot create a narrow one. The narrow role remains the recommendation.
 func Open(ctx context.Context, cfg Config) (*Deleter, error) {
 	pcfg, err := pgxpool.ParseConfig(cfg.DSN)
 	if err != nil {
@@ -111,6 +112,10 @@ func (d *Deleter) Close() {
 // Pool exposes the underlying pool for metrics.
 func (d *Deleter) Pool() *pgxpool.Pool { return d.pool }
 
+// Broad reports why the role holds more than SELECT and DELETE on
+// device_inbox, or "" if it does not.
+func (d *Deleter) Broad() string { return d.broad }
+
 func (d *Deleter) checkGrants(ctx context.Context) error {
 	var (
 		user      string
@@ -136,13 +141,11 @@ func (d *Deleter) checkGrants(ctx context.Context) error {
 	if !canDelete {
 		return fmt.Errorf("deviceinbox: role %q has no DELETE on device_inbox", user)
 	}
-	if canEvents {
-		return fmt.Errorf("deviceinbox: role %q can DELETE from events; "+
-			"this connection must be a narrowly granted role, not Synapse's own", user)
-	}
-	if canInsert {
-		return fmt.Errorf("deviceinbox: role %q can INSERT into device_inbox; "+
-			"the grant should be SELECT, DELETE only", user)
+	switch {
+	case canEvents:
+		d.broad = fmt.Sprintf("role %q can DELETE from events", user)
+	case canInsert:
+		d.broad = fmt.Sprintf("role %q can INSERT into device_inbox", user)
 	}
 	return nil
 }

@@ -12,8 +12,8 @@
 -- So this worker gets a second writing role, its second ever, and the same
 -- containment argument as device-inbox-role.sql applies: the grant is narrow,
 -- it lives in one package (internal/slidingstore) behind its own pool, and the
--- worker VERIFIES the narrowness at startup rather than trusting this file was
--- run as written.
+-- worker CHECKS the narrowness at startup rather than trusting this file was
+-- run as written, warning (not refusing) if the role can read `public`.
 --
 -- The narrowness here is a whole schema rather than one table. `gosync_ss`
 -- owns everything in `gosync` and has NOTHING in `public` -- it cannot read

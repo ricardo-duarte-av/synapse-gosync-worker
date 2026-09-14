@@ -54,16 +54,16 @@ type Config struct {
 type Store struct {
 	pool *pgxpool.Pool
 	now  func() int64
+	// broad is why the role reaches beyond the gosync schema, or "".
+	broad string
 }
 
-// Open connects and verifies the role is narrow enough to be trusted with a
-// write grant.
+// Open connects and verifies the role can write its own schema.
 //
-// The check is the whole argument for the grant existing. This worker runs
-// against a production Synapse database; "we only write our own tables" is a
-// claim the process should refuse to run without having tested. Specifically it
-// requires that the role can write its own schema and CANNOT read `public` --
-// not merely that it should not.
+// It also checks that the role CANNOT read `public`, but reports a role that
+// can through Broad rather than refusing: some deployments have a single
+// database user and cannot create a narrow one. The narrow role from
+// deploy/sliding-sync-role.sql remains the recommendation.
 func Open(ctx context.Context, cfg Config) (*Store, error) {
 	pcfg, err := pgxpool.ParseConfig(cfg.DSN)
 	if err != nil {
@@ -109,6 +109,10 @@ func (s *Store) Close() {
 // Pool exposes the underlying pool for metrics.
 func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 
+// Broad reports why the role can reach Synapse's own tables, or "" if it
+// cannot.
+func (s *Store) Broad() string { return s.broad }
+
 func (s *Store) checkGrants(ctx context.Context) error {
 	var (
 		user       string
@@ -140,9 +144,7 @@ func (s *Store) checkGrants(ctx context.Context) error {
 			"gosync.sliding_sync_connections; run deploy/sliding-sync-role.sql", user)
 	}
 	if canReadPub {
-		return fmt.Errorf("slidingstore: role %q can read public.events; this connection "+
-			"must own the gosync schema and have nothing in public, not be Synapse's own role "+
-			"or the read-only one", user)
+		s.broad = fmt.Sprintf("role %q can read public.events", user)
 	}
 	return nil
 }

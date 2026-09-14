@@ -27,10 +27,11 @@ What that means in practice:
 - `internal/deviceinbox` is a separate package with a separate pool. Everything
   else keeps the read-only role and its `SHOW default_transaction_read_only`
   check, so "every query in internal/store is a SELECT" stays literally true.
-- The worker verifies the narrowness at startup and refuses to run if the role
-  can delete from `events` or insert into `device_inbox`. The argument for the
-  grant rests entirely on it being narrow, so the process checks rather than
-  trusts.
+- The worker verifies the narrowness at startup. It originally refused to run
+  if the role could delete from `events` or insert into `device_inbox`; since
+  2026-09-14 it logs a warning instead, because some deployments have a single
+  database user and could not run at all. It still refuses a role that is
+  read-only or cannot delete. The narrow role remains the recommendation.
 - Serving and deleting are one setting. With `to_device.enabled: false` the
   section is omitted entirely; there is no "serve but do not delete".
 
@@ -70,9 +71,9 @@ What that means in practice:
   Synapse's tables, let alone write them. `internal/store` stays 100% `SELECT`
   and its role check keeps meaning what it means today.
 - `internal/slidingstore` is a separate package with a separate pool, and
-  `Open` refuses a role that can read `public.events`, is read-only, or cannot
-  write its own schema. The argument for the grant rests entirely on it being
-  narrow, so the process checks rather than trusts — the same shape as the
+  `Open` refuses a role that is read-only or cannot write its own schema, and
+  warns about one that can read `public.events` (a refusal until 2026-09-14,
+  relaxed for single-database-user deployments) — the same shape as the
   to-device grant above.
 - **Our `pos` is not interchangeable with Synapse's.** A client switching hosts
   mid-connection gets `M_UNKNOWN_POS` and re-bootstraps. That is a supported

@@ -143,9 +143,9 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 	}
 
 	// The one writing connection, and only when to_device is configured. It
-	// holds a role granted SELECT and DELETE on device_inbox alone, verified at
-	// startup by deviceinbox.Open -- so the main pool above keeps its read-only
-	// role and its check, and the guarantee is weakened in exactly one place.
+	// should hold a role granted SELECT and DELETE on device_inbox alone; a
+	// broader one (e.g. a deployment with a single database user) is warned
+	// about, not refused, like the main pool's read-only check above.
 	var inbox *deviceinbox.Deleter
 	if cfg.ToDevice.Enabled {
 		inbox, err = deviceinbox.Open(openCtx, deviceinbox.Config{
@@ -157,6 +157,10 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 			return err
 		}
 		defer inbox.Close()
+		if why := inbox.Broad(); why != "" {
+			log.Warn().Str("reason", why).
+				Msg("to_device role is broader than needed; see deploy/device-inbox-role.sql")
+		}
 		log.Info().Msg("to_device enabled: acknowledged messages will be deleted")
 	}
 
@@ -322,6 +326,10 @@ func run(cfg *config.Config, log zerolog.Logger, checkOnly bool) error {
 			return err
 		}
 		defer sliding.Close()
+		if why := sliding.Broad(); why != "" {
+			log.Warn().Str("reason", why).
+				Msg("sliding_sync role is broader than needed; see deploy/sliding-sync-role.sql")
+		}
 
 		// The materialised tables sliding sync reads are maintained by
 		// Synapse's event persister. If its background updates have not
