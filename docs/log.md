@@ -1338,3 +1338,44 @@ writer to a bad read is worse than the failure it would be fixing.
 `gosync_presence_config_reloads_total{outcome}` records all three answers.
 Unit-tested only: presence is disabled on this homeserver, so there is no live
 path to drive it.
+
+## Element X's encryption connection was never told about anyone's devices (2026-09-21)
+
+Reported as "sliding sync is brittle in encrypted rooms, worse the longer the
+app was closed": messages waiting for keys on opening a room, timelines that
+keep re-rendering. Classic sync on the same account was fine.
+
+**The e2ee extension scoped device-list changes to the rooms of the request's
+lists.** Element X asks for `e2ee` and `to_device` on a connection of its own
+(the `pos=0/...` requests in the access log) that has **no lists at all**, so
+that scope was empty: the connection heard about the caller's own devices and
+nobody else's. Synapse's get_user_ids_changed uses every joined room, adds the
+members of newly joined rooms and anyone who newly joined a room we are in, and
+fills `left`. Ours had `left: []` hard-coded.
+
+Measured on the main account over a two-hour window: Synapse reported 106
+changed users and 5 left. The deployed worker reported **0 and 0**. The
+consequences get worse the longer the client has been away: a co-member's new
+device goes unfetched, so it cannot be trusted and nothing we send is
+encrypted to it.
+
+Why nothing caught it: TestLiveExtensionsParity has a list covering every room
+of a 30-room account, and its two rounds are seconds apart, so the window holds
+no device changes. `TestLiveE2EEWithoutLists` sends a list-less request with a
+rewound `pos`. It fails against the old build (0/10 on @test, 0/678 on the main
+account), passes exactly on @test, and differs by 3 of 678 on the main account.
+Its comment explains those three.
+
+Two smaller things came with it:
+
+- **`device_lists_changes_in_room` is pruned**, and Synapse falls back to
+  device_lists_stream for everyone sharing a room when `since` predates the
+  pruning. We did not. It now does, for both endpoints.
+- **Checking who has really left** used UsersSharingAnyRoom, which lists
+  everyone in every room: 430ms on this account. Asking only about the users
+  who left takes 13ms, and the whole list-less request takes about 40ms.
+
+Not fixed yet: a device-list row wakes only the device's OWNER. Synapse wakes
+the rooms that user is in (`device_lists_changes_in_room`), so a waiting client
+hears about a co-member's new device at once. Here it waits for its next wake
+or its 30s timeout. That affects classic sync too.

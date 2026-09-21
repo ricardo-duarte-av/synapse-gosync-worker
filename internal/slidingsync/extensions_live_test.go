@@ -312,3 +312,98 @@ func stripClock(t *testing.T, raw json.RawMessage) string {
 	dropClockDerived(v)
 	return encodeJSON(t, v)
 }
+
+// TestLiveE2EEWithoutLists compares `e2ee.device_lists` on a connection that
+// has NO lists, over a window rewound far enough to contain device changes.
+//
+// This is how Element X asks for it: a dedicated encryption connection with
+// only `to_device` and `e2ee`. The parity test above cannot see the shape --
+// its list covers every room of a small test account, and its two rounds are
+// seconds apart -- and that is how a device-list section scoped to the lists'
+// rooms reached production. The Element X connection was told about the
+// caller's own devices and nobody else's.
+//
+// Sets, not lists: neither side orders `changed` or `left`. Read-only on
+// Synapse's side; no `to_device`, so nothing is deleted.
+//
+// Exact on @test. On the 654-room account expect a few differences in
+// `changed`, all of one shape: a bridged user who joined one shared room and
+// joined-then-left another inside the window. Synapse's answer for each is
+// only reachable if it skipped one of the two rooms' member deltas -- which
+// its stream-change cache, not the database, decides. Ours follows the
+// database. Either way the cost is one user's keys re-fetched or not.
+func TestLiveE2EEWithoutLists(t *testing.T) {
+	ours := os.Getenv("GOSYNC_LIVE_SS_SOCKET")
+	if ours == "" {
+		t.Skip("GOSYNC_LIVE_SS_SOCKET not set; needs a running worker with sliding_sync enabled")
+	}
+	c, token := refClient(t)
+	ref := os.Getenv("GOSYNC_LIVE_REF_SOCKET")
+
+	body := func(connID string) map[string]any {
+		return map[string]any{
+			"conn_id":    connID,
+			"extensions": map[string]any{"e2ee": map[string]any{"enabled": true}},
+		}
+	}
+
+	// A current position from the reference, then wound back. Connection
+	// position 0 is "no connection state", which both sides accept with any
+	// stream token -- exactly what Element X sends on its encryption connection.
+	now := postSliding(t, c, ref, token, body("e2ee-nolists-seed"), "")
+	pos, err := ParsePos(now.Pos)
+	if err != nil {
+		t.Fatal(err)
+	}
+	from := pos.StreamToken
+	from.Room.Stream -= 5000
+	from.Room.Instances = nil
+	from.DeviceList.Stream -= 20000
+	from.DeviceList.Instances = nil
+	rewound := Pos{StreamToken: from}.String()
+
+	deviceLists := func(r slidingResponse) (changed, left map[string]bool) {
+		var e struct {
+			DeviceLists *struct {
+				Changed []string `json:"changed"`
+				Left    []string `json:"left"`
+			} `json:"device_lists"`
+		}
+		if err := json.Unmarshal(r.Extensions["e2ee"], &e); err != nil {
+			t.Fatal(err)
+		}
+		if e.DeviceLists == nil {
+			t.Fatal("e2ee.device_lists absent on a request with a pos")
+		}
+		changed, left = map[string]bool{}, map[string]bool{}
+		for _, u := range e.DeviceLists.Changed {
+			changed[u] = true
+		}
+		for _, u := range e.DeviceLists.Left {
+			left[u] = true
+		}
+		return changed, left
+	}
+
+	oc, ol := deviceLists(postSliding(t, c, ours, token, body("e2ee-nolists-ours"), rewound))
+	rc, rl := deviceLists(postSliding(t, c, ref, token, body("e2ee-nolists-ref"), rewound))
+
+	// A window with nothing in it proves nothing; say so rather than pass.
+	if len(rc) == 0 {
+		t.Skip("reference reports no device-list changes in the rewound window; widen it")
+	}
+	for name, pair := range map[string][2]map[string]bool{"changed": {oc, rc}, "left": {ol, rl}} {
+		o, r := pair[0], pair[1]
+		for u := range r {
+			if !o[u] {
+				t.Errorf("device_lists.%s: %s missing from ours (%d ours, %d reference)",
+					name, u, len(o), len(r))
+			}
+		}
+		for u := range o {
+			if !r[u] {
+				t.Errorf("device_lists.%s: %s present only in ours", name, u)
+			}
+		}
+	}
+}

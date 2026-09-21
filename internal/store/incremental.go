@@ -421,7 +421,52 @@ func (s *Store) DeviceListChanges(ctx context.Context, userID string, roomIDs []
 
 	changed := map[string]bool{}
 
+	// device_lists_changes_in_room is pruned, and a `since` older than the
+	// pruning cannot be answered from it: the rows that would name who changed
+	// are gone. Synapse then falls back to asking device_lists_stream about
+	// everyone who shares a room with the caller -- a client that has been
+	// away for a while is exactly the one that needs this list complete.
+	pruned := false
 	if len(roomIDs) > 0 {
+		var maxPruned int64
+		if err := s.queryRow(ctx, "DeviceListChanges", `
+			SELECT stream_id FROM device_lists_changes_in_room_max_pruned_stream_id`,
+		).Scan(&maxPruned); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("store: device list pruning: %w", err)
+		}
+		pruned = maxPruned > since
+	}
+
+	if pruned {
+		sharing, err := s.UsersSharingAnyRoom(ctx, userID)
+		if err != nil {
+			return nil, err
+		}
+		tracked := make([]string, 0, len(sharing)+1)
+		for u := range sharing {
+			tracked = append(tracked, u)
+		}
+		tracked = append(tracked, userID)
+		rows, err := s.query(ctx, "DeviceListChanges", `
+			SELECT DISTINCT user_id FROM device_lists_stream
+			 WHERE user_id = ANY($1) AND stream_id > $2 AND stream_id <= $3`,
+			tracked, since, now)
+		if err != nil {
+			return nil, fmt.Errorf("store: device list changes: %w", err)
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("store: device list changes: %w", err)
+			}
+			changed[id] = true
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("store: device list changes: %w", err)
+		}
+	} else if len(roomIDs) > 0 {
 		const q = `
 			SELECT DISTINCT user_id FROM device_lists_changes_in_room
 			 WHERE room_id = ANY($1) AND stream_id > $2 AND stream_id <= $3`

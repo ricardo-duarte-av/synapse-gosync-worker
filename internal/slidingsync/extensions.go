@@ -253,15 +253,6 @@ func relevantRooms(in extensionInputs, scope *ExtensionScope) map[string]bool {
 	return out
 }
 
-func sortedRoomIDs(m map[string]bool) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
-}
-
 // --- to_device (MSC3885) ---
 
 type toDeviceJSON struct {
@@ -362,19 +353,134 @@ func e2eeExtension(ctx context.Context, d Deps, in extensionInputs) (*e2eeJSON, 
 	// not a gap: a client with no `pos` is about to fetch keys for everyone it
 	// shares a room with anyway.
 	if in.From != nil {
-		roomIDs := sortedRoomIDs(in.AllRooms)
-		changed, err := d.Store.DeviceListChanges(ctx, in.UserID, roomIDs,
-			in.From.DeviceList.Stream, in.Now.DeviceList.MaxStreamPos())
+		lists, err := deviceListUpdates(ctx, d, in.UserID, *in.From, in.Now)
 		if err != nil {
 			return nil, err
 		}
-		sort.Strings(changed)
-		if changed == nil {
-			changed = []string{}
-		}
-		out.DeviceLists = &deviceListsJSON{Changed: changed, Left: []string{}}
+		out.DeviceLists = lists
 	}
 	return out, nil
+}
+
+// deviceListUpdates is DeviceHandler.get_user_ids_changed: whose keys the
+// client should re-fetch, and whom it no longer shares a room with.
+//
+// It is scoped to EVERY room the user is joined to, not to the rooms this
+// connection's lists happen to cover. The two differ completely for Element X,
+// which asks for `e2ee` on a connection of its own with no lists at all: scoped
+// to the lists, that connection was told about the caller's own devices and
+// nobody else's, so the client never learned of a co-member's new device -- and
+// cannot trust, or encrypt to, a device it has never fetched.
+func deviceListUpdates(ctx context.Context, d Deps, userID string,
+	from, now streamtoken.Token) (*deviceListsJSON, error) {
+
+	joined, err := d.Store.RoomsForUser(ctx, userID, []string{"join"})
+	if err != nil {
+		return nil, err
+	}
+	joinedIDs := make([]string, 0, len(joined))
+	joinedSet := make(map[string]bool, len(joined))
+	for _, r := range joined {
+		joinedIDs = append(joinedIDs, r.RoomID)
+		joinedSet[r.RoomID] = true
+	}
+	sort.Strings(joinedIDs)
+
+	roomFrom, roomTo := from.Room.MaxStreamPos(), now.Room.MaxStreamPos()
+
+	// The caller's own joins and leaves. "Joinedness" is what counts: a join
+	// following a join is a profile change.
+	self, err := d.Store.SelfMemberDeltas(ctx, userID, roomFrom, roomTo)
+	if err != nil {
+		return nil, err
+	}
+	newlyJoinedRooms := map[string]bool{}
+	newlyLeftRooms := map[string]bool{}
+	for _, c := range self {
+		if d.ExcludedRooms[c.RoomID] {
+			continue
+		}
+		if c.Membership == "join" {
+			if c.PrevMembership != "join" {
+				newlyJoinedRooms[c.RoomID] = true
+				delete(newlyLeftRooms, c.RoomID)
+			}
+		} else if c.PrevMembership == "join" {
+			delete(newlyJoinedRooms, c.RoomID)
+			newlyLeftRooms[c.RoomID] = true
+		}
+	}
+
+	// Everybody else's, in the rooms we are in now.
+	deltas, err := d.Store.MemberDeltasInRooms(ctx, joinedIDs, roomFrom, roomTo)
+	if err != nil {
+		return nil, err
+	}
+	present := func(m string) bool { return m == "join" || m == "invite" || m == "knock" }
+	newUsers := map[string]bool{}
+	leftUsers := map[string]bool{}
+	for _, c := range deltas {
+		membership := c.Membership
+		if !c.HasEvent {
+			membership = ""
+		}
+		if present(membership) {
+			if !present(c.PrevMembership) {
+				newUsers[c.UserID] = true
+				delete(leftUsers, c.UserID)
+			}
+		} else if present(c.PrevMembership) {
+			delete(newUsers, c.UserID)
+			leftUsers[c.UserID] = true
+		}
+	}
+
+	changed, err := d.Store.DeviceListChanges(ctx, userID, joinedIDs,
+		from.DeviceList.Stream, now.DeviceList.MaxStreamPos())
+	if err != nil {
+		return nil, err
+	}
+	set := make(map[string]bool, len(changed))
+	for _, u := range changed {
+		set[u] = true
+	}
+	for u := range newUsers {
+		set[u] = true
+	}
+	if len(newlyJoinedRooms) > 0 {
+		members, err := d.Store.JoinedMembersOf(ctx, sortedKeys(newlyJoinedRooms))
+		if err != nil {
+			return nil, err
+		}
+		for _, u := range members {
+			set[u] = true
+		}
+	}
+
+	if len(newlyLeftRooms) > 0 {
+		members, err := d.Store.JoinedMembersOf(ctx, sortedKeys(newlyLeftRooms))
+		if err != nil {
+			return nil, err
+		}
+		for _, u := range members {
+			leftUsers[u] = true
+		}
+	}
+	// Someone still in another room with us has not left our view; telling the
+	// client otherwise makes it stop tracking keys it still needs.
+	if len(leftUsers) > 0 {
+		sharing, err := d.Store.UsersJoinedToAny(ctx, sortedKeys(leftUsers), joinedIDs)
+		if err != nil {
+			return nil, err
+		}
+		for u := range leftUsers {
+			if sharing[u] {
+				delete(leftUsers, u)
+			}
+		}
+	}
+
+	return &deviceListsJSON{Changed: sortedKeys(set), Left: sortedKeys(leftUsers)}, nil
 }
 
 // --- typing (MSC3961) ---
@@ -492,7 +598,7 @@ func accountDataExtension(
 	var initial []string
 	previously := map[string]int64{}
 	live := map[string]bool{}
-	for _, roomID := range sortedRoomIDs(relevant) {
+	for _, roomID := range sortedKeys(relevant) {
 		if in.From == nil {
 			initial = append(initial, roomID)
 			continue
@@ -568,7 +674,7 @@ func accountDataExtension(
 	}
 
 	// Record what the connection now has.
-	sent := append(append([]string{}, initial...), sortedRoomIDs(boolSet(previously))...)
+	sent := append(append([]string{}, initial...), sortedKeys(boolSet(previously))...)
 	sort.Strings(sent)
 	in.New.AccountData.RecordSentRooms(sent)
 
@@ -644,7 +750,7 @@ func receiptsExtension(
 	var initial []string
 	previously := map[string]int64{}
 	var live []string
-	for _, roomID := range sortedRoomIDs(relevant) {
+	for _, roomID := range sortedKeys(relevant) {
 		if in.From == nil {
 			initial = append(initial, roomID)
 			continue
@@ -727,7 +833,7 @@ func receiptsExtension(
 		}
 	}
 
-	for _, roomID := range sortedRoomIDs(boolSet(byRoom)) {
+	for _, roomID := range sortedKeys(boolSet(byRoom)) {
 		// The same renderer classic sync uses, which is what applies the
 		// private-receipt rule: a m.read.private receipt belongs to its owner
 		// and nobody else.
@@ -752,7 +858,7 @@ func receiptsExtension(
 		out.Rooms[roomID] = trimmed
 	}
 
-	sent := append(append([]string{}, initial...), sortedRoomIDs(boolSet(previously))...)
+	sent := append(append([]string{}, initial...), sortedKeys(boolSet(previously))...)
 	sort.Strings(sent)
 	in.New.Receipts.RecordSentRooms(sent)
 
@@ -911,7 +1017,7 @@ func stickyEventsExtension(
 		limit = stickyMaxEventsInSync
 	}
 
-	roomIDs := sortedRoomIDs(in.AllRooms)
+	roomIDs := sortedKeys(in.AllRooms)
 	to, byRoom, err := d.Store.StickyEvents(ctx, roomIDs, from, in.Now.StickyEvents, in.NowMS, limit)
 	if err != nil {
 		return nil, err
@@ -943,7 +1049,7 @@ func stickyEventsExtension(
 	}
 
 	out.Rooms = map[string]stickyRoomJSON{}
-	for _, roomID := range sortedRoomIDs(boolSet(byRoom)) {
+	for _, roomID := range sortedKeys(boolSet(byRoom)) {
 		room := in.Rooms[roomID]
 		inTimeline := map[string]bool{}
 		if room != nil {
