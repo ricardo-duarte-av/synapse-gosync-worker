@@ -716,14 +716,10 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 
 	ephemeral := []json.RawMessage{}
 	if !archived && !f.BlocksAllRoomEphemeral() {
-		// withThreads: /sync uses the multi-room receipt path, which selects
-		// thread_id and applies MSC4102 -- unlike /rooms/{id}/initialSync.
-		if ev, err := receiptEvent(room.RoomID, receiptRows, userID, true); err != nil {
-			return nil, err
-		} else if ev != nil {
-			ephemeral = append(ephemeral, ev)
-		}
-
+		// Typing before receipts: that is the order ephemeral_by_room appends
+		// them in. syncdiff keys ephemeral events by type, so it cannot see
+		// this; only a raw diff does.
+		//
 		// Synapse asks the typing source from position 0 on an initial sync,
 		// which yields every room whose serial it knows -- and nothing for
 		// rooms that have never had a typist. Asking unconditionally instead
@@ -734,6 +730,14 @@ func syncRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, userID s
 			} else if ev != nil {
 				ephemeral = append(ephemeral, ev)
 			}
+		}
+
+		// withThreads: /sync uses the multi-room receipt path, which selects
+		// thread_id and applies MSC4102 -- unlike /rooms/{id}/initialSync.
+		if ev, err := receiptEvent(room.RoomID, receiptRows, userID, true); err != nil {
+			return nil, err
+		} else if ev != nil {
+			ephemeral = append(ephemeral, ev)
 		}
 		// The filter sees the room_id, which is stripped only afterwards:
 		// Synapse filters the dict it built and removes the key on the way out.

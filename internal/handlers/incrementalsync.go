@@ -274,17 +274,15 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 				return nil, http.StatusInternalServerError, internalError(d, "room entry", err)
 			}
 			// Ephemeral is bounded by `since` even for a newly joined room:
-			// receipts are a stream like any other, and the client is not
-			// entitled to a replay of them just for joining.
-			ephemeral := []json.RawMessage{}
-			if rows := receiptsByRoom[room.RoomID]; len(rows) > 0 {
-				ev, err := receiptEvent(room.RoomID, rows, verdict.UserID, true)
-				if err != nil {
-					return nil, http.StatusInternalServerError, internalError(d, "receipts", err)
-				}
-				if ev != nil {
-					ephemeral = append(ephemeral, ev)
-				}
+			// receipts and typing are streams like any other, and the client
+			// is not entitled to a replay of them just for joining. Built by
+			// the same helper as every other room, because Synapse does not
+			// distinguish: dropping typing here left out an m.typing that
+			// Synapse sends.
+			ephemeral, err := sinceEphemeral(d, room.RoomID, verdict.UserID,
+				receiptsByRoom[room.RoomID], typingRooms[room.RoomID])
+			if err != nil {
+				return nil, http.StatusInternalServerError, internalError(d, "ephemeral", err)
 			}
 			ephemeral = stripRoomIDs(filterEphemeral(f, room.RoomID, ephemeral))
 			entry["ephemeral"] = map[string]any{"events": ephemeral}
@@ -614,24 +612,9 @@ func incrementalRoomEntry(ctx context.Context, d Deps, room store.RoomForUser, u
 
 	ephemeral := []json.RawMessage{}
 	if !f.BlocksAllRoomEphemeral() {
-		if len(receipts) > 0 {
-			ev, err := receiptEvent(room.RoomID, receipts, userID, true)
-			if err != nil {
-				return nil, err
-			}
-			if ev != nil {
-				ephemeral = append(ephemeral, ev)
-			}
-		}
-
-		// Only when this room's typists have actually changed since the
-		// client last looked. See the note where typingRooms is built.
-		if typingChanged {
-			if ev, err := typingEvent(d, room.RoomID); err != nil {
-				return nil, err
-			} else if ev != nil {
-				ephemeral = append(ephemeral, ev)
-			}
+		var err error
+		if ephemeral, err = sinceEphemeral(d, room.RoomID, userID, receipts, typingChanged); err != nil {
+			return nil, err
 		}
 		ephemeral = stripRoomIDs(filterEphemeral(f, room.RoomID, ephemeral))
 	}
@@ -1329,4 +1312,35 @@ func archivedRoomEntry(ctx context.Context, d Deps, roomID, userID string,
 		stateKeyName(useStateAfter): map[string]any{"events": stateJSON},
 		"account_data":              map[string]any{"events": adEvents},
 	}, nil
+}
+
+// sinceEphemeral builds a room's ephemeral events for an incremental sync:
+// typing, if this room's typists changed since the client's token, then the
+// receipts in the window.
+//
+// In that order because ephemeral_by_room appends typing first. syncdiff keys
+// ephemeral events by type and so cannot see the order; a raw diff can.
+func sinceEphemeral(d Deps, roomID, userID string, receipts []store.ReceiptRow,
+	typingChanged bool) ([]json.RawMessage, error) {
+
+	ephemeral := []json.RawMessage{}
+	// Only when this room's typists have actually changed since the client
+	// last looked. See the note where typingRooms is built.
+	if typingChanged {
+		if ev, err := typingEvent(d, roomID); err != nil {
+			return nil, err
+		} else if ev != nil {
+			ephemeral = append(ephemeral, ev)
+		}
+	}
+	if len(receipts) > 0 {
+		ev, err := receiptEvent(roomID, receipts, userID, true)
+		if err != nil {
+			return nil, err
+		}
+		if ev != nil {
+			ephemeral = append(ephemeral, ev)
+		}
+	}
+	return ephemeral, nil
 }
