@@ -256,8 +256,12 @@ func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter 
 			if err != nil {
 				return nil, http.StatusInternalServerError, internalError(d, "serialise invite", err)
 			}
+			events, err := strippedStateEvents(body, "invite_room_state")
+			if err != nil {
+				return nil, http.StatusInternalServerError, internalError(d, "serialise invite", err)
+			}
 			invitedRooms[room.RoomID] = map[string]any{
-				"invite_state": map[string]any{"events": []json.RawMessage{body}},
+				"invite_state": map[string]any{"events": events},
 			}
 		case "knock":
 			knock, err := d.Store.InviteEvent(ctx, room.EventID, room.RoomID, room.RoomVersion)
@@ -271,11 +275,10 @@ func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter 
 			// As on the incremental path: the stripped state a knock carries
 			// lives in the event's unsigned block, and the response lifts it
 			// out into knock_state.
-			events := []json.RawMessage{}
-			gjson.GetBytes(body, `unsigned.knock_room_state`).ForEach(func(_, v gjson.Result) bool {
-				events = append(events, json.RawMessage(v.Raw))
-				return true
-			})
+			events, err := strippedStateEvents(body, "knock_room_state")
+			if err != nil {
+				return nil, http.StatusInternalServerError, internalError(d, "serialise knock", err)
+			}
 			knockedRooms[room.RoomID] = map[string]any{
 				"knock_state": map[string]any{"events": events},
 			}
