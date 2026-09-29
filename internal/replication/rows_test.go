@@ -30,6 +30,17 @@ func TestRowSubjects(t *testing.T) {
 			wantRooms: []string{"!8DitJr99fJMIvafK4U42dkFtaeHdJkxgwOgFWWZWDoc"},
 		},
 		{
+			// The target is not in the room yet, so naming only the room would
+			// wake nobody who needs it: a created, joined or invited-to room
+			// would sit unseen until something else woke the client.
+			name:   "membership names its target",
+			stream: StreamEvents,
+			row: `["ev",["$evid","!new:example.com","m.room.member",` +
+				`"@creator:example.com",null,null,"join",false,false]]`,
+			wantRooms: []string{"!new:example.com"},
+			wantUsers: []string{"@creator:example.com"},
+		},
+		{
 			name: "typing", stream: StreamTyping,
 			row:       `["!NaLbfexyNIBQDbzGwB:bonifacelabs.ca",["@thedreadpirate:matrix.blackmoon.tv"]]`,
 			wantRooms: []string{"!NaLbfexyNIBQDbzGwB:bonifacelabs.ca"},

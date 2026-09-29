@@ -75,11 +75,21 @@ func rowDetails(stream, row string) RowDetail {
 			// [event_id, room_id, type, state_key, redacts, relates_to,
 			//  membership, rejected, outlier]
 			if len(inner) >= 2 {
-				return RowDetail{
+				d := RowDetail{
 					RoomIDs:  []string{inner[1].String()},
 					Type:     at(2),
 					StateKey: at(3),
 				}
+				// A membership event also names its target, because the target
+				// is not yet in the room and so is not waiting on it: without
+				// this, creating a room, being invited, or joining parks the
+				// client until something unrelated wakes it. Synapse's
+				// extra_users (replication/tcp/client.py, on_rdata). Only "ev"
+				// rows: Synapse passes nothing for "state" ones.
+				if d.Type == "m.room.member" && d.StateKey != "" {
+					d.UserIDs = []string{d.StateKey}
+				}
+				return d
 			}
 		case "state":
 			// [room_id, type, state_key, event_id] -- a current-state delta.
