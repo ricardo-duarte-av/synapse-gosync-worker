@@ -383,20 +383,8 @@ func initialSyncV2(r *http.Request, d Deps, verdict auth.Verdict, useStateAfter 
 			return nil, http.StatusInternalServerError, internalError(d, "global account data", err)
 		}
 
-		// m.push_rules is synthesised, not stored: Synapse keeps only a user's
-		// deviations from a built-in ruleset and rebuilds the whole thing on every
-		// read. It is prepended, as _generate_sync_entry_for_account_data does.
-		userRules, ruleEnabled, err := d.Store.PushRules(ctx, verdict.UserID)
-		if err != nil {
-			return nil, http.StatusInternalServerError, internalError(d, "push rules", err)
-		}
-		rulesContent, err := pushrules.Format(verdict.UserID, userRules, ruleEnabled, d.PushRuleFeatures)
-		if err != nil {
-			return nil, http.StatusInternalServerError, internalError(d, "push rules", err)
-		}
-		rulesEvent, err := json.Marshal(map[string]any{
-			"type": "m.push_rules", "content": rulesContent,
-		})
+		// Prepended, as _generate_sync_entry_for_account_data does.
+		rulesEvent, err := pushRulesAccountData(ctx, d, verdict.UserID)
 		if err != nil {
 			return nil, http.StatusInternalServerError, internalError(d, "push rules", err)
 		}
@@ -482,6 +470,22 @@ func enumeratesArchived(membership, sender, userID string, includeLeave bool) bo
 
 // syncPresenceEvents renders presence for /sync, which differs from the legacy
 // endpoints: the user is named by a top-level `sender`, not inside `content`.
+// pushRulesAccountData builds the m.push_rules global account data event.
+//
+// It is synthesised, not stored: Synapse keeps only a user's deviations from a
+// built-in ruleset and rebuilds the whole thing on every read.
+func pushRulesAccountData(ctx context.Context, d Deps, userID string) (json.RawMessage, error) {
+	userRules, ruleEnabled, err := d.Store.PushRules(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	content, err := pushrules.Format(userID, userRules, ruleEnabled, d.PushRuleFeatures)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(map[string]any{"type": "m.push_rules", "content": content})
+}
+
 func syncPresenceEvents(states []store.PresenceState, timeNow int64) ([]json.RawMessage, error) {
 	out := make([]json.RawMessage, 0, len(states))
 	for _, p := range states {

@@ -197,6 +197,26 @@ func (s *Store) GlobalAccountDataSince(ctx context.Context, userID string,
 	return out, rows.Err()
 }
 
+// PushRulesChangedSince reports whether a user's push rules changed in
+// (since, now] -- have_push_rules_changed_for_user.
+//
+// m.push_rules is not in account_data at all, so GlobalAccountDataSince cannot
+// see a rule change; without this an incremental sync drops it, and because
+// next_batch has already moved past it the client never hears of it.
+//
+// The table's own maximum is not a usable bound on the token: push_rules ids
+// drift above it (docs/tokens.md). A row in the window is what counts.
+func (s *Store) PushRulesChangedSince(ctx context.Context, userID string, since, now int64) (bool, error) {
+	const q = `
+		SELECT EXISTS (SELECT 1 FROM push_rules_stream
+		                WHERE user_id = $1 AND stream_id > $2 AND stream_id <= $3)`
+	var changed bool
+	if err := s.queryRow(ctx, "PushRulesChangedSince", q, userID, since, now).Scan(&changed); err != nil {
+		return false, fmt.Errorf("store: push rules changed since: %w", err)
+	}
+	return changed, nil
+}
+
 // RoomAccountDataSince loads per-room account data changed in (since, now],
 // keyed by room.
 //

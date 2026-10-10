@@ -407,11 +407,30 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 		if err != nil {
 			return nil, http.StatusInternalServerError, internalError(d, "global account data", err)
 		}
-		if len(globalAD) > 0 {
-			events, err := accountDataEvents(globalAD)
+		events, err := accountDataEvents(globalAD)
+		if err != nil {
+			return nil, http.StatusInternalServerError, internalError(d, "global account data", err)
+		}
+
+		// m.push_rules is not in account_data and has its own stream, so a
+		// rule change is invisible to the query above. Synapse adds the whole
+		// ruleset whenever the user's rules moved in the window. The token
+		// comparison spares the query on almost every pass: the stream is quiet.
+		if since.PushRules < now.PushRules {
+			changed, err := d.Store.PushRulesChangedSince(ctx, verdict.UserID, since.PushRules, now.PushRules)
 			if err != nil {
-				return nil, http.StatusInternalServerError, internalError(d, "global account data", err)
+				return nil, http.StatusInternalServerError, internalError(d, "push rules", err)
 			}
+			if changed {
+				rulesEvent, err := pushRulesAccountData(ctx, d, verdict.UserID)
+				if err != nil {
+					return nil, http.StatusInternalServerError, internalError(d, "push rules", err)
+				}
+				events = append([]json.RawMessage{rulesEvent}, events...)
+			}
+		}
+
+		if len(events) > 0 {
 			events = filterAccountDataEvents(f, "", events)
 			if len(events) > 0 {
 				resp["account_data"] = map[string]any{"events": events}

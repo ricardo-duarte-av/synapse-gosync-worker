@@ -1379,3 +1379,20 @@ Not fixed yet: a device-list row wakes only the device's OWNER. Synapse wakes
 the rooms that user is in (`device_lists_changes_in_room`), so a waiting client
 hears about a co-member's new device at once. Here it waits for its next wake
 or its 30s timeout. That affects classic sync too.
+
+## Push rule changes never reached classic sync (2026-10-10)
+
+The push_rules stream was followed, but nothing in incremental `/sync` read it
+back. A rule change woke the user's long-poll, advanced `now.PushRules`, and
+produced an empty response, so the poll kept waiting. The next response that
+did go out carried a `next_batch` past the change, and the client never heard
+of it until an initial sync. Sliding sync already handled it.
+
+`m.push_rules` is not in `account_data`, so `GlobalAccountDataSince` cannot
+see it. Synapse asks `have_push_rules_changed_for_user` separately and adds the
+whole ruleset when the answer is yes. We now do the same:
+`PushRulesChangedSince` is an EXISTS over `push_rules_stream` (an index-only
+scan), and it runs only when `since.PushRules < now.PushRules`.
+
+Why nothing caught it: a pinned comparison window almost never contains a rule
+change, and none of the test runs change one.
