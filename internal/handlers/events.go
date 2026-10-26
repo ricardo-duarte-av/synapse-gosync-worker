@@ -112,7 +112,7 @@ func eventStream(r *http.Request, d Deps, verdict auth.Verdict, ann *server.Anno
 		}
 	}
 
-	now, _, mxErr := nowToken(r, d)
+	now, nowPinned, mxErr := nowToken(r, d)
 	if mxErr != nil {
 		return nil, http.StatusBadRequest, mxErr
 	}
@@ -135,6 +135,7 @@ func eventStream(r *http.Request, d Deps, verdict auth.Verdict, ann *server.Anno
 			ann.Since = raw
 		}
 	}
+	now = boundBySince(now, nowPinned, from)
 
 	roomIDs, isPeeking, mxErr := eventStreamRooms(ctx, d, verdict.UserID, roomID)
 	if mxErr != nil {
@@ -272,11 +273,12 @@ func waitForEvents(r *http.Request, d Deps, req eventStreamRequest, from streamt
 	for {
 		handle := d.Notifier.Register(req.roomIDs, []string{req.userID})
 
-		now, _, mxErr := nowToken(r, d)
+		now, pinned, mxErr := nowToken(r, d)
 		if mxErr != nil {
 			handle.Close()
 			return nil, from, nil
 		}
+		now = boundBySince(now, pinned, from)
 		chunk, end, err := eventStreamChunk(ctx, d, req, from, now)
 		if err != nil || len(chunk) > 0 {
 			handle.Close()

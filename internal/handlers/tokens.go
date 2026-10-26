@@ -8,31 +8,44 @@ import (
 )
 
 // replicationStreams maps a replication stream name onto the token field it
-// advances.
-//
-// Every field except the room key is a plain integer, so the overlay is a
-// maximum. The room key is a RoomStreamToken and gets its own handling.
+// sets.
 var replicationStreams = map[string]func(*streamtoken.Token, int64){
-	replication.StreamPresence:            func(t *streamtoken.Token, p int64) { t.Presence = max64(t.Presence, p) },
-	replication.StreamTyping:              func(t *streamtoken.Token, p int64) { t.Typing = max64(t.Typing, p) },
-	replication.StreamAccountData:         func(t *streamtoken.Token, p int64) { t.AccountData = max64(t.AccountData, p) },
-	replication.StreamPushRules:           func(t *streamtoken.Token, p int64) { t.PushRules = max64(t.PushRules, p) },
-	replication.StreamToDevice:            func(t *streamtoken.Token, p int64) { t.ToDevice = max64(t.ToDevice, p) },
-	replication.StreamUnPartialStatedRoom: func(t *streamtoken.Token, p int64) { t.UnPartialStatedRooms = max64(t.UnPartialStatedRooms, p) },
-	replication.StreamThreadSubscriptions: func(t *streamtoken.Token, p int64) { t.ThreadSubscriptions = max64(t.ThreadSubscriptions, p) },
-	replication.StreamStickyEvents:        func(t *streamtoken.Token, p int64) { t.StickyEvents = max64(t.StickyEvents, p) },
-	replication.StreamProfileUpdates:      func(t *streamtoken.Token, p int64) { t.ProfileUpdates = max64(t.ProfileUpdates, p) },
+	replication.StreamEvents:              func(t *streamtoken.Token, p int64) { t.Room = streamtoken.Live(p) },
+	replication.StreamPresence:            func(t *streamtoken.Token, p int64) { t.Presence = p },
+	replication.StreamTyping:              func(t *streamtoken.Token, p int64) { t.Typing = p },
+	replication.StreamReceipts:            func(t *streamtoken.Token, p int64) { t.Receipt = streamtoken.MultiWriter{Stream: p} },
+	replication.StreamAccountData:         func(t *streamtoken.Token, p int64) { t.AccountData = p },
+	replication.StreamPushRules:           func(t *streamtoken.Token, p int64) { t.PushRules = p },
+	replication.StreamToDevice:            func(t *streamtoken.Token, p int64) { t.ToDevice = p },
+	replication.StreamDeviceLists:         func(t *streamtoken.Token, p int64) { t.DeviceList = streamtoken.MultiWriter{Stream: p} },
+	replication.StreamUnPartialStatedRoom: func(t *streamtoken.Token, p int64) { t.UnPartialStatedRooms = p },
+	replication.StreamThreadSubscriptions: func(t *streamtoken.Token, p int64) { t.ThreadSubscriptions = p },
+	replication.StreamStickyEvents:        func(t *streamtoken.Token, p int64) { t.StickyEvents = p },
+	replication.StreamQuarantinedMedia:    func(t *streamtoken.Token, p int64) { t.QuarantinedMedia = streamtoken.MultiWriter{Stream: p} },
+	replication.StreamProfileUpdates:      func(t *streamtoken.Token, p int64) { t.ProfileUpdates = p },
 }
 
 // currentToken builds the token this response is bounded by.
 //
-// The database supplies a seed and replication corrects it. The correction is
-// not cosmetic: `typing` has no database representation at all, and `push_rules`
-// and `thread_subscriptions` drift above their table maxima because their id
-// generators allocate ids that no surviving row records. See docs/tokens.md.
+// While replication is live, every stream it announces is taken from it and
+// from nothing else. The database's MAX is not a position: a writer allocates
+// stream ids before it commits, and commits several rooms concurrently, so the
+// table maximum can sit ABOVE an event that is still being written. A token
+// minted there steps over that event, and since every later window starts at
+// the client's since, nothing ever reports it. That is how two leaves vanished
+// on 2026-10-26: each was a slow transaction (the server leaving a room deletes
+// all of its current state) overtaken by events in other rooms. A writer only
+// announces a position once everything below it has committed, which is the
+// property a token needs. See docs/tokens.md.
 //
-// Every overlay is a MAXIMUM, so a stale replication position can never drag a
-// token backwards -- which would ask a client to replay events it already has.
+// The database still supplies any stream replication has not announced, and
+// the whole token while replication is down -- approximate, as it was before
+// M5, because there is nothing better to ask.
+//
+// A replication position can trail a token a client already holds, minted a
+// moment later by one of Synapse's workers. Callers with a since raise the
+// result to it with AtLeast, rather than this taking a maximum with a source
+// that is not safe.
 func currentToken(ctx context.Context, d Deps) (streamtoken.Token, error) {
 	tok, err := d.Store.CurrentToken(ctx)
 	if err != nil {
@@ -41,29 +54,28 @@ func currentToken(ctx context.Context, d Deps) (streamtoken.Token, error) {
 	if d.Replication == nil || !d.Replication.Live() {
 		return tok, nil
 	}
-	for stream, apply := range replicationStreams {
-		if pos := d.Replication.Position(stream); pos > 0 {
-			apply(&tok, pos)
-		}
-	}
-	if pos := d.Replication.Position(replication.StreamEvents); pos > tok.Room.Stream {
-		tok.Room = streamtoken.Live(pos)
-	}
-	if pos := d.Replication.Position(replication.StreamReceipts); pos > tok.Receipt.Stream {
-		tok.Receipt = streamtoken.MultiWriter{Stream: pos}
-	}
-	if pos := d.Replication.Position(replication.StreamDeviceLists); pos > tok.DeviceList.Stream {
-		tok.DeviceList = streamtoken.MultiWriter{Stream: pos}
-	}
-	if pos := d.Replication.Position(replication.StreamQuarantinedMedia); pos > tok.QuarantinedMedia.Stream {
-		tok.QuarantinedMedia = streamtoken.MultiWriter{Stream: pos}
-	}
-	return tok, nil
+	return overlayReplication(tok, d.Replication.Position), nil
 }
 
-func max64(a, b int64) int64 {
-	if a > b {
-		return a
+// overlayReplication replaces each stream replication has a position for.
+//
+// Replaces, never maximises: a maximum with the database is exactly the
+// position that may cover an uncommitted event.
+func overlayReplication(tok streamtoken.Token, position func(stream string) int64) streamtoken.Token {
+	for stream, set := range replicationStreams {
+		if pos := position(stream); pos > 0 {
+			set(&tok, pos)
+		}
 	}
-	return b
+	return tok
+}
+
+// boundBySince raises now so that no stream is behind the client's since.
+//
+// A pinned now is the comparator's, and is left exactly as it was given.
+func boundBySince(now streamtoken.Token, pinned bool, since streamtoken.Token) streamtoken.Token {
+	if pinned {
+		return now
+	}
+	return now.AtLeast(since)
 }

@@ -45,10 +45,11 @@ func incrementalSync(r *http.Request, d Deps, verdict auth.Verdict, sinceRaw str
 			ErrCode: matrixerr.CodeInvalidParam, Error: err.Error()}
 	}
 
-	now, _, mxErr := nowToken(r, d)
+	now, pinned, mxErr := nowToken(r, d)
 	if mxErr != nil {
 		return nil, http.StatusBadRequest, mxErr
 	}
+	now = boundBySince(now, pinned, since)
 
 	// The guarded caches may only answer for a token that replication has
 	// caught up to. Set once per pass, from the token this response will

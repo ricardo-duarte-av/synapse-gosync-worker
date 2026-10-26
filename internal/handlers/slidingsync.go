@@ -245,9 +245,12 @@ func slidingSyncOnce(r *http.Request, d Deps, verdict auth.Verdict,
 		from = &tok
 	}
 
-	now, _, mxErr := nowToken(r, d)
+	now, pinned, mxErr := nowToken(r, d)
 	if mxErr != nil {
 		return nil, false, http.StatusBadRequest, mxErr
+	}
+	if from != nil {
+		now = boundBySince(now, pinned, *from)
 	}
 	nowMS, mxErr := nowMillis(r, d)
 	if mxErr != nil {

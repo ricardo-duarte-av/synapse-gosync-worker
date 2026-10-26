@@ -142,6 +142,46 @@ func (t Token) WithRoomKey(k RoomKey) Token {
 	return t
 }
 
+// AtLeast returns a copy in which no stream is behind the same stream in floor.
+//
+// For a now token and the client's since. Our now token is the position
+// replication has announced, and a client may hold a token minted a moment
+// later by one of Synapse's own workers, or by this one while replication was
+// down. Answering with a lower position would ask the client to replay what it
+// already has; raising ours to theirs instead returns an empty window for that
+// stream, which is what Synapse does by waiting in wait_for_stream_token.
+//
+// Raising is safe where taking the database's MAX would not be: a token Synapse
+// minted is a persisted-up-to position, so nothing below it is still in
+// flight.
+//
+// Typing is left alone. Its serial lives in the typing writer's memory and
+// restarts at zero with it; raising ours to a client's pre-restart serial would
+// pin every later token above anything the restarted writer will issue for
+// days, and typing would go silent (see docs/tokens.md).
+func (t Token) AtLeast(floor Token) Token {
+	t.Room = t.Room.AdvancedTo(floor.Room)
+	t.Presence = maxInt64(t.Presence, floor.Presence)
+	t.Receipt = t.Receipt.AdvancedTo(floor.Receipt)
+	t.AccountData = maxInt64(t.AccountData, floor.AccountData)
+	t.PushRules = maxInt64(t.PushRules, floor.PushRules)
+	t.ToDevice = maxInt64(t.ToDevice, floor.ToDevice)
+	t.DeviceList = t.DeviceList.AdvancedTo(floor.DeviceList)
+	t.UnPartialStatedRooms = maxInt64(t.UnPartialStatedRooms, floor.UnPartialStatedRooms)
+	t.ThreadSubscriptions = maxInt64(t.ThreadSubscriptions, floor.ThreadSubscriptions)
+	t.StickyEvents = maxInt64(t.StickyEvents, floor.StickyEvents)
+	t.QuarantinedMedia = t.QuarantinedMedia.AdvancedTo(floor.QuarantinedMedia)
+	t.ProfileUpdates = maxInt64(t.ProfileUpdates, floor.ProfileUpdates)
+	return t
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 func parseInt(s, field string) (int64, error) {
 	n, err := strconv.ParseInt(s, 10, 64)
 	if err != nil {

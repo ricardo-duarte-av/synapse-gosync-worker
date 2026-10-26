@@ -129,3 +129,69 @@ func TestParseRejects(t *testing.T) {
 		})
 	}
 }
+
+// AtLeast raises every stream that is behind the floor and nothing that is
+// ahead of it. The tokens are the pair gomuks held across a leave on
+// 2026-10-26: a client holding the higher one must never be handed the lower.
+func TestAtLeastRaisesOnlyWhatIsBehind(t *testing.T) {
+	now, err := Parse("s14980200_289801243_143415_27692474_1561128_1876_325202_41796344_0_1745_2_7271_5_1537")
+	if err != nil {
+		t.Fatal(err)
+	}
+	floor, err := Parse("s14980203_289801200_143416_27692500_1561128_1876_325202_41796344_0_1745_2_7271_5_1537")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := now.AtLeast(floor).String()
+	want := "s14980203_289801243_143415_27692500_1561128_1876_325202_41796344_0_1745_2_7271_5_1537"
+	if got != want {
+		t.Errorf("AtLeast:\n got %s\nwant %s", got, want)
+	}
+}
+
+// Typing is a writer's in-memory serial and restarts at zero. Raising ours to
+// a client's pre-restart serial would freeze typing until the new serials
+// caught up, so AtLeast must leave it where it is.
+func TestAtLeastLeavesTypingAlone(t *testing.T) {
+	now := Token{Room: Live(10), Typing: 3}
+	floor := Token{Room: Live(10), Typing: 90000}
+	if got := now.AtLeast(floor).Typing; got != 3 {
+		t.Errorf("typing = %d, want 3: a restarted typing writer's serials must win", got)
+	}
+}
+
+// Synapse's copy_and_advance, writer by writer: a writer absent from one side
+// is at that side's minimum, and entries no longer ahead of the new minimum
+// are dropped.
+func TestAdvancedToIsWriterByWriter(t *testing.T) {
+	a, err := ParseRoomKey("m10~1.15~2.12")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := ParseRoomKey("m11~2.20~3.13")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// stream 11; writer 1: max(15, 11)=15; writer 2: max(12, 20)=20;
+	// writer 3: max(10, 13)=13.
+	if got, want := a.AdvancedTo(b).String(), "m11~1.15~2.20~3.13"; got != want {
+		t.Errorf("AdvancedTo = %s, want %s", got, want)
+	}
+
+	m := MultiWriter{Stream: 5, Instances: Instances{{ID: 1, Pos: 7}}}
+	if got, want := m.AdvancedTo(MultiWriter{Stream: 8}).String(), "8"; got != want {
+		t.Errorf("MultiWriter.AdvancedTo = %s, want %s: writer 1 is no longer ahead", got, want)
+	}
+}
+
+// A historical key has no ordering against a live one to restore.
+func TestAdvancedToLeavesHistoricalKeys(t *testing.T) {
+	h := Historical(4, 100)
+	if got := h.AdvancedTo(Live(200)); got.String() != h.String() {
+		t.Errorf("historical key changed to %s", got)
+	}
+	l := Live(50)
+	if got := l.AdvancedTo(h); got.String() != l.String() {
+		t.Errorf("live key changed to %s by a historical floor", got)
+	}
+}

@@ -158,8 +158,9 @@ type Subscriber struct {
 	invalidator Invalidator
 
 	// extra are listeners added after construction. Kept separate from
-	// listener only because that one is the notifier and is required; these
-	// are optional and there may be none.
+	// listener because that one is the notifier and the two run at different
+	// moments: extra listeners RECORD a row before the position advances, and
+	// the notifier WAKES clients after it. See record.
 	extra []Listener
 
 	mu sync.RWMutex
@@ -263,7 +264,8 @@ func New(cfg Config, log zerolog.Logger, listener Listener) *Subscriber {
 	}
 }
 
-// AddListener registers a further listener, notified alongside the first.
+// AddListener registers a further listener, told of each row BEFORE the
+// stream's position advances (the notifier is told after).
 //
 // The stream-change caches are fed this way rather than by extending the
 // notifier, because the two want opposite readings of the same row. A row that
@@ -279,12 +281,25 @@ func (s *Subscriber) AddListener(l Listener) {
 	}
 }
 
-func (s *Subscriber) notify(stream string, pos int64, roomIDs, userIDs []string) {
-	if s.listener != nil {
-		s.listener.OnStreamAdvance(stream, pos, roomIDs, userIDs)
-	}
+// record tells the added listeners -- the stream-change caches -- about a row.
+//
+// It runs BEFORE the position advances, because the position is what a now
+// token is built from. In the other order a sync landing between the two gets a
+// token that covers the row from a cache that has not heard of it, is told
+// "nothing changed in this room since your since", and the change is lost for
+// good: the client's next since is past it. This order costs nothing worse
+// than a cache answering "changed" for a position nobody can ask about yet.
+func (s *Subscriber) record(stream string, pos int64, roomIDs, userIDs []string) {
 	for _, l := range s.extra {
 		l.OnStreamAdvance(stream, pos, roomIDs, userIDs)
+	}
+}
+
+// wake tells the notifier, AFTER the position has advanced, so that a woken
+// sync computes a token that already covers the row.
+func (s *Subscriber) wake(stream string, pos int64, roomIDs, userIDs []string) {
+	if s.listener != nil {
+		s.listener.OnStreamAdvance(stream, pos, roomIDs, userIDs)
 	}
 }
 
@@ -589,15 +604,20 @@ func (s *Subscriber) handleRDATA(payload string) {
 		}
 	}
 
+	// A silent stream reaches nobody. See silentStreams for why each is there.
+	if !silent {
+		for _, r := range batch {
+			s.record(stream, pos, r.detail.RoomIDs, r.detail.UserIDs)
+		}
+	}
 	if pos > 0 && stream != StreamTyping {
 		s.advance(stream, instance, pos)
 	}
-	// A silent stream reaches nobody. See silentStreams for why each is there.
 	if silent {
 		return
 	}
 	for _, r := range batch {
-		s.notify(stream, pos, r.detail.RoomIDs, r.detail.UserIDs)
+		s.wake(stream, pos, r.detail.RoomIDs, r.detail.UserIDs)
 	}
 }
 
@@ -695,12 +715,13 @@ func (s *Subscriber) handlePosition(payload string) {
 			Msg("replication gap; rows were missed and caches below this position are dropped")
 	}
 
-	s.advance(stream, instance, pos)
 	// No room or user is named, so this reaches every listener as "we do not
 	// know what changed" -- the notifier wakes everybody, and a stream-change
 	// cache must reset its horizon rather than assume it saw the rows in
-	// between.
-	s.notify(stream, pos, nil, nil)
+	// between. The cache hears it before the position moves; see record.
+	s.record(stream, pos, nil, nil)
+	s.advance(stream, instance, pos)
+	s.wake(stream, pos, nil, nil)
 }
 
 // bestKnown is the highest position we can claim to have seen for one writer

@@ -337,3 +337,45 @@ func TestANormalBatchDoesNotEndTheSession(t *testing.T) {
 		t.Errorf("%d rows left buffered after the batch terminated", got)
 	}
 }
+
+// orderListener records the subscriber's position at the moment it is called.
+type orderListener struct {
+	s    *Subscriber
+	seen []int64
+}
+
+func (o *orderListener) OnStreamAdvance(stream string, _ int64, _, _ []string) {
+	o.seen = append(o.seen, o.s.Position(stream))
+}
+
+// The stream-change caches must hear of a row BEFORE the position moves, and
+// the notifier after. A now token is built from the position, so in the other
+// order a sync in between would cover the row with a cache that answers
+// "nothing changed here", and the client's next since would be past it.
+func TestCachesRecordBeforeThePositionMovesAndClientsWakeAfter(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload string
+	}{
+		{"RDATA", `RDATA events p1 600 ` + eventRow("!a:e")},
+		{"POSITION", `POSITION events p1 500 600`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestSub()
+			cache := &orderListener{s: s}
+			waker := &orderListener{s: s}
+			s.listener = waker
+			s.AddListener(cache)
+			s.advance(StreamEvents, "p1", 500)
+
+			s.handle(tc.payload)
+
+			if len(cache.seen) != 1 || cache.seen[0] != 500 {
+				t.Errorf("cache listener saw position %v, want [500]: it must record before the advance", cache.seen)
+			}
+			if len(waker.seen) != 1 || waker.seen[0] != 600 {
+				t.Errorf("notifier saw position %v, want [600]: it must wake after the advance", waker.seen)
+			}
+		})
+	}
+}

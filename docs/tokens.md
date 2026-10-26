@@ -71,13 +71,65 @@ allocate ids that no surviving row records, so the table maximum is a **lower
 bound**, and both streams are nearly silent — so the seed can stay behind for a
 long time. That is safe rather than merely tolerable: a position that is too low
 asks a client to re-receive something it already has, never to skip something it
-has not. A position that was too high would lose data.
+has not. A position that was too high would lose data — and the table maximum
+can be too high too. See the next section.
 
 Closing the gap entirely would mean PUBLISHing a `REPLICATE` command to ask the
 other workers for their positions, as a real Synapse worker does on connect.
 This worker deliberately does not: it would make every other worker broadcast
 POSITION rows on our account, and the project's standing rule is not to perturb
 the deployment it measures.
+
+## The table maximum can be AHEAD of what has committed (2026-10-26)
+
+Until this date the token was `max(database, replication)` field by field, on
+the reasoning above: replication corrects the streams the database cannot see,
+and a maximum can never drag a token backwards. The flaw is in the database
+half. `MAX(stream_ordering)` is the highest id that has *committed*, not the
+position below which everything has. A writer allocates stream ids before it
+commits, and commits different rooms concurrently, so a slow transaction can
+still be writing at 201 while 202 and 203 in other rooms are already visible.
+A token minted at 203 then steps over 201. Every later window starts at the
+client's since, so nothing ever reports that event.
+
+Measured on the owner's account: two leaves vanished from gomuks this way.
+gomuks' since went 200 → 203 over the first leave and 446 → 448 over the
+second. Each `/leave` took more than ten seconds, because the last local member
+leaving a room makes Synapse delete that room's whole current state in the same
+transaction. Pinned to exactly those windows, both rooms land in `rooms.leave`
+correctly. The leave logic was never wrong; the window was.
+
+A writer announces a position over replication only once everything below it
+has committed. That is the property a token needs, and it is what Synapse
+mints tokens from. So now:
+
+- **While replication is live, each stream it has a position for is taken from
+  replication alone** (`overlayReplication`, `internal/handlers/tokens.go`).
+  The database supplies only streams replication has not announced, and the
+  whole token while replication is down, approximate as before M5.
+- **A client's since is a floor** (`Token.AtLeast`, applied by
+  `boundBySince`). The replication position can trail a token a Synapse worker
+  minted milliseconds later, or one this worker minted while replication was
+  down. Raising ours to theirs makes that stream's window empty, which is what
+  Synapse gets by waiting in `wait_for_stream_token`. It is safe where the
+  table max is not, because a token Synapse minted is persisted-up-to. Typing
+  is exempt: raising it to a pre-restart serial would freeze typing (below).
+- **The stream-change caches hear of a row before the position advances**, and
+  the notifier after (`record` and `wake` in `internal/replication`). With the
+  token built from the position, the old order let a sync in between cover a
+  row with a cache that had not seen it, and be told "nothing changed here".
+
+Still approximate, and why it is tolerable here:
+
+- The startup seed is the table maximum, so a transaction in flight at the
+  instant the worker starts can be stepped over once. The first row on the
+  stream replaces the seed.
+- A stream with several writers is held as one number, the highest any writer
+  has announced. Synapse keeps the minimum plus a vector clock. Every token
+  stream on this deployment has exactly one writer.
+
+To-device is the case to remember. Deletion is bounded by the client's since,
+so a skipped to-device message is not just late, it is deleted undelivered.
 
 ## Typing is only as complete as what we have seen
 

@@ -234,6 +234,66 @@ func (m MultiWriter) StreamPosForInstance(instanceID int) int64 {
 	return m.Stream
 }
 
+// AdvancedTo is Synapse's copy_and_advance: a position at or after both this
+// one and other, writer by writer.
+func (m MultiWriter) AdvancedTo(other MultiWriter) MultiWriter {
+	stream, instances := advanceVectorClock(m.Stream, m.Instances, other.Stream, other.Instances)
+	return MultiWriter{Stream: stream, Instances: instances}
+}
+
+// AdvancedTo is Synapse's RoomStreamToken.copy_and_advance for live keys.
+//
+// A historical key is returned unchanged, in either position. Synapse raises
+// on a topological key there; nothing here passes one, and a sync token whose
+// room key is historical was not minted by a sync, so there is no ordering
+// with a live key to restore.
+func (k RoomKey) AdvancedTo(other RoomKey) RoomKey {
+	if k.IsHistorical() || other.IsHistorical() {
+		return k
+	}
+	stream, instances := advanceVectorClock(k.Stream, k.Instances, other.Stream, other.Instances)
+	return RoomKey{Topological: NoTopological, Stream: stream, Instances: instances}
+}
+
+// advanceVectorClock takes the maximum of two vector clocks, writer by writer.
+//
+// A writer absent from one side is at that side's Stream, so it is compared
+// against that rather than against zero. Entries no longer ahead of the new
+// minimum are dropped, as Synapse does, and the order is this side's writers
+// followed by any only the other names.
+func advanceVectorClock(aStream int64, a Instances, bStream int64, b Instances) (int64, Instances) {
+	stream := aStream
+	if bStream > stream {
+		stream = bStream
+	}
+	get := func(in Instances, base int64, id int) int64 {
+		if pos, ok := in.Get(id); ok {
+			return pos
+		}
+		return base
+	}
+	var out Instances
+	add := func(id int) {
+		if _, done := out.Get(id); done {
+			return
+		}
+		pos := get(a, aStream, id)
+		if other := get(b, bStream, id); other > pos {
+			pos = other
+		}
+		if pos > stream {
+			out = append(out, InstancePos{ID: id, Pos: pos})
+		}
+	}
+	for _, e := range a {
+		add(e.ID)
+	}
+	for _, e := range b {
+		add(e.ID)
+	}
+	return stream, out
+}
+
 // parseVectorClock parses "<stream>~<id>.<pos>~<id>.<pos>", preserving order.
 func parseVectorClock(s string) (int64, Instances, error) {
 	parts := strings.Split(s, "~")

@@ -1396,3 +1396,30 @@ scan), and it runs only when `since.PushRules < now.PushRules`.
 
 Why nothing caught it: a pinned comparison window almost never contains a rule
 change, and none of the test runs change one.
+
+## Tokens stepped over events still being committed (2026-10-26)
+
+Two rooms the owner left in gomuks stayed in its room list. Both leave events
+were in the database, and gomuks deletes a room the moment it appears in
+`rooms.leave`, so it never received them. Its since jumped 200 → 203 and
+446 → 448, over each leave.
+
+The now token was `max(MAX(stream_ordering), replication position)`. The table
+maximum covers an event allocated below it and still committing, and a leave
+that takes the server out of a room is a slow transaction: it deletes the
+room's current state. Events in other rooms committed past it, the token moved
+over it, and no later window could include it. Pinned to the same windows, both
+rooms came out in `rooms.leave` correctly.
+
+Fixed in three parts (docs/tokens.md has the detail): stream positions come
+from replication alone while it is live; a client's since is a floor, field by
+field, typing excepted; and the stream-change caches record a row before its
+position advances. Unit tests for all three fail against the old code. Live, a
+local build tracked replication exactly, returned a since that was ahead of it
+unchanged, and delivered three leaves on @test to `rooms.leave` under a long
+poll.
+
+Why nothing caught it: the comparator pins now, so it never sees the token we
+mint; small test rooms commit too fast to open the window; and the symptom is
+one silently missing event.
+
